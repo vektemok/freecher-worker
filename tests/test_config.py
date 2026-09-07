@@ -1,7 +1,7 @@
 """Tests for configuration settings."""
 
 import pytest
-from arny_worker.config import Settings
+from freecher_worker.config import Settings
 
 
 def test_default_settings():
@@ -17,11 +17,11 @@ def test_default_settings():
 
 
 def test_env_override(monkeypatch):
-    monkeypatch.setenv("ARNY_ASR_MODEL", "medium")
-    monkeypatch.setenv("ARNY_ASR_DEVICE", "cpu")
-    monkeypatch.setenv("ARNY_ASR_COMPUTE_TYPE", "int8")
-    monkeypatch.setenv("ARNY_HIGHLIGHT_TOP_K", "10")
-    monkeypatch.setenv("ARNY_SCORER", "llm")
+    monkeypatch.setenv("FREECHER_ASR_MODEL", "medium")
+    monkeypatch.setenv("FREECHER_ASR_DEVICE", "cpu")
+    monkeypatch.setenv("FREECHER_ASR_COMPUTE_TYPE", "int8")
+    monkeypatch.setenv("FREECHER_HIGHLIGHT_TOP_K", "10")
+    monkeypatch.setenv("FREECHER_SCORER", "llm")
 
     settings = Settings()
     assert settings.asr_model == "medium"

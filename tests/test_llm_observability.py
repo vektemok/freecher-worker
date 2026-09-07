@@ -1,7 +1,7 @@
 """Tests for LLM fallback observability."""
 
-from arny_worker.highlights.models import CandidateWindow
-from arny_worker.scoring.llm import OpenAILLMScorer
+from freecher_worker.highlights.models import CandidateWindow
+from freecher_worker.scoring.llm import OpenAILLMScorer
 
 
 def test_llm_fallback_flag_and_reason_on_missing_api_key():
@@ -18,7 +18,7 @@ def test_llm_fallback_flag_and_reason_on_missing_api_key():
 
     assert score.fallback_used is True
     assert score.fallback_reason is not None
-    assert "ARNY_LLM_API_KEY is not set" in score.fallback_reason
+    assert "FREECHER_LLM_API_KEY is not set" in score.fallback_reason
     assert score.score > 0.0
 
 

@@ -2,10 +2,10 @@
 
 from pathlib import Path
 from typer.testing import CliRunner
-from arny_worker.cli import app
-from arny_worker.highlights.models import CandidateDocument, CandidateWindow, Highlight, HighlightScore
-from arny_worker.media.fingerprint import SourceFingerprint
-from arny_worker.pipeline.processor import (
+from freecher_worker.cli import app
+from freecher_worker.highlights.models import CandidateDocument, CandidateWindow, Highlight, HighlightScore
+from freecher_worker.media.fingerprint import SourceFingerprint
+from freecher_worker.pipeline.processor import (
     AsrManifestInfo,
     CandidateConfigInfo,
     EnvironmentInfo,
@@ -16,7 +16,7 @@ from arny_worker.pipeline.processor import (
     RankingManifestInfo,
     ScoringManifestInfo,
 )
-from arny_worker.utils.json_io import load_json, save_json
+from freecher_worker.utils.json_io import load_json, save_json
 
 runner = CliRunner()
 

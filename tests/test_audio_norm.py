@@ -1,6 +1,6 @@
 """Unit tests for audio loudness normalization filter generation."""
 
-from arny_worker.rendering.audio import build_loudnorm_filter
+from freecher_worker.rendering.audio import build_loudnorm_filter
 
 
 def test_build_loudnorm_filter_with_measured_params():

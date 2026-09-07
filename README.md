@@ -1,4 +1,4 @@
-# arny-worker
+# freecher-worker
 
 Local worker for automated highlight discovery in long videos and short clip generation (Phase 1.1 MVP of an OpusClip alternative).
 
@@ -19,15 +19,15 @@ Local worker for automated highlight discovery in long videos and short clip gen
 - **Temporal Candidate Windowing**: Segment aggregation bounded strictly by natural phrase boundaries (~30-90s, target 60s, ~15s overlap).
 - **Temporal Deduplication**: Non-Maximum Suppression (NMS) suppressing overlapping candidates (>60% temporal overlap).
 - **Hardware-Accelerated Clipping**: Auto-detects `h264_nvenc` with automatic fallback to `libx264`. Includes contextual padding (±2.0s).
-- **Environment Doctor**: Built-in `python -m arny_worker doctor` command for environment diagnostics.
+- **Environment Doctor**: Built-in `python -m freecher_worker doctor` command for environment diagnostics.
 
 ---
 
 ## Directory Structure
 
 ```
-arny-worker/
-    arny_worker/
+freecher-worker/
+    freecher_worker/
         __init__.py
         __main__.py
         cli.py
@@ -116,7 +116,7 @@ source scripts/cuda_env.sh
 Run system diagnostics to check Python, FFmpeg, ffprobe, CUDA, and faster-whisper:
 
 ```bash
-python -m arny_worker doctor
+python -m freecher_worker doctor
 ```
 
 ---
@@ -127,14 +127,14 @@ python -m arny_worker doctor
 
 ```bash
 # Full process with MP4 clipping
-python -m arny_worker process test.mp4 \
+python -m freecher_worker process test.mp4 \
   --language ru \
   --model small \
   --compute-type int8_float16 \
   --top-k 5
 
 # Analysis-only (skip video rendering for rapid iteration & evaluation)
-python -m arny_worker process test.mp4 \
+python -m freecher_worker process test.mp4 \
   --language ru \
   --analysis-only
 ```
@@ -142,13 +142,13 @@ python -m arny_worker process test.mp4 \
 ### Inspect a Run
 
 ```bash
-python -m arny_worker inspect runs/20260907_082719_test
+python -m freecher_worker inspect runs/20260907_082719_test
 ```
 
 ### Export Evaluation Dataset
 
 ```bash
-python -m arny_worker export-eval runs/20260907_082719_test
+python -m freecher_worker export-eval runs/20260907_082719_test
 ```
 
 Generates `evaluation.json` with candidate highlights and blank human feedback fields:

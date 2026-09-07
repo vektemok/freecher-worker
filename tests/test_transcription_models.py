@@ -1,7 +1,7 @@
 """Tests for transcription models and JSON serialization."""
 
-from arny_worker.transcription.models import Transcript, TranscriptSegment
-from arny_worker.utils.json_io import load_json, save_json
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.utils.json_io import load_json, save_json
 
 
 def test_transcript_model_serialization(tmp_path):

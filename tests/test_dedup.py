@@ -1,11 +1,11 @@
 """Tests for temporal overlap and deduplication."""
 
-from arny_worker.highlights.dedup import (
+from freecher_worker.highlights.dedup import (
     calculate_iou,
     calculate_overlap_ratio,
     is_temporally_overlapping,
 )
-from arny_worker.highlights.models import CandidateWindow
+from freecher_worker.highlights.models import CandidateWindow
 
 
 def test_disjoint_windows():

@@ -1,8 +1,8 @@
 """Unit tests for subtitle segmentation and ASS styling."""
 
-from arny_worker.rendering.asr_refinement import WordItem
-from arny_worker.subtitles.ass import format_ass_timestamp, generate_ass_script
-from arny_worker.subtitles.segmenter import segment_words_to_events
+from freecher_worker.rendering.asr_refinement import WordItem
+from freecher_worker.subtitles.ass import format_ass_timestamp, generate_ass_script
+from freecher_worker.subtitles.segmenter import segment_words_to_events
 
 
 def test_format_ass_timestamp():

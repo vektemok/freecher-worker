@@ -1,8 +1,8 @@
 """Tests for heuristic and LLM scoring modules."""
 
-from arny_worker.highlights.models import CandidateWindow
-from arny_worker.scoring.heuristic import HeuristicScorer
-from arny_worker.scoring.llm import OpenAILLMScorer
+from freecher_worker.highlights.models import CandidateWindow
+from freecher_worker.scoring.heuristic import HeuristicScorer
+from freecher_worker.scoring.llm import OpenAILLMScorer
 
 
 def test_heuristic_empty_text():

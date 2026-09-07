@@ -3,11 +3,11 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from arny_worker.config import Settings
-from arny_worker.media.probe import MediaInfo
-from arny_worker.pipeline.processor import run_pipeline
-from arny_worker.transcription.models import Transcript, TranscriptSegment
-from arny_worker.transcription.whisper import BaseTranscriber
+from freecher_worker.config import Settings
+from freecher_worker.media.probe import MediaInfo
+from freecher_worker.pipeline.processor import run_pipeline
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.transcription.whisper import BaseTranscriber
 
 
 class SimpleTranscriber(BaseTranscriber):
@@ -27,9 +27,9 @@ class SimpleTranscriber(BaseTranscriber):
         )
 
 
-@patch("arny_worker.pipeline.processor.clip_video")
-@patch("arny_worker.pipeline.processor.extract_audio")
-@patch("arny_worker.pipeline.processor.probe_media")
+@patch("freecher_worker.pipeline.processor.clip_video")
+@patch("freecher_worker.pipeline.processor.extract_audio")
+@patch("freecher_worker.pipeline.processor.probe_media")
 def test_analysis_only_mode(mock_probe, mock_extract, mock_clip, tmp_path):
     video = tmp_path / "test.mp4"
     video.write_bytes(b"analysis_only_dummy_bytes")

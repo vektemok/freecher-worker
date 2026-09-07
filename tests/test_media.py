@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from arny_worker.media.audio import AudioExtractionError, extract_audio
-from arny_worker.media.probe import (
+from freecher_worker.media.audio import AudioExtractionError, extract_audio
+from freecher_worker.media.probe import (
     MediaInfo,
     MediaProbeError,
     NoAudioStreamError,

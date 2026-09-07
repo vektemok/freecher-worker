@@ -4,12 +4,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from arny_worker.config import Settings
-from arny_worker.media.fingerprint import compute_source_fingerprint
-from arny_worker.media.probe import MediaInfo
-from arny_worker.pipeline.processor import run_pipeline
-from arny_worker.transcription.models import Transcript, TranscriptSegment
-from arny_worker.transcription.whisper import BaseTranscriber
+from freecher_worker.config import Settings
+from freecher_worker.media.fingerprint import compute_source_fingerprint
+from freecher_worker.media.probe import MediaInfo
+from freecher_worker.pipeline.processor import run_pipeline
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.transcription.whisper import BaseTranscriber
 
 
 class CountingTranscriber(BaseTranscriber):
@@ -62,9 +62,9 @@ def test_source_fingerprint_changes_on_file_modification(tmp_path):
     assert fp1.content_hash != fp2.content_hash
 
 
-@patch("arny_worker.pipeline.processor.clip_video")
-@patch("arny_worker.pipeline.processor.extract_audio")
-@patch("arny_worker.pipeline.processor.probe_media")
+@patch("freecher_worker.pipeline.processor.clip_video")
+@patch("freecher_worker.pipeline.processor.extract_audio")
+@patch("freecher_worker.pipeline.processor.probe_media")
 def test_cache_invalidation_on_asr_param_change(mock_probe, mock_extract, mock_clip, tmp_path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"sample_content_for_cache_test" * 50)
@@ -144,9 +144,9 @@ def test_cache_invalidation_on_asr_param_change(mock_probe, mock_extract, mock_c
     assert transcriber.call_count == 4
 
 
-@patch("arny_worker.pipeline.processor.clip_video")
-@patch("arny_worker.pipeline.processor.extract_audio")
-@patch("arny_worker.pipeline.processor.probe_media")
+@patch("freecher_worker.pipeline.processor.clip_video")
+@patch("freecher_worker.pipeline.processor.extract_audio")
+@patch("freecher_worker.pipeline.processor.probe_media")
 def test_candidate_cache_invalidation_on_window_param_change(mock_probe, mock_extract, mock_clip, tmp_path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"content_for_window_test" * 50)

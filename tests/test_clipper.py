@@ -2,7 +2,7 @@
 
 from pathlib import Path
 import pytest
-from arny_worker.media.clipper import VideoClippingError, clip_video, is_nvenc_available
+from freecher_worker.media.clipper import VideoClippingError, clip_video, is_nvenc_available
 
 
 def test_is_nvenc_available_returns_bool():

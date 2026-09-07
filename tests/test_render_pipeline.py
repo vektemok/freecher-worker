@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from arny_worker.cli import app
-from arny_worker.highlights.models import Highlight, HighlightScore
-from arny_worker.media.fingerprint import SourceFingerprint
-from arny_worker.pipeline.processor import (
+from freecher_worker.cli import app
+from freecher_worker.highlights.models import Highlight, HighlightScore
+from freecher_worker.media.fingerprint import SourceFingerprint
+from freecher_worker.pipeline.processor import (
     AsrManifestInfo,
     CandidateConfigInfo,
     EnvironmentInfo,
@@ -19,7 +19,7 @@ from arny_worker.pipeline.processor import (
     RankingManifestInfo,
     ScoringManifestInfo,
 )
-from arny_worker.rendering import (
+from freecher_worker.rendering import (
     RefinedWordsDocument,
     WordItem,
     get_preset,
@@ -27,8 +27,8 @@ from arny_worker.rendering import (
     render_single_short,
     validate_rendered_video,
 )
-from arny_worker.transcription.models import Transcript, TranscriptSegment
-from arny_worker.utils.json_io import load_json, save_json
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.utils.json_io import load_json, save_json
 
 runner = CliRunner()
 
@@ -68,7 +68,7 @@ def mock_whisper_words(monkeypatch):
         return doc
 
     monkeypatch.setattr(
-        "arny_worker.rendering.renderer.HighlightWordTranscriber.transcribe_highlight",
+        "freecher_worker.rendering.renderer.HighlightWordTranscriber.transcribe_highlight",
         fake_transcribe,
     )
 

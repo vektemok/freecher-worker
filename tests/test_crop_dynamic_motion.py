@@ -5,10 +5,10 @@ import subprocess
 import cv2
 import numpy as np
 
-from arny_worker.crop.detector import SubjectDetector
-from arny_worker.crop.expression import build_ffmpeg_crop_x_expression
-from arny_worker.crop.models import DetectedSubject
-from arny_worker.crop.tracker import generate_crop_trajectory
+from freecher_worker.crop.detector import SubjectDetector
+from freecher_worker.crop.expression import build_ffmpeg_crop_x_expression
+from freecher_worker.crop.models import DetectedSubject
+from freecher_worker.crop.tracker import generate_crop_trajectory
 
 
 class MovingBoxDetector(SubjectDetector):

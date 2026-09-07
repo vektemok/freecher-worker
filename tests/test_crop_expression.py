@@ -1,8 +1,8 @@
 """Unit tests for crop dimensions and FFmpeg expression generation."""
 
-from arny_worker.crop.expression import build_ffmpeg_crop_x_expression, simplify_trajectory_points
-from arny_worker.crop.models import CropPoint, CropTrajectory
-from arny_worker.crop.tracker import calculate_crop_dimensions
+from freecher_worker.crop.expression import build_ffmpeg_crop_x_expression, simplify_trajectory_points
+from freecher_worker.crop.models import CropPoint, CropTrajectory
+from freecher_worker.crop.tracker import calculate_crop_dimensions
 
 
 def test_calculate_crop_dimensions():

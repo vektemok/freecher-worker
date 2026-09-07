@@ -3,11 +3,11 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from arny_worker.config import Settings
-from arny_worker.media.probe import MediaInfo
-from arny_worker.pipeline.processor import PIPELINE_VERSION, run_pipeline
-from arny_worker.transcription.models import Transcript, TranscriptSegment
-from arny_worker.transcription.whisper import BaseTranscriber
+from freecher_worker.config import Settings
+from freecher_worker.media.probe import MediaInfo
+from freecher_worker.pipeline.processor import PIPELINE_VERSION, run_pipeline
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.transcription.whisper import BaseTranscriber
 
 
 class FakeTranscriber(BaseTranscriber):
@@ -36,9 +36,9 @@ class FakeTranscriber(BaseTranscriber):
         )
 
 
-@patch("arny_worker.pipeline.processor.clip_video")
-@patch("arny_worker.pipeline.processor.extract_audio")
-@patch("arny_worker.pipeline.processor.probe_media")
+@patch("freecher_worker.pipeline.processor.clip_video")
+@patch("freecher_worker.pipeline.processor.extract_audio")
+@patch("freecher_worker.pipeline.processor.probe_media")
 def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
     video_file = tmp_path / "sample_video.mp4"
     video_file.write_bytes(b"dummy_video_content_for_test")

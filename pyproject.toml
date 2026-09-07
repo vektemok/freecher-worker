@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "arny-worker"
+name = "freecher-worker"
 version = "0.2.0"
 description = "Local worker for automated video highlight extraction and clipping"
 readme = "README.md"
@@ -19,8 +19,12 @@ dependencies = [
 ]
 
 [project.scripts]
-arny-worker = "arny_worker.cli:app"
+freecher-worker = "freecher_worker.cli:app"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["freecher_worker*"]

@@ -2,7 +2,7 @@
 
 import pytest
 from pydantic import BaseModel
-from arny_worker.utils.json_io import load_json, save_json
+from freecher_worker.utils.json_io import load_json, save_json
 
 
 class SampleModel(BaseModel):

@@ -1,7 +1,7 @@
 """Tests for candidate window generation / segmentation."""
 
-from arny_worker.highlights.segmenter import generate_candidate_windows
-from arny_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.highlights.segmenter import generate_candidate_windows
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
 
 
 def test_empty_transcript():

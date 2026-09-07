@@ -1,8 +1,8 @@
 """Tests for ranking and top-K highlight selection."""
 
 import pytest
-from arny_worker.highlights.models import CandidateWindow, HighlightScore
-from arny_worker.highlights.ranker import rank_and_deduplicate
+from freecher_worker.highlights.models import CandidateWindow, HighlightScore
+from freecher_worker.highlights.ranker import rank_and_deduplicate
 
 
 def test_ranker_sorting_and_top_k():

@@ -4,21 +4,21 @@ import json
 from pathlib import Path
 from typer.testing import CliRunner
 
-from arny_worker.cli import app
-from arny_worker.evaluation.annotator import run_terminal_annotator
-from arny_worker.evaluation.disagreements import extract_disagreements
-from arny_worker.evaluation.models import (
+from freecher_worker.cli import app
+from freecher_worker.evaluation.annotator import run_terminal_annotator
+from freecher_worker.evaluation.disagreements import extract_disagreements
+from freecher_worker.evaluation.models import (
     BlindEvaluationDocument,
     BlindEvaluationItem,
     ScorerPredictionDocument,
     ScorerPredictionItem,
 )
-from arny_worker.highlights.models import (
+from freecher_worker.highlights.models import (
     CandidateDocument,
     CandidateWindow,
     compute_candidate_set_id,
 )
-from arny_worker.utils.json_io import load_json, save_json
+from freecher_worker.utils.json_io import load_json, save_json
 
 runner = CliRunner()
 
@@ -355,7 +355,7 @@ def test_preview_candidate_command(tmp_path, monkeypatch):
         output_path.write_bytes(b"clipped mp4")
         return output_path
 
-    monkeypatch.setattr("arny_worker.cli.preview_clip", mock_preview_clip)
+    monkeypatch.setattr("freecher_worker.cli.preview_clip", mock_preview_clip)
 
     res = runner.invoke(
         app,

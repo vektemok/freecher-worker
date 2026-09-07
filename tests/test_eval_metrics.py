@@ -2,13 +2,13 @@
 
 import pytest
 import math
-from arny_worker.evaluation.models import (
+from freecher_worker.evaluation.models import (
     BlindEvaluationDocument,
     BlindEvaluationItem,
     ScorerPredictionDocument,
     ScorerPredictionItem,
 )
-from arny_worker.evaluation.metrics import (
+from freecher_worker.evaluation.metrics import (
     calculate_dcg,
     compute_evaluation_metrics,
     RELEVANCE_THRESHOLD,

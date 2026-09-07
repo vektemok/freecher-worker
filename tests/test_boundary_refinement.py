@@ -1,9 +1,9 @@
 """Unit tests for highlight boundary refinement."""
 
 import pytest
-from arny_worker.highlights.models import Highlight
-from arny_worker.rendering.boundaries import refine_boundaries, refine_highlight
-from arny_worker.transcription.models import Transcript, TranscriptSegment
+from freecher_worker.highlights.models import Highlight
+from freecher_worker.rendering.boundaries import refine_boundaries, refine_highlight
+from freecher_worker.transcription.models import Transcript, TranscriptSegment
 
 
 def _create_mock_transcript() -> Transcript:
