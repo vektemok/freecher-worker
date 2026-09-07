@@ -15,12 +15,12 @@ from .models import (
 RELEVANCE_THRESHOLD = 3  # Ratings 3 (good) and 4 (excellent) are considered relevant highlights
 
 
-def calculate_dcg(relevances: List[int], k: int) -> float:
+def calculate_dcg(relevances: List[Union[int, float]], k: int) -> float:
     """Calculate Discounted Cumulative Gain at rank K using exponential gain 2^rel - 1."""
     dcg = 0.0
     for i, rel in enumerate(relevances[:k], start=1):
         if rel > 0:
-            gain = (2.0 ** rel) - 1.0
+            gain = (2.0 ** float(rel)) - 1.0
             discount = math.log2(i + 1)
             dcg += gain / discount
     return dcg
@@ -56,7 +56,7 @@ def compute_evaluation_metrics(
     sorted_preds = sorted(prediction_doc.predictions, key=lambda p: p.rank)
 
     # Extract human scores and publishable flags in ranked order
-    ranked_relevances: List[int] = []
+    ranked_relevances: List[Union[int, float]] = []
     ranked_publishable: List[bool] = []
     for pred in sorted_preds:
         item = eval_by_id.get(pred.candidate_id)

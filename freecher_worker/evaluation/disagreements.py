@@ -39,11 +39,11 @@ def extract_disagreements(
     false_negatives: List[DisagreementItem] = []
     scorer_divergences: List[DisagreementItem] = []
 
-    # 1. False Positives: Model ranked in top_k_fp (e.g. top 5), but human rated 0 or 1
+    # 1. False Positives: Model ranked in top_k_fp (e.g. top 5), but human rated <= 1
     sorted_a = sorted(pred_a.predictions, key=lambda p: p.rank)
     for p in sorted_a[:top_k_fp]:
         item = eval_by_id.get(p.candidate_id)
-        if item is not None and item.human_score is not None and item.human_score in (0, 1):
+        if item is not None and item.human_score is not None and item.human_score <= 1.0:
             false_positives.append(
                 DisagreementItem(
                     candidate_id=p.candidate_id,
@@ -61,9 +61,9 @@ def extract_disagreements(
                 )
             )
 
-    # 2. False Negatives: Human scored 3 or 4, but model ranked low (rank > fn_rank_threshold)
+    # 2. False Negatives: Human scored >= 3, but model ranked low (rank > fn_rank_threshold)
     for item in eval_doc.items:
-        if item.human_score is not None and item.human_score in (3, 4):
+        if item.human_score is not None and item.human_score >= 3.0:
             pred_item = preds_a_by_id.get(item.candidate_id)
             if pred_item is None or pred_item.rank > fn_rank_threshold:
                 false_negatives.append(

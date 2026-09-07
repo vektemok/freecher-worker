@@ -377,3 +377,35 @@ def test_preview_candidate_command(tmp_path, monkeypatch):
     assert called_args["end"] == 42.0
     assert called_args["open_player"] is False
     assert out_clip.is_file()
+
+
+def test_evaluate_command_with_fractional_human_scores(tmp_path):
+    """Verify evaluate CLI runs successfully when human_score contains fractional numbers like 2.5."""
+    run_dir = tmp_path / "test_run_float"
+    cset_id = _create_mock_run_with_candidates(run_dir)
+
+    # Generate score predictions first
+    runner.invoke(app, ["score-run", str(run_dir), "--scorer", "heuristic"])
+    scores_file = run_dir / "scores" / "heuristic_v1.json"
+
+    eval_file = run_dir / "evaluation_blind.json"
+    eval_doc_data = {
+        "candidate_set_id": cset_id,
+        "total_candidates": 6,
+        "labeled_candidates": 6,
+        "items": [
+            {"candidate_id": "c01", "start": 0.0, "end": 30.0, "duration": 30.0, "text": "Intro", "human_score": 1.0, "publishable": False},
+            {"candidate_id": "c02", "start": 30.0, "end": 65.0, "duration": 35.0, "text": "Insight", "human_score": 3.5, "publishable": True},
+            {"candidate_id": "c03", "start": 65.0, "end": 100.0, "duration": 35.0, "text": "Tech", "human_score": 2.5, "publishable": False},
+            {"candidate_id": "c04", "start": 100.0, "end": 130.0, "duration": 30.0, "text": "Chatter", "human_score": 0.5, "publishable": False},
+            {"candidate_id": "c05", "start": 130.0, "end": 165.0, "duration": 35.0, "text": "Outage", "human_score": 4.0, "publishable": True},
+            {"candidate_id": "c06", "start": 165.0, "end": 195.0, "duration": 30.0, "text": "Outro", "human_score": 1.5, "publishable": False},
+        ],
+    }
+    save_json(eval_doc_data, eval_file)
+
+    res = runner.invoke(app, ["evaluate", str(eval_file), str(scores_file), "--k", "3,5"])
+    assert res.exit_code == 0
+    assert "Evaluation Report" in res.output
+    assert "Mean Human Score" in res.output
+

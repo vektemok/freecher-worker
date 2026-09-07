@@ -182,8 +182,16 @@ def run_terminal_annotator(
                     print("Video file not specified or not found. Pass --video to enable video preview.")
                 continue
 
-            if choice in ("0", "1", "2", "3", "4"):
-                score = int(choice)
+            score_input_val = None
+            try:
+                val = float(choice)
+                if 0.0 <= val <= 4.0:
+                    score_input_val = int(val) if val.is_integer() else val
+            except ValueError:
+                pass
+
+            if score_input_val is not None:
+                score = score_input_val
 
                 # Prompt for publishable
                 curr_pub_str = "y" if item.publishable is True else ("n" if item.publishable is False else "none")
@@ -220,7 +228,7 @@ def run_terminal_annotator(
 
                 current_idx += 1
             else:
-                print("Invalid input. Enter 0, 1, 2, 3, 4, 's' to skip, 'b' to go back, 'p' to preview, or 'q' to quit.")
+                print("Invalid input. Enter a score between 0 and 4, 's' to skip, 'b' to go back, 'p' to preview, or 'q' to quit.")
 
         except (KeyboardInterrupt, EOFError):
             print("\nSession interrupted. Progress saved.")

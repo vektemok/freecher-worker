@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -18,10 +18,10 @@ class BlindEvaluationItem(BaseModel):
     segment_ids: list[int] = Field(default_factory=list, description="Transcript segment IDs")
 
     # Human annotations (MUST be empty during initial blind export)
-    human_score: Optional[int] = Field(
+    human_score: Optional[Union[int, float]] = Field(
         default=None,
-        ge=0,
-        le=4,
+        ge=0.0,
+        le=4.0,
         description="Blind rating: 0=unusable, 1=weak, 2=acceptable, 3=good, 4=excellent",
     )
     publishable: Optional[bool] = Field(
@@ -110,7 +110,7 @@ class DisagreementItem(BaseModel):
     end: float
     duration: float
     text: str
-    human_score: Optional[int] = None
+    human_score: Optional[Union[int, float]] = None
     publishable: Optional[bool] = None
     human_notes: Optional[str] = None
     model_rank: Optional[int] = None

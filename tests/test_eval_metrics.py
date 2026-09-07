@@ -15,7 +15,7 @@ from freecher_worker.evaluation.metrics import (
 )
 
 
-def _make_eval_item(cid: str, score: int | None, pub: bool = False) -> BlindEvaluationItem:
+def _make_eval_item(cid: str, score: int | float | None, pub: bool = False) -> BlindEvaluationItem:
     return BlindEvaluationItem(
         candidate_id=cid,
         start=0.0,
@@ -211,3 +211,72 @@ def test_candidate_set_id_mismatch_raises_error():
 
     with pytest.raises(ValueError, match="Candidate set ID mismatch"):
         compute_evaluation_metrics(eval_doc, pred_doc)
+
+
+def test_float_human_score_metrics():
+    """Verify that fractional human scores (e.g. 2.5) are valid and metrics compute properly."""
+    cset_id = "cset_float_test"
+    eval_doc = BlindEvaluationDocument(
+        candidate_set_id=cset_id,
+        total_candidates=4,
+        items=[
+            _make_eval_item("c1", score=3.5, pub=True),
+            _make_eval_item("c2", score=2.5, pub=False),
+            _make_eval_item("c3", score=1.0, pub=False),
+            _make_eval_item("c4", score=0.5, pub=False),
+        ],
+    )
+    eval_doc.update_labeled_count()
+
+    pred_doc = ScorerPredictionDocument(
+        candidate_set_id=cset_id,
+        scorer="test_scorer",
+        scorer_version="v1",
+        predictions=[
+            _make_pred_item("c1", rank=1, score=90.0),
+            _make_pred_item("c2", rank=2, score=80.0),
+            _make_pred_item("c3", rank=3, score=70.0),
+            _make_pred_item("c4", rank=4, score=60.0),
+        ],
+    )
+
+    metrics = compute_evaluation_metrics(eval_doc, pred_doc, k_values=[2, 4])
+    assert metrics.precision_at_k[2] == 0.5
+    assert metrics.mean_human_score_at_k[2] == 3.0
+    assert metrics.mean_human_score_at_k[4] == 1.875
+    assert metrics.hit_rate_at_k[1] == 1.0
+
+
+def test_float_human_score_validation():
+    """Verify BlindEvaluationItem validation accepts floats in [0.0, 4.0] and rejects out-of-range."""
+    from pydantic import ValidationError
+
+    item = BlindEvaluationItem.model_validate({
+        "candidate_id": "c1",
+        "start": 0.0,
+        "end": 10.0,
+        "duration": 10.0,
+        "text": "test",
+        "human_score": 2.5,
+    })
+    assert item.human_score == 2.5
+
+    with pytest.raises(ValidationError):
+        BlindEvaluationItem.model_validate({
+            "candidate_id": "c1",
+            "start": 0.0,
+            "end": 10.0,
+            "duration": 10.0,
+            "text": "test",
+            "human_score": -0.5,
+        })
+
+    with pytest.raises(ValidationError):
+        BlindEvaluationItem.model_validate({
+            "candidate_id": "c1",
+            "start": 0.0,
+            "end": 10.0,
+            "duration": 10.0,
+            "text": "test",
+            "human_score": 4.5,
+        })
