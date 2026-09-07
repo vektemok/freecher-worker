@@ -13,11 +13,14 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from arny_worker.config import Settings, get_settings
+from arny_worker.evaluation.models import ScorerPredictionDocument, ScorerPredictionItem
+from arny_worker.highlights.dedup import calculate_iou, calculate_overlap_ratio
 from arny_worker.highlights.models import (
     CandidateDocument,
     CandidateWindow,
     Highlight,
     HighlightScore,
+    compute_candidate_set_id,
 )
 from arny_worker.highlights.ranker import rank_and_deduplicate
 from arny_worker.highlights.segmenter import generate_candidate_windows
@@ -51,6 +54,7 @@ class AsrManifestInfo(BaseModel):
 
 
 class CandidateConfigInfo(BaseModel):
+    candidate_set_id: Optional[str] = None
     min_seconds: float
     target_seconds: float
     max_seconds: float
@@ -319,6 +323,7 @@ def run_pipeline(
     # 4. STAGE: CANDIDATE WINDOW GENERATION
     # ==========================================
     candidates: list[CandidateWindow]
+    candidate_set_id: str = ""
     transcript_hash = transcript.compute_transcript_hash()
     with logger.stage("candidates") as s:
         cand_start = time.perf_counter()
@@ -344,8 +349,9 @@ def run_pipeline(
 
                     if mismatch_reason is None:
                         candidates = doc.candidates
+                        candidate_set_id = doc.candidate_set_id
                         reused_candidates = True
-                        logger.info("candidates", f"cache HIT: reused candidates.json ({len(candidates)} windows)")
+                        logger.info("candidates", f"cache HIT: reused candidates.json ({len(candidates)} windows, id={candidate_set_id})")
                     else:
                         logger.info("candidates", f"cache MISS: {mismatch_reason}")
                 elif isinstance(cached_data, list) and not reused_transcript:
@@ -353,8 +359,15 @@ def run_pipeline(
                 elif isinstance(cached_data, list) and reused_transcript:
                     # Legacy list matching current transcript
                     candidates = [CandidateWindow.model_validate(item) for item in cached_data]
+                    candidate_set_id = compute_candidate_set_id(
+                        transcript_hash=transcript_hash,
+                        min_seconds=cfg.highlight_min_seconds,
+                        target_seconds=cfg.highlight_target_seconds,
+                        max_seconds=cfg.highlight_max_seconds,
+                        overlap_seconds=cfg.highlight_overlap_seconds,
+                    )
                     reused_candidates = True
-                    logger.info("candidates", f"cache HIT: reused candidates.json ({len(candidates)} windows)")
+                    logger.info("candidates", f"cache HIT: reused candidates.json ({len(candidates)} windows, id={candidate_set_id})")
             except Exception as exc:
                 logger.warning("candidates", f"cache INVALIDATED: cached candidates invalid ({exc})")
 
@@ -374,8 +387,9 @@ def run_pipeline(
                 overlap_seconds=cfg.highlight_overlap_seconds,
                 candidates=candidates,
             )
+            candidate_set_id = cand_doc.candidate_set_id
             save_json(cand_doc, candidates_json_path)
-            logger.info("candidates", f"CREATED candidates.json ({len(candidates)} candidate windows generated)")
+            logger.info("candidates", f"CREATED candidates.json ({len(candidates)} candidate windows generated, id={candidate_set_id})")
         timings.candidate_seconds = round(time.perf_counter() - cand_start, 3)
 
     if not candidates:
@@ -398,6 +412,7 @@ def run_pipeline(
                 vad_filter=cfg.asr_vad_filter,
             ),
             candidate_config=CandidateConfigInfo(
+                candidate_set_id=candidate_set_id,
                 min_seconds=cfg.highlight_min_seconds,
                 target_seconds=cfg.highlight_target_seconds,
                 max_seconds=cfg.highlight_max_seconds,
@@ -405,7 +420,7 @@ def run_pipeline(
             ),
             scoring=ScoringManifestInfo(
                 scorer=cfg.scorer,
-                scorer_version="1.1.0",
+                scorer_version="heuristic_v1" if cfg.scorer == "heuristic" else "1.1.0",
                 llm_model=cfg.llm_model if cfg.scorer == "llm" else None,
                 fallback_used=False,
                 fallback_reason=None,
@@ -445,7 +460,7 @@ def run_pipeline(
                 active_scorer = HeuristicScorer()
 
         scorer_name = getattr(active_scorer, "name", type(active_scorer).__name__)
-        scorer_ver = getattr(active_scorer, "version", "1.1.0")
+        scorer_ver = getattr(active_scorer, "version", "heuristic_v1")
 
         scores = active_scorer.score_batch(candidates)
 
@@ -465,6 +480,48 @@ def run_pipeline(
             "scoring",
             f"scored {len(scores)} candidates using {scorer_name} (v{scorer_ver})",
         )
+
+        # Persist model predictions to runs/<run_id>/scores/<scorer>_<version>.json
+        try:
+            scores_dir = run_dir / "scores"
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            if scorer_ver.startswith(f"{scorer_name.lower()}_"):
+                scorer_file_name = f"{scorer_ver}.json"
+            else:
+                scorer_file_name = f"{scorer_name.lower()}_{scorer_ver}.json"
+
+            cand_score_pairs = list(zip(candidates, scores))
+            cand_score_pairs.sort(key=lambda cs: cs[1].score, reverse=True)
+
+            pred_items = [
+                ScorerPredictionItem(
+                    candidate_id=c.id,
+                    rank=r_idx,
+                    score=sc_item.score,
+                    reason=sc_item.reason,
+                    subscores={
+                        "hook_score": sc_item.hook_score,
+                        "standalone_score": sc_item.standalone_score,
+                        "emotion_score": sc_item.emotion_score,
+                        "information_score": sc_item.information_score,
+                        "shareability_score": getattr(sc_item, "shareability_score", 0.0),
+                    },
+                )
+                for r_idx, (c, sc_item) in enumerate(cand_score_pairs, start=1)
+            ]
+
+            pred_doc = ScorerPredictionDocument(
+                candidate_set_id=candidate_set_id,
+                scorer=scorer_name.lower(),
+                scorer_version=scorer_ver,
+                model=cfg.llm_model if cfg.scorer == "llm" else None,
+                predictions=pred_items,
+            )
+            save_json(pred_doc, scores_dir / scorer_file_name)
+            logger.info("scoring", f"saved predictions to scores/{scorer_file_name}")
+        except Exception as score_save_err:
+            logger.warning("scoring", f"failed to write prediction file: {score_save_err}")
+
         timings.scoring_seconds = round(time.perf_counter() - scoring_start, 3)
 
     # ==========================================
@@ -588,6 +645,7 @@ def run_pipeline(
             vad_filter=cfg.asr_vad_filter,
         ),
         candidate_config=CandidateConfigInfo(
+            candidate_set_id=candidate_set_id,
             min_seconds=cfg.highlight_min_seconds,
             target_seconds=cfg.highlight_target_seconds,
             max_seconds=cfg.highlight_max_seconds,

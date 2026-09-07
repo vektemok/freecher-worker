@@ -9,13 +9,14 @@ from typing import Set
 from arny_worker.highlights.models import CandidateWindow, HighlightScore
 from .base import HighlightScorer
 
-HEURISTIC_SCORER_VERSION = "1.1.0"
+HEURISTIC_SCORER_VERSION = "heuristic_v1"
 
 
 class HeuristicScorer(HighlightScorer):
     """Scorer utilizing linguistic, pacing, and emotional cues to evaluate highlight potential."""
 
     def __init__(self) -> None:
+        self.name = "heuristic"
         self.version = HEURISTIC_SCORER_VERSION
 
     # Russian and English hook keywords

@@ -54,6 +54,7 @@ class OpenAILLMScorer(HighlightScorer):
         self.api_key = api_key or ""
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.name = "llm"
         self.version = SCORER_VERSION
         self.fallback_scorer = HeuristicScorer()
 
