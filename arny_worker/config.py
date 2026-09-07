@@ -47,6 +47,35 @@ class Settings(BaseSettings):
     # Paths
     output_dir: Path = Field(default=Path("runs"), description="Base directory for run outputs")
 
+    # Phase 2 — Boundary Refinement Settings
+    boundary_max_shift_seconds: float = Field(default=5.0, description="Max seconds to shift highlight boundaries")
+    boundary_context_before: float = Field(default=0.5, description="Context seconds preserved before phrase start")
+    boundary_context_after: float = Field(default=0.5, description="Context seconds preserved after phrase end")
+
+    # Phase 2 — Refined ASR with Word Timestamps
+    refinement_asr_model: str = Field(default="medium", description="ASR model for refined word timestamping")
+    refinement_asr_compute_type: str = Field(default="int8", description="Compute type for refined ASR")
+
+    # Phase 2 — Subtitles & ASS Styling
+    subtitle_font: str = Field(default="Montserrat, DejaVu Sans, Arial", description="Font family for subtitles")
+    subtitle_font_size: int = Field(default=54, description="Font size for vertical video ASS subtitles")
+    subtitle_max_words: int = Field(default=4, description="Maximum words grouped per subtitle event")
+    subtitle_active_word: bool = Field(default=True, description="Enable active spoken word karaoke pop effect")
+
+    # Phase 2 — Smart Crop 9:16 Settings
+    crop_analysis_fps: float = Field(default=2.0, description="Frame sampling rate (FPS) for subject detection")
+    crop_deadzone_ratio: float = Field(default=0.03, description="Dead-zone ratio of width to suppress jitter")
+    crop_max_velocity_pixels_per_sec: float = Field(default=200.0, description="Maximum pan velocity in pixels/second")
+
+    # Phase 2 — Audio Loudness Normalization Settings (EBU R128)
+    audio_normalize_loudness: bool = Field(default=True, description="Enable two-pass loudness normalization")
+    audio_target_i: float = Field(default=-16.0, description="Target integrated loudness in LUFS")
+    audio_target_lra: float = Field(default=11.0, description="Target loudness range in LU")
+    audio_target_tp: float = Field(default=-1.5, description="Maximum true peak in dBFS")
+
+    # Phase 2 — Render Presets
+    render_preset: str = Field(default="shorts", description="Render preset (shorts, tiktok, reels, original)")
+
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")
 

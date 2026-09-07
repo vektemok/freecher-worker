@@ -36,6 +36,13 @@ from arny_worker.scoring.heuristic import HeuristicScorer
 from arny_worker.scoring.llm import OpenAILLMScorer
 from arny_worker.media.clipper import is_nvenc_available
 from arny_worker.pipeline.processor import Manifest, run_pipeline
+from arny_worker.rendering import (
+    AVAILABLE_PRESETS,
+    get_preset,
+    render_highlights_for_run,
+    render_single_short,
+)
+from arny_worker.transcription.models import Transcript
 from arny_worker.utils.json_io import load_json, save_json
 
 app = typer.Typer(
@@ -281,6 +288,36 @@ def inspect_command(
             content += f"[bold]Clip:[/bold] {resolved_dir / hl.file}"
 
         console.print(Panel(content.strip(), title=header, title_align="left", expand=False))
+
+    render_manifest_file = resolved_dir / "render_manifest.json"
+    if render_manifest_file.is_file():
+        try:
+            rm_data = load_json(render_manifest_file)
+            rm_shorts = rm_data.get("shorts", [])
+            if rm_shorts:
+                console.print(f"\n[bold green]Rendered Vertical Shorts ({len(rm_shorts)}):[/bold green]")
+                r_table = Table(show_header=True, header_style="bold green")
+                r_table.add_column("Rank", width=6, justify="center")
+                r_table.add_column("Candidate", style="dim", width=14)
+                r_table.add_column("Refined Window", width=18)
+                r_table.add_column("Dur", width=8, justify="right")
+                r_table.add_column("Resolution", width=11)
+                r_table.add_column("Encoder", width=12)
+                r_table.add_column("Short File")
+                for s in rm_shorts:
+                    ref_win = f"{_format_timestamp(s['refined_start'])} -> {_format_timestamp(s['refined_end'])}"
+                    r_table.add_row(
+                        f"#{s['rank']}",
+                        s.get("candidate_id", ""),
+                        ref_win,
+                        f"{s.get('duration', 0.0):.1f}s",
+                        s.get("resolution", "1080x1920"),
+                        s.get("encoder", "unknown"),
+                        s.get("file", ""),
+                    )
+                console.print(r_table)
+        except Exception:
+            pass
 
 
 @app.command("export-eval")
@@ -874,6 +911,255 @@ def compare_scorers_command(
     console.print()
 
 
+@app.command("render")
+def render_command(
+    run_arg: str = typer.Argument(
+        ...,
+        help="Path to run directory or run directory name in runs/ (e.g. 'runs/20260907_test')",
+    ),
+    preset: str = typer.Option(
+        "shorts",
+        "--preset",
+        "-p",
+        help=f"Rendering preset to use: {', '.join(AVAILABLE_PRESETS.keys())}",
+    ),
+    top_k: int = typer.Option(
+        3,
+        "--top-k",
+        "-k",
+        help="Number of top highlights to render as vertical short-form videos",
+    ),
+    no_crop: bool = typer.Option(
+        False,
+        "--no-crop",
+        help="Disable smart vertical crop (uses static 9:16 center crop)",
+    ),
+    no_subtitles: bool = typer.Option(
+        False,
+        "--no-subtitles",
+        help="Disable ASS karaoke subtitles overlay",
+    ),
+    no_loudnorm: bool = typer.Option(
+        False,
+        "--no-loudnorm",
+        help="Disable two-stage EBU R128 audio loudness normalization",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force re-rendering even if output short files already exist",
+    ),
+) -> None:
+    """Render top highlights from an existing run into 9:16 publication-ready vertical short-form videos."""
+    try:
+        run_dir = _resolve_run_path(run_arg)
+    except FileNotFoundError as err:
+        console.print(f"[bold red]Error:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    if preset not in AVAILABLE_PRESETS:
+        console.print(f"[bold red]Error:[/bold red] Unknown preset '{preset}'. Available: {', '.join(AVAILABLE_PRESETS.keys())}")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold cyan]=== Starting Short-Form Rendering MVP ===[/bold cyan]")
+    console.print(f"Run Directory:   [bold]{run_dir}[/bold]")
+    console.print(f"Preset:          [bold]{preset}[/bold]")
+    console.print(f"Top K:           [bold]{top_k}[/bold]")
+    console.print(f"Smart Crop:      [bold]{'Disabled' if no_crop else 'Enabled (Subject Tracking)'}[/bold]")
+    console.print(f"Karaoke Subs:    [bold]{'Disabled' if no_subtitles else 'Enabled (ASS)'}[/bold]")
+    console.print(f"Audio Loudnorm:  [bold]{'Disabled' if no_loudnorm else 'Enabled (EBU R128 Two-Stage)'}[/bold]\n")
+
+    try:
+        manifest = render_highlights_for_run(
+            run_dir=run_dir,
+            preset_name=preset,
+            top_k=top_k,
+            enable_smart_crop=not no_crop,
+            enable_subtitles=not no_subtitles,
+            enable_audio_normalization=not no_loudnorm,
+            force=force,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Rendering Failed:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Rank", width=6, justify="center")
+    table.add_column("Candidate ID", style="dim", width=14)
+    table.add_column("Refined Window", width=18)
+    table.add_column("Dur", width=8, justify="right")
+    table.add_column("Resolution", width=11)
+    table.add_column("Encoder", width=12)
+    table.add_column("Validation", width=12)
+    table.add_column("Output File")
+
+    for item in manifest.shorts:
+        ref = f"{_format_timestamp(item.refined_start)} -> {_format_timestamp(item.refined_end)}"
+        dur = f"{item.duration:.1f}s"
+        val_status = "[green]PASSED[/green]" if item.validation and item.validation.passed else "[red]FAILED[/red]"
+        table.add_row(
+            f"#{item.rank}",
+            item.candidate_id,
+            ref,
+            dur,
+            item.resolution,
+            item.encoder,
+            val_status,
+            item.file,
+        )
+
+    console.print(table)
+    console.print(f"\n[bold green]✓ Successfully rendered {len(manifest.shorts)} vertical video(s).[/bold green]")
+    console.print(f"Manifest: [bold]{run_dir / 'render_manifest.json'}[/bold]\n")
+
+
+@app.command("render-highlight")
+def render_highlight_command(
+    run_arg: str = typer.Argument(
+        ...,
+        help="Path to run directory or run directory name in runs/",
+    ),
+    rank: Optional[int] = typer.Option(
+        None,
+        "--rank",
+        "-r",
+        help="Rank of the highlight to render (e.g. 1)",
+    ),
+    candidate_id: Optional[str] = typer.Option(
+        None,
+        "--candidate-id",
+        "-c",
+        help="Candidate ID of the highlight to render (e.g. 'cand_0003')",
+    ),
+    preset: str = typer.Option(
+        "shorts",
+        "--preset",
+        "-p",
+        help=f"Rendering preset to use: {', '.join(AVAILABLE_PRESETS.keys())}",
+    ),
+    no_crop: bool = typer.Option(
+        False,
+        "--no-crop",
+        help="Disable smart crop face/subject tracking (uses static 9:16 center crop)",
+    ),
+    no_subtitles: bool = typer.Option(
+        False,
+        "--no-subtitles",
+        help="Disable ASS karaoke subtitles overlay",
+    ),
+    no_loudnorm: bool = typer.Option(
+        False,
+        "--no-loudnorm",
+        help="Disable two-stage EBU R128 audio loudness normalization",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force re-rendering even if output short file already exists",
+    ),
+) -> None:
+    """Render a specific highlight from a run into a 9:16 publication-ready vertical video."""
+    if rank is None and candidate_id is None:
+        console.print("[bold red]Error:[/bold red] Either --rank or --candidate-id must be specified.")
+        raise typer.Exit(code=1)
+
+    try:
+        run_dir = _resolve_run_path(run_arg)
+    except FileNotFoundError as err:
+        console.print(f"[bold red]Error:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    if preset not in AVAILABLE_PRESETS:
+        console.print(f"[bold red]Error:[/bold red] Unknown preset '{preset}'. Available: {', '.join(AVAILABLE_PRESETS.keys())}")
+        raise typer.Exit(code=1)
+
+    highlights_file = run_dir / "highlights.json"
+    manifest_file = run_dir / "manifest.json"
+    transcript_file = run_dir / "transcript.json"
+
+    if not highlights_file.is_file():
+        console.print(f"[bold red]Error:[/bold red] {highlights_file} not found.")
+        raise typer.Exit(code=1)
+    if not manifest_file.is_file():
+        console.print(f"[bold red]Error:[/bold red] {manifest_file} not found.")
+        raise typer.Exit(code=1)
+    if not transcript_file.is_file():
+        console.print(f"[bold red]Error:[/bold red] {transcript_file} not found.")
+        raise typer.Exit(code=1)
+
+    man = load_json(manifest_file)
+    source_video = Path(man["source"])
+    if not source_video.is_file():
+        console.print(f"[bold red]Error:[/bold red] Source video does not exist: {source_video}")
+        raise typer.Exit(code=1)
+
+    transcript = Transcript.model_validate(load_json(transcript_file))
+    highlights_data = load_json(highlights_file)
+    highlights = [Highlight.model_validate(h) for h in highlights_data]
+
+    target: Optional[Highlight] = None
+    for h in highlights:
+        if rank is not None and h.rank == rank:
+            target = h
+            break
+        if candidate_id is not None and h.candidate_id == candidate_id:
+            target = h
+            break
+
+    if target is None:
+        identifier = f"rank={rank}" if rank is not None else f"candidate_id={candidate_id}"
+        console.print(f"[bold red]Error:[/bold red] Highlight with {identifier} not found in {highlights_file}.")
+        raise typer.Exit(code=1)
+
+    source_fp_id = man.get("source_fingerprint", {}).get("fingerprint_id", "unknown_fp")
+    video_duration = float(man.get("source_fingerprint", {}).get("duration_seconds", 0.0))
+    if video_duration <= 0.0:
+        info = probe_media(source_video)
+        video_duration = info.duration or 300.0
+
+    selected_preset = get_preset(preset)
+
+    console.print(f"\n[bold cyan]=== Rendering Highlight #{target.rank} ({target.candidate_id}) ===[/bold cyan]")
+    console.print(f"Source Video:    [bold]{source_video}[/bold]")
+    console.print(f"Original Window: [bold]{_format_timestamp(target.start)} -> {_format_timestamp(target.end)}[/bold] ({target.duration:.1f}s)")
+    console.print(f"Preset:          [bold]{preset}[/bold]\n")
+
+    try:
+        item = render_single_short(
+            source_video=source_video,
+            highlight=target,
+            transcript=transcript,
+            source_fingerprint_id=source_fp_id,
+            video_duration=video_duration,
+            run_dir=run_dir,
+            preset=selected_preset,
+            enable_smart_crop=not no_crop,
+            enable_subtitles=not no_subtitles,
+            enable_audio_normalization=not no_loudnorm,
+            force=force,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Rendering Failed:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    val_str = "[bold green]PASSED[/bold green]" if item.validation and item.validation.passed else "[bold red]FAILED[/bold red]"
+    console.print(Panel(
+        f"[bold]Output File:[/bold] {item.file}\n"
+        f"[bold]Resolution:[/bold]  {item.resolution}\n"
+        f"[bold]Refined Window:[/bold] {_format_timestamp(item.refined_start)} -> {_format_timestamp(item.refined_end)} ({item.duration:.1f}s)\n"
+        f"[bold]Reason:[/bold]      {item.refinement_reason}\n"
+        f"[bold]Encoder:[/bold]     {item.encoder}\n"
+        f"[bold]Validation:[/bold]  {val_str}\n"
+        f"[bold]Crop Mode:[/bold]   {item.crop_mode}\n"
+        f"[bold]Subtitles:[/bold]   {item.subtitle_style}\n"
+        f"[bold]Audio Norm:[/bold]  {'Yes' if item.audio_normalized else 'No'}",
+        title=f"Rendered Short #{item.rank}",
+        border_style="green" if (item.validation and item.validation.passed) else "red",
+    ))
+
+
 @app.command("doctor")
 def doctor_command() -> None:
     """Run diagnostics to inspect environment, FFmpeg, CUDA, and faster-whisper availability."""
@@ -921,6 +1207,15 @@ def doctor_command() -> None:
     else:
         table.add_row("FFmpeg NVENC", "[yellow]NOT AVAILABLE[/yellow]", "h264_nvenc unavailable, worker will use libx264 fallback")
 
+    # 4b. FFmpeg libass subtitle burning
+    from arny_worker.rendering.renderer import is_ffmpeg_filter_supported
+    ass_ok = is_ffmpeg_filter_supported("ass") or is_ffmpeg_filter_supported("subtitles")
+    if ass_ok:
+        table.add_row("FFmpeg libass", "[green]OK[/green]", "Subtitle filtering (ass/subtitles) supported for burning subtitles")
+    else:
+        table.add_row("FFmpeg libass", "[yellow]NOT AVAILABLE[/yellow]", "FFmpeg build lacks libass; ASS files saved to disk, burn-in skipped")
+
+
     # 5. faster-whisper
     try:
         import faster_whisper
@@ -965,3 +1260,12 @@ def doctor_command() -> None:
 
     console.print(table)
     console.print()
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
+

@@ -36,7 +36,7 @@ from arny_worker.transcription.whisper import BaseTranscriber, WhisperTranscribe
 from arny_worker.utils.json_io import load_json, save_json
 from arny_worker.utils.logging import WorkerLogger
 
-PIPELINE_VERSION = "0.1.1"
+PIPELINE_VERSION = "0.2.0"
 
 
 class EnvironmentInfo(BaseModel):

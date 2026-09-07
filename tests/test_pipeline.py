@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from arny_worker.config import Settings
 from arny_worker.media.probe import MediaInfo
-from arny_worker.pipeline.processor import run_pipeline
+from arny_worker.pipeline.processor import PIPELINE_VERSION, run_pipeline
 from arny_worker.transcription.models import Transcript, TranscriptSegment
 from arny_worker.transcription.whisper import BaseTranscriber
 
@@ -97,7 +97,7 @@ def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
     assert len(manifest1.highlights) > 0
     assert manifest1.highlights[0].rank == 1
     assert manifest1.timings.total_seconds >= 0.0
-    assert manifest1.pipeline_version == "0.1.1"
+    assert manifest1.pipeline_version == PIPELINE_VERSION
 
     # Check files created
     run_dirs = list((tmp_path / "runs").iterdir())
