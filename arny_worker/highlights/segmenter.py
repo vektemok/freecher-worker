@@ -1,4 +1,8 @@
-"""Candidate window generation from transcript segments."""
+"""Candidate window generation via temporal transcript-window segmentation.
+
+Note: This performs temporal sliding-window segmentation aligned to Whisper
+segment boundaries, not topic/semantic boundary detection.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ def generate_candidate_windows(
     max_seconds: float = 90.0,
     overlap_seconds: float = 15.0,
 ) -> list[CandidateWindow]:
-    """Segment a transcript into overlapping candidate highlight windows.
+    """Segment a transcript into overlapping temporal candidate highlight windows.
 
     Windows are bounded by Whisper segment boundaries (never cutting mid-sentence).
 

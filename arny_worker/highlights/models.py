@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 class CandidateWindow(BaseModel):
-    """A multi-segment candidate highlight window."""
+    """A multi-segment candidate highlight window (temporal windowing bounded by Whisper segments)."""
 
     id: str
     start: float = Field(description="Start time in seconds")
@@ -15,6 +15,17 @@ class CandidateWindow(BaseModel):
     duration: float = Field(description="Duration in seconds (end - start)")
     text: str = Field(description="Aggregated text from included segments")
     segment_ids: list[int] = Field(default_factory=list, description="IDs of included transcript segments")
+
+
+class CandidateDocument(BaseModel):
+    """Container for candidates with generation parameters for cache validation."""
+
+    transcript_hash: str = Field(description="Hash of source transcript segments")
+    min_seconds: float = Field(description="Minimum duration in seconds")
+    target_seconds: float = Field(description="Target duration in seconds")
+    max_seconds: float = Field(description="Maximum duration in seconds")
+    overlap_seconds: float = Field(description="Overlap duration in seconds")
+    candidates: list[CandidateWindow] = Field(default_factory=list)
 
 
 class HighlightScore(BaseModel):
@@ -27,6 +38,8 @@ class HighlightScore(BaseModel):
     information_score: float = Field(ge=0, le=100, description="Information value score (0-100)")
     shareability_score: float = Field(ge=0, le=100, description="Shareability / viral potential score (0-100)")
     reason: str = Field(description="Human-readable explanation of the score")
+    fallback_used: bool = Field(default=False, description="Whether fallback scoring was engaged (e.g. LLM failure)")
+    fallback_reason: Optional[str] = Field(default=None, description="Reason why fallback was triggered")
 
 
 class Highlight(BaseModel):

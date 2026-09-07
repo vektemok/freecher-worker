@@ -1,20 +1,24 @@
 # arny-worker
 
-Local worker for automated highlight discovery in long videos and short clip generation (Phase 1 MVP of an OpusClip alternative).
+Local worker for automated highlight discovery in long videos and short clip generation (Phase 1.1 MVP of an OpusClip alternative).
 
 ---
 
-## Features (Phase 1 MVP)
+## Features (Phase 1.1)
 
-- **End-to-End Pipeline**: From input MP4 to extracted audio, Whisper transcription, candidate window generation, highlight scoring, deduplication, ranking, and final cut MP4 clips.
-- **Hardware-Accelerated ASR**: Configurable `faster-whisper` on GPU (`cuda`) or `cpu` with custom compute types (`int8_float16`, `int8`, `float16`).
-- **Configurable Models**: Seamlessly switch between `small`, `medium`, `turbo`, and other Whisper models via environment variables or CLI flags without changing code.
-- **Standalone Heuristic Scorer**: Evaluates hooks, questions, emotions, concrete facts, pacing, and lexical density with zero external API dependencies.
-- **Optional OpenAI-Compatible LLM Scorer**: Pluggable LLM scoring with graceful fallback to heuristic scoring.
-- **Smart Sliding Window**: Segment aggregation bounded strictly by natural phrase boundaries (~30-90s, target 60s, ~15s overlap).
-- **Temporal Deduplication**: Non-Maximum Suppression (NMS) suppressing overlapping candidates (>60% temporal overlap) to guarantee varied highlights.
-- **Hardware-Accelerated Clipping**: Auto-detects `h264_nvenc` and transparently falls back to `libx264` if unavailable. Includes contextual padding (±2.0s).
-- **Stage Caching**: Reuses `media.json`, `audio.wav`, `transcript.json`, and `candidates.json` across reruns to avoid re-transcribing long videos.
+- **End-to-End Pipeline**: From input MP4 to extracted audio, Whisper transcription, temporal candidate window generation, highlight scoring, deduplication, ranking, and final cut MP4 clips.
+- **Configuration-Aware Cache Invalidation**: Caches artifacts deterministically. Automatically invalidates transcription cache if ASR model, device, compute type, language, beam size, or VAD settings change. Automatically invalidates candidate cache if window parameters or transcript change.
+- **Source Fingerprinting**: Media files are tracked by resolved path, file size, modification nanoseconds, duration, and a lightweight chunk-based content hash (fast even on multi-gigabyte videos).
+- **Observable Cache Logging**: Stage logs clearly state `cache HIT`, `cache MISS` with exact reason, and differentiate between `reused cached clip` and `created clip`.
+- **Reproducible Manifest**: Expanded `manifest.json` recording environment, full ASR and candidate configs, scorer version, LLM fallback tracking, per-stage timings, and statistics.
+- **Analysis-Only Mode (`--analysis-only`)**: Runs full discovery, scoring, and ranking without invoking FFmpeg video clip re-encoding.
+- **Inspection CLI (`inspect`)**: Terminal inspection command displaying top highlights with human-readable timestamps (`MM:SS`), duration, text preview, reasons, and subscores.
+- **Evaluation Export CLI (`export-eval`)**: Exports candidates to `evaluation.json` with empty human rating fields (`human_label: null`, `human_score: null` [0-4], `human_notes: null`) for scientific benchmarking.
+- **Standalone Heuristic Scorer**: Evaluates hooks, questions, emotions, concrete facts, pacing, and repetition penalties with zero external API dependencies.
+- **Observable LLM Scorer**: Pluggable OpenAI-compatible LLM scoring with explicit tracking of fallback reason if the API fails.
+- **Temporal Candidate Windowing**: Segment aggregation bounded strictly by natural phrase boundaries (~30-90s, target 60s, ~15s overlap).
+- **Temporal Deduplication**: Non-Maximum Suppression (NMS) suppressing overlapping candidates (>60% temporal overlap).
+- **Hardware-Accelerated Clipping**: Auto-detects `h264_nvenc` with automatic fallback to `libx264`. Includes contextual padding (±2.0s).
 - **Environment Doctor**: Built-in `python -m arny_worker doctor` command for environment diagnostics.
 
 ---
@@ -32,6 +36,7 @@ arny-worker/
         media/
             __init__.py
             probe.py
+            fingerprint.py
             audio.py
             clipper.py
 
@@ -74,6 +79,10 @@ arny-worker/
         test_scoring.py
         test_json_io.py
         test_pipeline.py
+        test_cache_invalidation.py
+        test_analysis_only.py
+        test_inspect_and_eval.py
+        test_llm_observability.py
 
     benchmark_whisper.py
     requirements.txt
@@ -112,19 +121,64 @@ python -m arny_worker doctor
 
 ---
 
-## Usage
+## CLI Usage
 
 ### Process a Video
 
 ```bash
+# Full process with MP4 clipping
 python -m arny_worker process test.mp4 \
   --language ru \
   --model small \
   --compute-type int8_float16 \
   --top-k 5
+
+# Analysis-only (skip video rendering for rapid iteration & evaluation)
+python -m arny_worker process test.mp4 \
+  --language ru \
+  --analysis-only
 ```
 
-### CLI Parameters
+### Inspect a Run
+
+```bash
+python -m arny_worker inspect runs/20260907_082719_test
+```
+
+### Export Evaluation Dataset
+
+```bash
+python -m arny_worker export-eval runs/20260907_082719_test
+```
+
+Generates `evaluation.json` with candidate highlights and blank human feedback fields:
+
+```json
+[
+  {
+    "candidate_id": "cand_002",
+    "rank": 1,
+    "start": 45.44,
+    "end": 71.96,
+    "duration": 26.52,
+    "text": "...",
+    "score": 87.9,
+    "subscores": {
+      "hook_score": 100.0,
+      "standalone_score": 100.0,
+      "emotion_score": 64.0,
+      "information_score": 88.0,
+      "shareability_score": 84.4
+    },
+    "reason": "...",
+    "human_label": null,
+    "human_score": null,
+    "human_notes": null
+  }
+]
+```
+
+### CLI Parameters for `process`
 
 - `video_path`: Path to input video (required).
 - `-o, --output`: Base output directory (default: `runs/`).
@@ -135,82 +189,8 @@ python -m arny_worker process test.mp4 \
 - `-k, --top-k`: Number of top highlight clips to generate. Default: `5`.
 - `-s, --scorer`: Scorer to use (`heuristic` or `llm`). Default: `heuristic`.
 - `-f, --force`: Ignore cached stage artifacts and force recalculation.
+- `--analysis-only`: Skip video clip cutting, only produce transcript, candidates, scores, and manifest.
 - `--run-id`: Resume or target a specific run directory name.
-
----
-
-## Output Artifacts
-
-Each processing run creates a structured directory in `runs/<run_id>/` (e.g., `runs/20260907_021500_test/`):
-
-```
-runs/20260907_021500_test/
-    media.json          # Container and stream metadata
-    audio.wav           # Extracted 16kHz mono PCM WAV
-    transcript.json     # Materialized Whisper transcript segments
-    candidates.json     # Generated candidate windows
-    highlights.json     # Ranked top-K highlights
-    manifest.json       # Final run manifest and clip metadata
-    clips/
-        clip_01.mp4     # Generated highlight video clips
-        clip_02.mp4
-        ...
-    logs/
-        worker.log      # Complete stage timing log
-```
-
-### Sample `manifest.json`:
-
-```json
-{
-  "source": "/path/to/test.mp4",
-  "duration": 2038.8,
-  "processing_time": 231.7,
-  "created_at": "2026-09-07T02:18:51",
-  "asr": {
-    "model": "small",
-    "compute_type": "int8_float16",
-    "device": "cuda"
-  },
-  "highlights": [
-    {
-      "rank": 1,
-      "start": 120.5,
-      "end": 181.2,
-      "duration": 60.7,
-      "score": 88.5,
-      "reason": "Heuristic (88.5/100): opening question hook; emotional keywords (ого, жесть); concrete numbers / data points",
-      "file": "clips/clip_01.mp4",
-      "candidate_id": "cand_003",
-      "padded_start": 118.5,
-      "padded_end": 183.2
-    }
-  ]
-}
-```
-
----
-
-## Configuration via Environment Variables
-
-Copy `.env.example` to `.env` and customize:
-
-```bash
-cp .env.example .env
-```
-
-Available variables:
-- `ARNY_ASR_MODEL`: `small`, `medium`, `turbo`
-- `ARNY_ASR_DEVICE`: `cuda`, `cpu`
-- `ARNY_ASR_COMPUTE_TYPE`: `int8_float16`, `int8`, `float16`
-- `ARNY_HIGHLIGHT_MIN_SECONDS`: `30`
-- `ARNY_HIGHLIGHT_TARGET_SECONDS`: `60`
-- `ARNY_HIGHLIGHT_MAX_SECONDS`: `90`
-- `ARNY_HIGHLIGHT_TOP_K`: `5`
-- `ARNY_SCORER`: `heuristic` or `llm`
-- `ARNY_LLM_BASE_URL`: OpenAI-compatible endpoint URL
-- `ARNY_LLM_API_KEY`: API Key
-- `ARNY_LLM_MODEL`: e.g. `gpt-4o-mini`
 
 ---
 

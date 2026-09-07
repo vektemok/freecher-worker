@@ -1,4 +1,4 @@
-"""OpenAI-compatible LLM Highlight Scorer with JSON validation and graceful fallback."""
+"""OpenAI-compatible LLM Highlight Scorer with JSON validation and graceful fallback observability."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .heuristic import HeuristicScorer
 
 logger = logging.getLogger("arny_worker")
 
+SCORER_VERSION = "1.1.0"
 
 SYSTEM_PROMPT = """You are an expert short-form video editor (Shorts, Reels, TikTok).
 Evaluate whether the following speech transcript fragment is suitable for a standalone viral clip.
@@ -40,7 +41,7 @@ Do not include any Markdown fencing like ```json, just pure raw JSON."""
 
 
 class OpenAILLMScorer(HighlightScorer):
-    """Highlight scorer connecting to an OpenAI-compatible API endpoint."""
+    """Highlight scorer connecting to an OpenAI-compatible API endpoint with explicit fallback observability."""
 
     def __init__(
         self,
@@ -53,15 +54,28 @@ class OpenAILLMScorer(HighlightScorer):
         self.api_key = api_key or ""
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.version = SCORER_VERSION
         self.fallback_scorer = HeuristicScorer()
 
     def score(self, candidate: CandidateWindow) -> HighlightScore:
-        """Score candidate using OpenAI-compatible API, falling back to heuristic scorer on failure."""
+        """Score candidate using OpenAI-compatible API, recording fallback metadata if failed."""
         if not self.api_key:
+            reason = "ARNY_LLM_API_KEY is not set"
             logger.warning(
-                f"[scoring] ARNY_LLM_API_KEY is not set. Falling back to HeuristicScorer for candidate {candidate.id}"
+                f"[scoring] LLM fallback engaged for {candidate.id}: {reason}. Falling back to HeuristicScorer."
             )
-            return self.fallback_scorer.score(candidate)
+            heuristic_res = self.fallback_scorer.score(candidate)
+            return HighlightScore(
+                score=heuristic_res.score,
+                hook_score=heuristic_res.hook_score,
+                standalone_score=heuristic_res.standalone_score,
+                emotion_score=heuristic_res.emotion_score,
+                information_score=heuristic_res.information_score,
+                shareability_score=heuristic_res.shareability_score,
+                reason=f"{heuristic_res.reason} [Fallback: {reason}]",
+                fallback_used=True,
+                fallback_reason=reason,
+            )
 
         user_content = (
             f"Candidate ID: {candidate.id}\n"
@@ -92,7 +106,7 @@ class OpenAILLMScorer(HighlightScorer):
                 data = resp.json()
 
             choice_content = data["choices"][0]["message"]["content"].strip()
-            # Strip potential ```json ``` fences if model added them despite instructions
+            # Strip potential ```json ``` fences if model added them
             if choice_content.startswith("```"):
                 choice_content = choice_content.strip("`")
                 if choice_content.startswith("json"):
@@ -107,10 +121,13 @@ class OpenAILLMScorer(HighlightScorer):
                 information_score=float(parsed.get("information_score", parsed["score"])),
                 shareability_score=float(parsed.get("shareability_score", parsed["score"])),
                 reason=f"LLM ({self.model}): {parsed.get('reason', 'Evaluated by LLM')}",
+                fallback_used=False,
+                fallback_reason=None,
             )
         except Exception as exc:
+            fallback_err = f"{type(exc).__name__}: {exc}"
             logger.warning(
-                f"[scoring] LLM scoring failed for {candidate.id} ({exc}). Falling back to heuristic scorer."
+                f"[scoring] LLM fallback engaged for {candidate.id}: {fallback_err}. Falling back to HeuristicScorer."
             )
             heuristic_result = self.fallback_scorer.score(candidate)
             return HighlightScore(
@@ -120,5 +137,7 @@ class OpenAILLMScorer(HighlightScorer):
                 emotion_score=heuristic_result.emotion_score,
                 information_score=heuristic_result.information_score,
                 shareability_score=heuristic_result.shareability_score,
-                reason=f"{heuristic_result.reason} [Note: LLM fallback due to {type(exc).__name__}]",
+                reason=f"{heuristic_result.reason} [Fallback: {fallback_err}]",
+                fallback_used=True,
+                fallback_reason=fallback_err,
             )

@@ -28,6 +28,7 @@ class BaseTranscriber(ABC):
         self,
         audio_path: Path | str,
         language: Optional[str] = None,
+        source_fingerprint_id: Optional[str] = None,
     ) -> Transcript:
         """Transcribe an audio file into a normalized Transcript."""
         pass
@@ -86,6 +87,7 @@ class WhisperTranscriber(BaseTranscriber):
         self,
         audio_path: Path | str,
         language: Optional[str] = None,
+        source_fingerprint_id: Optional[str] = None,
     ) -> Transcript:
         """Transcribe audio file to normalized Transcript object.
 
@@ -140,11 +142,14 @@ class WhisperTranscriber(BaseTranscriber):
             duration = segments[-1].end
 
         return Transcript(
+            source_fingerprint_id=source_fingerprint_id,
             language=info.language if hasattr(info, "language") else (language or "unknown"),
             language_probability=round(getattr(info, "language_probability", 1.0), 3),
             duration=round(duration, 3),
             model=self.model_name,
             compute_type=self.compute_type,
             device=self.device,
+            beam_size=self.beam_size,
+            vad_filter=self.vad_filter,
             segments=segments,
         )

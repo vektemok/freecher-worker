@@ -1,21 +1,20 @@
 """Tests for end-to-end pipeline orchestration and caching."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from arny_worker.config import Settings
 from arny_worker.media.probe import MediaInfo
 from arny_worker.pipeline.processor import run_pipeline
 from arny_worker.transcription.models import Transcript, TranscriptSegment
 from arny_worker.transcription.whisper import BaseTranscriber
-from arny_worker.utils.json_io import load_json
 
 
 class FakeTranscriber(BaseTranscriber):
     def __init__(self):
         self.call_count = 0
 
-    def transcribe(self, audio_path, language=None):
+    def transcribe(self, audio_path, language=None, source_fingerprint_id=None):
         self.call_count += 1
         segments = [
             TranscriptSegment(id=0, start=0.0, end=15.0, text="Привет всем, это первое введение в тему!"),
@@ -24,12 +23,15 @@ class FakeTranscriber(BaseTranscriber):
             TranscriptSegment(id=3, start=71.0, end=110.0, text="В итоге результат превзошел все ожидания, обязательно попробуйте сами."),
         ]
         return Transcript(
+            source_fingerprint_id=source_fingerprint_id,
             language="ru",
             language_probability=0.99,
             duration=115.0,
             model="small",
             compute_type="int8_float16",
             device="cuda",
+            beam_size=5,
+            vad_filter=True,
             segments=segments,
         )
 
@@ -39,7 +41,7 @@ class FakeTranscriber(BaseTranscriber):
 @patch("arny_worker.pipeline.processor.probe_media")
 def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
     video_file = tmp_path / "sample_video.mp4"
-    video_file.touch()
+    video_file.write_bytes(b"dummy_video_content_for_test")
 
     media_info = MediaInfo(
         path=str(video_file),
@@ -49,7 +51,7 @@ def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
         fps=30.0,
         video_codec="h264",
         audio_codec="aac",
-        file_size=1048576,
+        file_size=len(b"dummy_video_content_for_test"),
         has_audio=True,
     )
     mock_probe.return_value = media_info
@@ -94,6 +96,8 @@ def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
     assert fake_transcriber.call_count == 1
     assert len(manifest1.highlights) > 0
     assert manifest1.highlights[0].rank == 1
+    assert manifest1.timings.total_seconds >= 0.0
+    assert manifest1.pipeline_version == "0.1.1"
 
     # Check files created
     run_dirs = list((tmp_path / "runs").iterdir())
@@ -108,7 +112,7 @@ def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
     assert (active_run / "manifest.json").is_file()
     assert (active_run / "logs" / "worker.log").is_file()
 
-    # SECOND RUN: Test caching - probe, audio extraction, and transcription should be skipped!
+    # SECOND RUN: Test caching - probe, audio extraction, and transcription should be reused
     manifest2 = run_pipeline(
         video_path=video_file,
         output_dir=tmp_path / "runs",
@@ -117,6 +121,6 @@ def test_pipeline_run_and_cache(mock_probe, mock_extract, mock_clip, tmp_path):
         transcriber=fake_transcriber,
     )
 
-    # Transcriber call count should NOT increase because transcript.json was reused!
+    # Transcriber call count must NOT increase because transcript.json was reused
     assert fake_transcriber.call_count == 1
     assert len(manifest2.highlights) == len(manifest1.highlights)

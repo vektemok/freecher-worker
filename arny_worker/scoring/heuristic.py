@@ -9,9 +9,14 @@ from typing import Set
 from arny_worker.highlights.models import CandidateWindow, HighlightScore
 from .base import HighlightScorer
 
+HEURISTIC_SCORER_VERSION = "1.1.0"
+
 
 class HeuristicScorer(HighlightScorer):
     """Scorer utilizing linguistic, pacing, and emotional cues to evaluate highlight potential."""
+
+    def __init__(self) -> None:
+        self.version = HEURISTIC_SCORER_VERSION
 
     # Russian and English hook keywords
     HOOK_QUESTION_WORDS: Set[str] = {
@@ -65,10 +70,10 @@ class HeuristicScorer(HighlightScorer):
                 information_score=10.0,
                 shareability_score=10.0,
                 reason="Fragment contains almost no speech words.",
+                fallback_used=False,
             )
 
         # 1. Hook Score (0-100)
-        # Check first ~25 words for questions, intrigue, or direct audience address
         first_words = set(words[:25])
         has_question_hook = "?" in text[:120] or bool(first_words & self.HOOK_QUESTION_WORDS)
         has_intrigue = bool(first_words & self.HOOK_INTRIGUE_WORDS)
@@ -92,7 +97,6 @@ class HeuristicScorer(HighlightScorer):
         # 2. Emotion Score (0-100)
         exclamation_count = text.count("!")
         emotion_matches = [w for w in words if w in self.EMOTIONAL_WORDS]
-        # Count capitalized words (intensity)
         all_tokens = text.split()
         caps_tokens = [t for t in all_tokens if t.isupper() and len(t) > 2]
 
@@ -126,7 +130,6 @@ class HeuristicScorer(HighlightScorer):
         information_score = min(100.0, information_score)
 
         # 4. Standalone Score (0-100)
-        # Check clean start and clean finish
         standalone_score = 60.0
         first_word = words[0] if words else ""
         if first_word in self.DANGLING_STARTS:
@@ -134,7 +137,6 @@ class HeuristicScorer(HighlightScorer):
         else:
             standalone_score += 15.0
 
-        # Ends with sentence terminal punctuation
         if text.endswith((".", "!", "?", "...", '."', '!"', '?"')):
             standalone_score += 15.0
         else:
@@ -146,7 +148,6 @@ class HeuristicScorer(HighlightScorer):
         standalone_score = max(10.0, min(100.0, standalone_score))
 
         # 5. Shareability Score (0-100)
-        # Weighted blend of hook, emotion, information
         shareability_score = round(0.40 * hook_score + 0.35 * emotion_score + 0.25 * information_score, 1)
         shareability_score = max(0.0, min(100.0, shareability_score))
 
@@ -186,4 +187,6 @@ class HeuristicScorer(HighlightScorer):
             information_score=round(information_score, 1),
             shareability_score=round(shareability_score, 1),
             reason=f"Heuristic ({overall}/100): {reason_str}",
+            fallback_used=False,
+            fallback_reason=None,
         )
