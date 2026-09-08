@@ -3,7 +3,11 @@
 from .models import DetectedSubject, CropPoint, CropTrajectory
 from .detector import SubjectDetector, HaarCascadeFaceDetector, CenterCropDetector, get_subject_detector
 from .tracker import calculate_crop_dimensions, select_target_center, generate_crop_trajectory
-from .expression import build_ffmpeg_crop_x_expression, simplify_trajectory_points
+from .expression import (
+    build_ffmpeg_crop_expression,
+    build_ffmpeg_crop_x_expression,
+    simplify_trajectory_points,
+)
 
 __all__ = [
     "DetectedSubject",
@@ -16,6 +20,7 @@ __all__ = [
     "calculate_crop_dimensions",
     "select_target_center",
     "generate_crop_trajectory",
+    "build_ffmpeg_crop_expression",
     "build_ffmpeg_crop_x_expression",
     "simplify_trajectory_points",
 ]

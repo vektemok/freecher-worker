@@ -43,6 +43,12 @@ from freecher_worker.rendering import (
     render_highlights_for_run,
     render_single_short,
 )
+from freecher_worker.shorts import (
+    ASPECT_RATIO,
+    AVAILABLE_DURATION_MODES,
+    DURATION_MODE_AUTO,
+    render_shorts_for_run,
+)
 from freecher_worker.multimodal import (
     MultimodalReranker,
     OpenAIMultimodalProvider,
@@ -1541,6 +1547,244 @@ def render_highlight_command(
         title=f"Rendered Short #{item.rank}",
         border_style="green" if (item.validation and item.validation.passed) else "red",
     ))
+
+
+@app.command("render-short")
+def render_short_command(
+    run_arg: str = typer.Argument(
+        ...,
+        help="Path to run directory or run directory name in runs/ (e.g. 'benchmark_02')",
+    ),
+    candidate: str = typer.Option(
+        ...,
+        "--candidate",
+        "-c",
+        help="Candidate ID to turn into a vertical short (e.g. 'cand_037')",
+    ),
+    duration_mode: str = typer.Option(
+        DURATION_MODE_AUTO,
+        "--duration-mode",
+        help=f"Subclip duration mode: {', '.join(AVAILABLE_DURATION_MODES)}",
+    ),
+    encoder: str = typer.Option(
+        "auto",
+        "--encoder",
+        help="Video encoder: auto (NVENC if present, else libx264) | libx264 | h264_nvenc",
+    ),
+    no_reframe: bool = typer.Option(
+        False,
+        "--no-reframe",
+        help="Disable smart subject tracking and use a static 9:16 center crop",
+    ),
+    no_loudnorm: bool = typer.Option(
+        False,
+        "--no-loudnorm",
+        help="Disable EBU R128 audio loudness normalization",
+    ),
+    debug: bool = typer.Option(
+        False,
+        "--debug-overlay",
+        help="Also render a diagnostic video with detection boxes, crop rect and active subject",
+    ),
+) -> None:
+    """Render one ranked candidate into a finished 9:16 1080x1920 short."""
+    _render_shorts_cli(
+        run_arg=run_arg,
+        candidate_ids=[candidate],
+        top=1,
+        duration_mode=duration_mode,
+        encoder=encoder,
+        no_reframe=no_reframe,
+        no_loudnorm=no_loudnorm,
+        debug=debug,
+    )
+
+
+@app.command("render-shorts")
+def render_shorts_command(
+    run_arg: str = typer.Argument(
+        ...,
+        help="Path to run directory or run directory name in runs/ (e.g. 'benchmark_02')",
+    ),
+    top: int = typer.Option(
+        5,
+        "--top",
+        "-n",
+        help="How many top-ranked candidates to turn into shorts",
+    ),
+    duration_mode: str = typer.Option(
+        DURATION_MODE_AUTO,
+        "--duration-mode",
+        help=f"Subclip duration mode: {', '.join(AVAILABLE_DURATION_MODES)}",
+    ),
+    encoder: str = typer.Option(
+        "auto",
+        "--encoder",
+        help="Video encoder: auto (NVENC if present, else libx264) | libx264 | h264_nvenc",
+    ),
+    no_reframe: bool = typer.Option(
+        False,
+        "--no-reframe",
+        help="Disable smart subject tracking and use a static 9:16 center crop",
+    ),
+    no_loudnorm: bool = typer.Option(
+        False,
+        "--no-loudnorm",
+        help="Disable EBU R128 audio loudness normalization",
+    ),
+    debug: bool = typer.Option(
+        False,
+        "--debug-overlay",
+        help="Also render diagnostic videos with detection boxes, crop rect and active subject",
+    ),
+) -> None:
+    """Render the top ranked candidates into finished 9:16 1080x1920 shorts."""
+    _render_shorts_cli(
+        run_arg=run_arg,
+        candidate_ids=None,
+        top=top,
+        duration_mode=duration_mode,
+        encoder=encoder,
+        no_reframe=no_reframe,
+        no_loudnorm=no_loudnorm,
+        debug=debug,
+    )
+
+
+def _render_shorts_cli(
+    run_arg: str,
+    candidate_ids: Optional[list[str]],
+    top: int,
+    duration_mode: str,
+    encoder: str,
+    no_reframe: bool,
+    no_loudnorm: bool,
+    debug: bool,
+) -> None:
+    """Shared implementation for `render-short` and `render-shorts`."""
+    if duration_mode not in AVAILABLE_DURATION_MODES:
+        console.print(
+            f"[bold red]Error:[/bold red] Unknown duration mode '{duration_mode}'. "
+            f"Available: {', '.join(AVAILABLE_DURATION_MODES)}"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        run_dir = _resolve_run_path(run_arg)
+    except FileNotFoundError as err:
+        console.print(f"[bold red]Error:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    console.print("\n[bold cyan]=== Vertical Short Production (9:16 only) ===[/bold cyan]")
+    console.print(f"Run Directory:   [bold]{run_dir}[/bold]")
+    console.print(f"Output Format:   [bold]{ASPECT_RATIO} {settings.shorts_output_width}x{settings.shorts_output_height} H.264 + AAC[/bold]")
+    console.print(f"Duration Mode:   [bold]{duration_mode}[/bold] "
+                  f"(min {settings.subclip_min_duration_sec:g}s, target "
+                  f"{settings.subclip_target_min_duration_sec:g}-{settings.subclip_target_max_duration_sec:g}s, "
+                  f"max {settings.subclip_max_duration_sec:g}s)")
+    console.print(f"Reframing:       [bold]{'Static center crop' if no_reframe else 'Smart subject tracking'}[/bold]")
+    console.print(f"Audio Loudnorm:  [bold]{'Disabled' if no_loudnorm else 'Enabled (EBU R128)'}[/bold]")
+    if candidate_ids:
+        console.print(f"Candidate:       [bold]{', '.join(candidate_ids)}[/bold]\n")
+    else:
+        console.print(f"Top Candidates:  [bold]{top}[/bold]\n")
+
+    try:
+        manifest = render_shorts_for_run(
+            run_dir=run_dir,
+            candidate_ids=candidate_ids,
+            top=top,
+            duration_mode=duration_mode,
+            settings=settings,
+            enable_smart_reframe=not no_reframe,
+            enable_audio_normalization=not no_loudnorm,
+            encoder=encoder,
+            debug_overlay=debug,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Short production failed:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    table.add_column("File", width=14)
+    table.add_column("Candidate", style="dim", width=13)
+    table.add_column("Candidate Window", width=18)
+    table.add_column("Offsets", width=17)
+    table.add_column("Source Range", width=18)
+    table.add_column("Dur", width=8, justify="right")
+    table.add_column("Reframe", width=9)
+    table.add_column("Switches", width=9, justify="right")
+    table.add_column("Enc", width=10)
+    table.add_column("Valid", width=7)
+
+    for item in manifest.shorts:
+        reframe = item.reframe
+        table.add_row(
+            item.file,
+            item.candidate_id,
+            f"{_format_timestamp(item.source_start_sec)}-{_format_timestamp(item.source_end_sec)}",
+            f"{item.short_start_offset_sec:.1f}s-{item.short_end_offset_sec:.1f}s",
+            f"{_format_timestamp(item.short_source_start_sec)}-{_format_timestamp(item.short_source_end_sec)}",
+            f"{item.duration_sec:.1f}s",
+            item.reframing_mode,
+            str(reframe.dominant_subject_switches) if reframe else "-",
+            item.encoder,
+            "[green]OK[/green]" if (item.validation and item.validation.valid) else "[red]FAIL[/red]",
+        )
+
+    console.print(table)
+
+    for item in manifest.shorts:
+        reframe = item.reframe
+        subclip = item.subclip
+        lines = [
+            f"[bold]Candidate duration:[/bold] {item.candidate_duration_sec:.2f}s "
+            f"-> [bold]final duration:[/bold] {item.duration_sec:.2f}s",
+            f"[bold]Selected source range:[/bold] {item.short_source_start_sec:.2f}s - {item.short_source_end_sec:.2f}s",
+        ]
+        if subclip:
+            lines.append(f"[bold]Selection:[/bold] {subclip.reason}")
+            lines.append(
+                f"[bold]Signal source:[/bold] {subclip.signal_source}  "
+                f"[bold]windows evaluated:[/bold] {subclip.evaluated_windows}  "
+                f"[bold]score:[/bold] {subclip.score:.1f}"
+            )
+        if item.advisory_interpretation:
+            lines.append(f"[bold]Advisory region:[/bold] {item.advisory_interpretation} - {item.advisory_reason}")
+        if reframe:
+            lines.append(
+                f"[bold]Subjects:[/bold] max {reframe.max_simultaneous_subjects} simultaneous, "
+                f"{reframe.unique_tracks} tracks, {reframe.detected_subjects_total} detections over "
+                f"{reframe.sampled_frames} sampled frames"
+            )
+            lines.append(
+                f"[bold]Dominant switches:[/bold] {reframe.dominant_subject_switches}  "
+                f"[bold]dual-subject frames:[/bold] {reframe.dual_subject_frames}  "
+                f"[bold]scene cuts:[/bold] {reframe.scene_cuts}"
+            )
+            lines.append(
+                f"[bold]Crop trajectory:[/bold] range {reframe.trajectory.crop_x_range}px, "
+                f"mean {reframe.trajectory.mean_velocity_px_per_sec:.1f}px/s, "
+                f"peak {reframe.trajectory.max_velocity_px_per_sec:.1f}px/s, "
+                f"stationary {reframe.trajectory.stationary_ratio:.0%}"
+            )
+            lines.append(
+                f"[bold]Fallbacks:[/bold] previous={reframe.fallback_previous_frames}, "
+                f"dominant={reframe.fallback_dominant_frames}, center={reframe.fallback_center_frames}"
+            )
+        lines.append(
+            f"[bold]Render:[/bold] {item.timings.get('render_seconds', 0.0):.1f}s "
+            f"(refinement {item.timings.get('subclip_refinement_seconds', 0.0):.2f}s, "
+            f"reframe analysis {item.timings.get('reframe_analysis_seconds', 0.0):.1f}s)"
+        )
+        if item.debug_file:
+            lines.append(f"[bold]Debug overlay:[/bold] {item.debug_file}")
+        console.print(Panel("\n".join(lines), title=f"{item.file} ({item.candidate_id})", border_style="cyan"))
+
+    console.print(f"\n[bold green]OK Produced {len(manifest.shorts)} vertical short(s).[/bold green]")
+    console.print(f"Output: [bold]{run_dir / 'shorts'}[/bold]")
+    console.print(f"Manifest: [bold]{run_dir / 'shorts' / 'shorts_manifest.json'}[/bold]\n")
 
 
 @app.command("doctor")

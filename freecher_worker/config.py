@@ -118,6 +118,47 @@ class Settings(BaseSettings):
     # Phase 2 — Render Presets
     render_preset: str = Field(default="shorts", description="Render preset (shorts, tiktok, reels, original)")
 
+    # Phase 3 — Dynamic Subclip Refinement (post-ranking production stage)
+    subclip_min_duration_sec: float = Field(default=8.0, description="Hard minimum final short duration in seconds")
+    subclip_target_min_duration_sec: float = Field(default=15.0, description="Preferred duration band lower bound")
+    subclip_target_max_duration_sec: float = Field(default=30.0, description="Preferred duration band upper bound")
+    subclip_max_duration_sec: float = Field(default=45.0, description="Hard maximum final short duration in seconds")
+    subclip_duration_mode: str = Field(default="auto", description="Subclip duration mode ('auto' or 'full')")
+    subclip_hook_window_sec: float = Field(default=3.0, description="Leading window measured for hook strength")
+    subclip_tail_window_sec: float = Field(default=3.0, description="Trailing window measured for dead-air penalty")
+    subclip_pre_roll_sec: float = Field(default=0.15, description="Lead-in kept before a phrase onset")
+    subclip_post_roll_sec: float = Field(default=0.30, description="Tail kept after a phrase completes")
+    subclip_boring_threshold: float = Field(default=0.25, description="Normalized activity below which a bin is 'boring'")
+    subclip_strict_timestamps: bool = Field(default=True, description="Reject ambiguous advisory regions instead of guessing")
+    subclip_use_advisory_region: bool = Field(default=True, description="Use multimodal best_observed_region as a soft prior")
+
+    # Phase 3 — Smart 9:16 Reframing
+    reframe_analysis_fps: float = Field(default=5.0, description="Frame sampling rate for detection and tracking")
+    reframe_detector: str = Field(default="haar", description="Subject detector implementation name")
+    reframe_detect_max_width: int = Field(default=640, description="Frames downscaled to this width before detection")
+    reframe_subject_padding_ratio: float = Field(default=0.55, description="Padding around subject box as a ratio of its width")
+    reframe_head_position_ratio: float = Field(default=0.38, description="Vertical position of the face inside the crop (0=top)")
+    reframe_headroom_ratio: float = Field(default=0.45, description="Minimum headroom above the face as a ratio of face height")
+    reframe_edge_margin_ratio: float = Field(default=0.06, description="Minimum margin between subject and crop edge")
+    reframe_deadzone_ratio: float = Field(default=0.02, description="Dead-zone as a ratio of source width to suppress micro-jitter")
+    reframe_smoothing_alpha: float = Field(default=0.22, description="Per-sample proportional gain toward the target center")
+    reframe_max_velocity_px_per_sec: float = Field(default=160.0, description="Maximum crop pan velocity in px/s")
+    reframe_max_acceleration_px_per_sec2: float = Field(default=420.0, description="Maximum crop pan acceleration in px/s^2")
+    reframe_switch_hold_sec: float = Field(default=0.8, description="Sustained evidence required before switching subject")
+    reframe_switch_margin: float = Field(default=0.25, description="Relative score margin required to switch subject")
+    reframe_min_switch_interval_sec: float = Field(default=1.5, description="Minimum seconds between subject switches")
+    reframe_track_max_misses: int = Field(default=6, description="Consecutive missed detections before a track is dropped")
+    reframe_scene_cut_threshold: float = Field(default=0.35, description="Normalized frame difference treated as a scene cut")
+    reframe_dual_subject_balance: float = Field(default=0.35, description="Max relative weight gap for dual-subject framing")
+    reframe_jitter_epsilon_px: float = Field(default=2.0, description="Emitted crop movements below this are suppressed")
+
+    # Phase 3 — Vertical Short Output (always 9:16, no other aspect ratio is supported)
+    shorts_output_width: int = Field(default=1080, description="Final short width in pixels (fixed 9:16 output)")
+    shorts_output_height: int = Field(default=1920, description="Final short height in pixels (fixed 9:16 output)")
+    shorts_encoder: str = Field(default="auto", description="Encoder selection: auto | libx264 | h264_nvenc")
+    shorts_x264_preset: str = Field(default="veryfast", description="libx264 preset for the final encode")
+    shorts_x264_crf: int = Field(default=20, description="libx264 CRF quality for the final encode")
+
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")
 

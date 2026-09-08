@@ -6,11 +6,16 @@ from typing import List
 from .models import CropPoint, CropTrajectory
 
 
-def simplify_trajectory_points(points: List[CropPoint], tolerance_px: float = 2.0) -> List[CropPoint]:
+def simplify_trajectory_points(
+    points: List[CropPoint],
+    tolerance_px: float = 2.0,
+    axis: str = "x",
+) -> List[CropPoint]:
     """Reduce redundant points along linear segments to keep FFmpeg expression compact."""
     if len(points) <= 2:
         return points
 
+    attr = "crop_x" if axis == "x" else "crop_y"
     simplified: List[CropPoint] = [points[0]]
     for i in range(1, len(points) - 1):
         prev_pt = simplified[-1]
@@ -21,14 +26,54 @@ def simplify_trajectory_points(points: List[CropPoint], tolerance_px: float = 2.
         dt_total = next_pt.time - prev_pt.time
         if dt_total > 1e-4:
             alpha = (curr_pt.time - prev_pt.time) / dt_total
-            expected_x = prev_pt.crop_x + alpha * (next_pt.crop_x - prev_pt.crop_x)
-            if abs(curr_pt.crop_x - expected_x) > tolerance_px:
+            expected = getattr(prev_pt, attr) + alpha * (getattr(next_pt, attr) - getattr(prev_pt, attr))
+            if abs(getattr(curr_pt, attr) - expected) > tolerance_px:
                 simplified.append(curr_pt)
         else:
             simplified.append(curr_pt)
 
     simplified.append(points[-1])
     return simplified
+
+
+def build_ffmpeg_crop_expression(
+    trajectory: CropTrajectory,
+    axis: str = "x",
+    escape_for_filter: bool = True,
+) -> str:
+    """Convert one axis of a crop trajectory into a piecewise-linear FFmpeg expression.
+
+    The result is clamped to the valid crop range for that axis and snapped to even integers,
+    which keeps H.264 / yuv420p happy regardless of where the trajectory wandered.
+    """
+    if axis not in ("x", "y"):
+        raise ValueError(f"axis must be 'x' or 'y', got {axis!r}")
+
+    attr = "crop_x" if axis == "x" else "crop_y"
+    bound = "in_w-out_w" if axis == "x" else "in_h-out_h"
+    center_default = f"trunc(({bound})/2)"
+
+    raw_points = trajectory.points
+    if not raw_points:
+        return center_default
+
+    points = simplify_trajectory_points(raw_points, tolerance_px=2.0, axis=axis)
+    first_value = getattr(points[0], attr)
+    if len(points) == 1 or all(getattr(p, attr) == first_value for p in points):
+        return f"{first_value}"
+
+    expr = f"{getattr(points[-1], attr)}"
+    for i in range(len(points) - 2, -1, -1):
+        p0, p1 = points[i], points[i + 1]
+        t0, v0 = p0.time, getattr(p0, attr)
+        t1, v1 = p1.time, getattr(p1, attr)
+        dt = max(0.001, t1 - t0)
+        dv = v1 - v0
+        segment = f"{v0}" if abs(dv) < 1 else f"({v0}+({dv:.1f})*(t-{t0:.2f})/{dt:.3f})"
+        expr = f"if(lte(t,{t1:.2f}),{segment},{expr})"
+
+    clamped = f"2*trunc(min(max(0,{expr}),{bound})/2)"
+    return clamped.replace(",", r"\,") if escape_for_filter else clamped
 
 
 def build_ffmpeg_crop_x_expression(trajectory: CropTrajectory, escape_for_filter: bool = True) -> str:

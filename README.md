@@ -23,6 +23,138 @@ Local worker for automated highlight discovery in long videos and short clip gen
 
 ---
 
+## Vertical Short Production (9:16 only)
+
+Freecher produces exactly one output format: **9:16, 1080x1920, MP4, H.264 + AAC**. There is no
+landscape, square, 4:5 or generic aspect-ratio support, and no CLI flag to request one.
+
+Two production stages run *after* ranking. Neither reads nor modifies `heuristic_v1`,
+`highlight_v2_1`, `multimodal_v1_1` or any scoring weight.
+
+```
+Video -> Whisper -> candidates -> heuristic_v1 + highlight_v2_1 -> shortlist
+      -> multimodal_v1_1 / Luna -> ranked candidate
+      -> [1] Dynamic Subclip Refinement
+      -> [2] Smart 9:16 Reframing
+      -> 1080x1920 MP4 + metadata JSON
+```
+
+### 1. Dynamic Subclip Refinement
+
+A ~60 s candidate is an *analysis* window, not the published short. Inside it, the strongest
+self-contained fragment is selected by `subclip_v1_formula_v1`, scoring hook strength, payoff
+coverage, mean activity, phrase completeness, setup preservation, a soft duration prior and the
+multimodal advisory region, minus dull lead-in and dead-air-tail penalties.
+
+Boundaries snap to Whisper phrase boundaries, so a short never opens or closes mid-sentence.
+Durations are **never quantized**: 11.4 s, 18.7 s, 24.2 s, 31.6 s and 42.0 s are all normal.
+
+Configurable via `FREECHER_SUBCLIP_*` (defaults: min 8 s, target 15-30 s, max 45 s,
+`duration_mode=auto`).
+
+Activity signals are taken from the cached multimodal activity profile when the run has one,
+otherwise from the run's `audio.wav`, otherwise from the transcript alone.
+
+### 2. Timestamp Semantics
+
+Absolute source timestamps and candidate-relative offsets are kept strictly apart:
+
+| Field | Meaning |
+| --- | --- |
+| `source_start_sec` / `source_end_sec` | absolute, measured from the start of the source video |
+| `short_start_offset_sec` / `short_end_offset_sec` | relative to the candidate start, `0 <= offset <= candidate_duration` |
+| `short_source_start_sec` / `short_source_end_sec` | absolute timestamps of the produced short |
+
+All conversion goes through `CandidateTimeframe`, which validates every offset. An incoming
+`best_observed_region` is classified before use: plausible only as offsets is accepted, plausible
+only as absolute timestamps is converted, and anything plausible as **both** is rejected as
+ambiguous (refinement never runs on ambiguous timestamps; the advisory is simply dropped).
+
+### 3. Smart 9:16 Reframing
+
+```
+semantic info / Luna -> face/person detection -> active subject selection
+    -> tracking -> crop trajectory -> smoothing -> FFmpeg render 1080x1920
+```
+
+All local — no per-frame LLM calls. Frames are sampled at `reframe_analysis_fps` (default 5),
+downscaled for detection, and detections are associated into persistent tracks by IoU and centre
+distance. The active subject is chosen from a weighted blend of a mouth-motion speaking proxy,
+box area, centrality and track persistence, with hysteresis (`switch_margin`, `switch_hold_sec`,
+`min_switch_interval_sec`) so the crop never ping-pongs between two faces. Two faces that fit
+inside the vertical window are framed together.
+
+Safe framing keeps configurable padding around the subject, places the face near the upper third
+and preserves headroom so eyes and the top of the head are not cut. The raw target is then
+stabilized with a dead-zone, proportional tracking, and velocity/acceleration clamps; a detected
+scene cut is allowed to re-anchor instantly.
+
+Fallback ladder, so a valid 9:16 MP4 is always produced: last stable crop -> dominant visual
+region (column gradient energy) -> static center crop.
+
+### CLI
+
+```bash
+# One ranked candidate
+python -m freecher_worker render-short RUN \
+  --candidate cand_037 \
+  --duration-mode auto
+
+# Top N ranked candidates -> short_01.mp4, short_02.mp4, ...
+python -m freecher_worker render-shorts RUN \
+  --top 5 \
+  --duration-mode auto
+```
+
+Useful flags: `--encoder libx264|h264_nvenc|auto`, `--no-reframe` (static center crop),
+`--no-loudnorm`, `--debug-overlay` (writes a diagnostic video with detection boxes, crop
+rectangle, crop centre and active subject).
+
+Output lands in `RUN/shorts/`:
+
+```
+shorts/short_01.mp4
+shorts/short_01.json
+shorts/short_01_crop_trajectory.json
+shorts/shorts_manifest.json
+```
+
+```json
+{
+  "candidate_id": "cand_037",
+  "source_start_sec": 1234.2,
+  "source_end_sec": 1294.2,
+
+  "short_start_offset_sec": 8.4,
+  "short_end_offset_sec": 31.8,
+
+  "short_source_start_sec": 1242.6,
+  "short_source_end_sec": 1266.0,
+
+  "duration_sec": 23.4,
+
+  "aspect_ratio": "9:16",
+  "width": 1080,
+  "height": 1920,
+
+  "reframing_mode": "smart",
+  "duration_mode": "auto"
+}
+```
+
+The same file also carries diagnostics: original candidate duration, selected duration and source
+range, detected subjects and tracks, dominant-subject switches, scene cuts, crop trajectory
+statistics, fallback usage counters, encoder used and per-stage timings.
+
+### Hardware
+
+Encoding auto-detects `h264_nvenc` and falls back to `libx264`, and retries with `libx264` if an
+NVENC encode fails mid-run. NVENC is never required: on the GTX 1650 / WSL2 target it is
+typically unavailable and the pipeline runs entirely on CPU x264. Detection and tracking run on
+downscaled frames through OpenCV on the CPU, so this stage consumes no VRAM.
+
+---
+
 ## Directory Structure
 
 ```

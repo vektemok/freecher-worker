@@ -333,7 +333,7 @@ def render_highlights_for_run(
     video_duration = float(man.get("source_fingerprint", {}).get("duration_seconds", 0.0))
     if video_duration <= 0.0:
         info = probe_media(source_video)
-        video_duration = info.duration or 300.0
+        video_duration = info.duration_seconds or 300.0
 
     transcript = Transcript.model_validate(load_json(transcript_file))
     raw_highlights = load_json(highlights_file)
