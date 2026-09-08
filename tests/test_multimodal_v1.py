@@ -37,6 +37,7 @@ from freecher_worker.multimodal import (
     compute_source_audio_profile,
     extract_candidate_audio_features,
     extract_candidate_visual_features,
+    extract_canonical_fingerprint,
     generate_shortlist,
     multimodal_v1_formula_v1,
     probe_software_decoder,
@@ -46,7 +47,7 @@ from freecher_worker.multimodal.frames import (
     extract_candidate_frames,
 )
 from freecher_worker.transcription.models import Transcript, TranscriptSegment
-from freecher_worker.utils.json_io import save_json
+from freecher_worker.utils.json_io import load_json, save_json
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,7 @@ def _make_candidate(cid: str, start: float, end: float, text: str = "Test candid
 
 
 def _setup_mock_run_dir(tmp_path: Path, count: int = 25) -> Path:
-    """Populate a synthetic run directory with candidates and historical score files."""
+    """Populate a synthetic run directory with candidates, manifest, and historical score files."""
     cset_id = "cset_mock_test_123"
     candidates = []
     heur_preds = []
@@ -166,6 +167,22 @@ def _setup_mock_run_dir(tmp_path: Path, count: int = 25) -> Path:
 
     # Empty dummy video file
     (tmp_path / "source.mp4").write_bytes(b"DUMMY_MP4_HEADER")
+
+    # Canonical manifest matching development run schema and fingerprint
+    manifest = {
+        "pipeline_version": "0.1.1",
+        "created_at": "2026-09-07T16:43:21.000000",
+        "source": str(tmp_path / "source.mp4"),
+        "source_fingerprint": {
+            "path": str(tmp_path / "source.mp4"),
+            "file_size": 1024,
+            "mtime_ns": 1788747967206757495,
+            "duration_seconds": count * 30.0,
+            "content_hash": "mock_content_hash_123",
+            "fingerprint_id": "035864f48379388e",
+        },
+    }
+    save_json(manifest, tmp_path / "manifest.json")
 
     return tmp_path
 
@@ -879,46 +896,47 @@ def test_formula_insufficient_visual_lowers_confidence():
     assert any("insufficient_visual_evidence_confidence_lowered" in c for c in diag["applied_caps"])
 
 
+class MockMultimodalProvider(MultimodalProvider):
+    name = "mock_provider"
+    model = "mock_model"
+    prompt_version = "multimodal_v1_prompt_v1"
+
+    def __init__(self):
+        self.usage = MultimodalUsage(requests=0, input_tokens=0, output_tokens=0)
+
+    def score_candidate(self, package: MultimodalCandidatePackage) -> MultimodalModelResult:
+        self.usage.requests += 1
+        self.usage.input_tokens += 1000
+        self.usage.output_tokens += 200
+        # Higher candidate ID gets higher score
+        cand_num = int(package.candidate_id.split("_")[1])
+        return MultimodalModelResult(
+            candidate_id=package.candidate_id,
+            observable_event=True,
+            visual_payoff=True,
+            visual_event=50.0 + cand_num * 5,
+            reaction=50.0 + cand_num * 5,
+            emotion=50.0,
+            humor=50.0,
+            surprise=50.0,
+            energy=60.0,
+            standalone=70.0,
+            retention=75.0,
+            shareability=70.0,
+            boringness=15.0,
+            context_dependency=20.0,
+            confidence=0.85,
+            reason=f"Mock judgment for {package.candidate_id}",
+            quality_score=60.0 + cand_num * 4,
+        )
+
+    def get_usage(self) -> MultimodalUsage:
+        return self.usage
+
+
 def test_reranker_pipeline_end_to_end(tmp_path: Path):
     """28. Mocked provider reranks a synthetic run directory and writes scores/multimodal_v1.json."""
     _setup_mock_run_dir(tmp_path, count=6)
-
-    class MockMultimodalProvider(MultimodalProvider):
-        name = "mock_provider"
-        model = "mock_model"
-        prompt_version = "multimodal_v1_prompt_v1"
-
-        def __init__(self):
-            self.usage = MultimodalUsage(requests=0, input_tokens=0, output_tokens=0)
-
-        def score_candidate(self, package: MultimodalCandidatePackage) -> MultimodalModelResult:
-            self.usage.requests += 1
-            self.usage.input_tokens += 1000
-            self.usage.output_tokens += 200
-            # Higher candidate ID gets higher score
-            cand_num = int(package.candidate_id.split("_")[1])
-            return MultimodalModelResult(
-                candidate_id=package.candidate_id,
-                observable_event=True,
-                visual_payoff=True,
-                visual_event=50.0 + cand_num * 5,
-                reaction=50.0 + cand_num * 5,
-                emotion=50.0,
-                humor=50.0,
-                surprise=50.0,
-                energy=60.0,
-                standalone=70.0,
-                retention=75.0,
-                shareability=70.0,
-                boringness=15.0,
-                context_dependency=20.0,
-                confidence=0.85,
-                reason=f"Mock judgment for {package.candidate_id}",
-                quality_score=60.0 + cand_num * 4,
-            )
-
-        def get_usage(self) -> MultimodalUsage:
-            return self.usage
 
     mock_provider = MockMultimodalProvider()
     reranker = MultimodalReranker(
@@ -932,7 +950,13 @@ def test_reranker_pipeline_end_to_end(tmp_path: Path):
     img_path = _create_synthetic_image(tmp_path / "frame.jpg")
     with mock.patch("freecher_worker.multimodal.package.extract_candidate_frames") as mock_frames, \
          mock.patch("freecher_worker.multimodal.scorer.probe_media") as mock_probe:
-        mock_probe.return_value = mock.MagicMock(duration=180.0, video_codec="h264")
+        mock_probe.return_value = mock.MagicMock(
+            duration_seconds=180.0,
+            video_codec="h264",
+            width=1920,
+            height=1080,
+            fps=30.0,
+        )
         mock_frames.return_value = (
             [
                 ExtractedFrame(
@@ -963,6 +987,19 @@ def test_reranker_pipeline_end_to_end(tmp_path: Path):
 
         target_file = tmp_path / "scores" / "multimodal_v1.json"
         assert target_file.is_file()
+
+        # Assert packages were written and their source_fingerprint matches canonical manifest
+        pkg_files = list(tmp_path.glob("multimodal/cache/**/package.json"))
+        assert len(pkg_files) > 0
+        for pf in pkg_files:
+            pkg_data = load_json(pf)
+            assert pkg_data["source_fingerprint"] == "035864f48379388e"
+
+        # Assert audio profile cache also uses canonical manifest fingerprint
+        audio_cache = tmp_path / "multimodal" / "cache" / "source_audio_profile.json"
+        assert audio_cache.is_file()
+        profile_data = load_json(audio_cache)
+        assert profile_data["source_fingerprint"] == "035864f48379388e"
 
 
 def test_evaluation_metrics_shortlist_recall():
@@ -1061,4 +1098,90 @@ def test_resolve_source_video_not_found_informative_error(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError, match="No source video found for run"):
         resolve_source_video_path(run_dir)
+
+
+def test_extract_canonical_fingerprint_from_manifest(tmp_path: Path):
+    """34. extract_canonical_fingerprint extracts exact fingerprint_id from manifest.json."""
+    manifest = {
+        "pipeline_version": "0.1.1",
+        "source_fingerprint": {
+            "duration_seconds": 2037.921,
+            "fingerprint_id": "035864f48379388e",
+        },
+    }
+    save_json(manifest, tmp_path / "manifest.json")
+    fp_id = extract_canonical_fingerprint(tmp_path)
+    assert fp_id == "035864f48379388e"
+
+
+def test_extract_canonical_fingerprint_missing_manifest_fails(tmp_path: Path):
+    """35. extract_canonical_fingerprint raises FileNotFoundError if manifest.json is missing."""
+    with pytest.raises(FileNotFoundError, match="Canonical run manifest not found"):
+        extract_canonical_fingerprint(tmp_path)
+
+
+def test_extract_canonical_fingerprint_invalid_manifest_fails(tmp_path: Path):
+    """36. extract_canonical_fingerprint raises ValueError if manifest is malformed or missing fingerprint_id."""
+    # Missing source_fingerprint key
+    save_json({"pipeline_version": "0.1.1"}, tmp_path / "manifest.json")
+    with pytest.raises(ValueError, match="missing 'source_fingerprint'"):
+        extract_canonical_fingerprint(tmp_path)
+
+    # Empty fingerprint_id
+    save_json(
+        {"source_fingerprint": {"fingerprint_id": ""}},
+        tmp_path / "manifest.json",
+    )
+    with pytest.raises(ValueError, match="'source_fingerprint.fingerprint_id' is missing or empty"):
+        extract_canonical_fingerprint(tmp_path)
+
+
+def test_package_source_fingerprint_equals_canonical_manifest_fingerprint(tmp_path: Path):
+    """37. build_multimodal_package assigns exact canonical fingerprint from manifest."""
+    _setup_mock_run_dir(tmp_path, count=5)
+    cand = _make_candidate("cand_001", 0.0, 30.0)
+    fp_id = extract_canonical_fingerprint(tmp_path)
+    assert fp_id == "035864f48379388e"
+
+    img_path = _create_synthetic_image(tmp_path / "f.jpg")
+    with mock.patch("freecher_worker.multimodal.package.extract_candidate_frames") as mock_frames:
+        mock_frames.return_value = (
+            [
+                ExtractedFrame(
+                    timestamp_offset=1.0,
+                    absolute_timestamp=1.0,
+                    image_path=str(img_path),
+                    width=640,
+                    height=360,
+                )
+            ] * 4,
+            "libdav1d",
+            4,
+            0,
+        )
+        pkg = build_multimodal_package(
+            candidate=cand,
+            transcript_doc=None,
+            source_video_path=tmp_path / "source.mp4",
+            source_wav_path=tmp_path / "audio.wav",
+            source_fingerprint=fp_id,
+            candidate_set_id="cset_test",
+            run_dir=tmp_path,
+        )
+
+    assert pkg.source_fingerprint == "035864f48379388e"
+
+
+def test_reranker_pipeline_fails_when_manifest_missing(tmp_path: Path):
+    """38. rerank_run fails clearly when manifest.json is missing."""
+    _setup_mock_run_dir(tmp_path, count=5)
+    # Remove manifest.json
+    (tmp_path / "manifest.json").unlink()
+
+    mock_provider = MockMultimodalProvider()
+    reranker = MultimodalReranker(provider=mock_provider)
+
+    with pytest.raises(FileNotFoundError, match="Canonical run manifest not found"):
+        reranker.rerank_run(tmp_path)
+
 

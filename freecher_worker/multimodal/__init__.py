@@ -21,6 +21,7 @@ from .scorer import (
     FORMULA_VERSION_MULTIMODAL_V1,
     SCORER_VERSION_MULTIMODAL_V1,
     MultimodalReranker,
+    extract_canonical_fingerprint,
     multimodal_v1_formula_v1,
     resolve_source_video_path,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "extract_candidate_audio_features",
     "extract_candidate_frames",
     "extract_candidate_visual_features",
+    "extract_canonical_fingerprint",
     "generate_shortlist",
     "multimodal_v1_formula_v1",
     "probe_software_decoder",

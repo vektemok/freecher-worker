@@ -200,6 +200,43 @@ def resolve_source_video_path(
     )
 
 
+def extract_canonical_fingerprint(run_dir: Path | str) -> str:
+    """Extract canonical source fingerprint ID from manifest.json in run_dir.
+
+    Fails explicitly if manifest.json is missing or if
+    manifest['source_fingerprint']['fingerprint_id'] is missing or empty.
+    """
+    r_dir = Path(run_dir).resolve()
+    manifest_file = r_dir / "manifest.json"
+    if not manifest_file.is_file():
+        raise FileNotFoundError(
+            f"Canonical run manifest not found at {manifest_file}. "
+            f"multimodal_v1 requires manifest.json with source_fingerprint.fingerprint_id."
+        )
+
+    try:
+        manifest_data = load_json(manifest_file)
+    except Exception as exc:
+        raise ValueError(f"Failed to read manifest at {manifest_file}: {exc}") from exc
+
+    if not isinstance(manifest_data, dict):
+        raise ValueError(f"Invalid manifest at {manifest_file}: expected JSON object.")
+
+    source_fp = manifest_data.get("source_fingerprint")
+    if not isinstance(source_fp, dict):
+        raise ValueError(
+            f"Invalid manifest at {manifest_file}: missing 'source_fingerprint' object."
+        )
+
+    fp_id = source_fp.get("fingerprint_id")
+    if not fp_id or not isinstance(fp_id, str) or not fp_id.strip():
+        raise ValueError(
+            f"Invalid manifest at {manifest_file}: 'source_fingerprint.fingerprint_id' is missing or empty."
+        )
+
+    return fp_id.strip()
+
+
 class MultimodalReranker:
     """Orchestrator for candidate shortlisting, multimodal packaging, evaluation, and reranking."""
 
@@ -260,9 +297,21 @@ class MultimodalReranker:
             source_video_override=source_video_override or self.source_video_override,
         )
 
-        # Probe video fingerprint
+        # Canonical source fingerprint from manifest.json
+        source_fingerprint = extract_canonical_fingerprint(r_dir)
+
+        # Probe video metadata for diagnostics / codec validation
         media_info = probe_media(video_path)
-        source_fingerprint = f"{video_path.name}_{media_info.duration:.1f}s"
+        dur = getattr(media_info, "duration_seconds", getattr(media_info, "duration", 0.0))
+        fps = getattr(media_info, "fps", 0.0)
+        width = getattr(media_info, "width", 0)
+        height = getattr(media_info, "height", 0)
+        codec = getattr(media_info, "video_codec", "unknown")
+        logger.info(
+            f"[multimodal-rerank] Source video: {video_path.name} "
+            f"({width}x{height} @ {fps:.1f}fps, {dur:.1f}s, codec={codec}), "
+            f"canonical fingerprint={source_fingerprint}"
+        )
 
         # 3. Locate source audio WAV
         wav_path = r_dir / "audio.wav"
