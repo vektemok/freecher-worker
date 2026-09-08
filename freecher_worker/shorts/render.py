@@ -37,6 +37,27 @@ from .reframe import (
     build_reframe_plan,
     render_debug_overlay,
 )
+from .layout import (
+    AVAILABLE_LAYOUT_MODES,
+    LAYOUT_MODE_ADAPTIVE,
+    LAYOUT_MODE_FULL_FRAME,
+    LAYOUT_MODE_SINGLE,
+    LAYOUT_VERSION,
+    LayoutConfig,
+    LayoutPlan,
+    SemanticContext,
+    build_dual_viewports,
+    build_layout_plan,
+)
+from .layout_render import (
+    AdaptiveRenderPlan,
+    LayoutRenderError,
+    build_adaptive_render_plan,
+    build_adaptive_video_filter,
+    crop_driver_of,
+    describe_plan,
+    supports_named_filter_instances,
+)
 from .refinement import (
     AVAILABLE_DURATION_MODES,
     DURATION_MODE_AUTO,
@@ -53,6 +74,7 @@ from .trajectory import (
     CropDriverPlan,
     TrajectoryReport,
     TrajectoryValidationError,
+    escape_filtergraph_value,
     plan_crop_driver,
     static_center_driver,
     validate_and_sanitize_trajectory,
@@ -95,6 +117,16 @@ class ShortMetadata(BaseModel):
 
     reframing_mode: str = REFRAME_MODE_SMART
     duration_mode: str = DURATION_MODE_AUTO
+    layout_mode_requested: str = Field(
+        default=LAYOUT_MODE_SINGLE, description="Layout strategy asked for: single | adaptive | full-frame"
+    )
+    layout_version: str = LAYOUT_VERSION
+    layout: Optional[LayoutPlan] = Field(
+        default=None, description="The layout plan this short was actually rendered from"
+    )
+    layout_fallback_reason: Optional[str] = Field(
+        default=None, description="Why the adaptive layout was abandoned, if it was"
+    )
 
     # --- diagnostics -------------------------------------------------------
     pipeline_version: str = SHORTS_PIPELINE_VERSION
@@ -158,6 +190,8 @@ class ShortsManifest(BaseModel):
     width: int = 1080
     height: int = 1920
     duration_mode: str = DURATION_MODE_AUTO
+    layout_mode: str = Field(default=LAYOUT_MODE_SINGLE, description="Layout strategy requested for the batch")
+    layout_version: str = LAYOUT_VERSION
     ranking_source: str = Field(default="", description="Scorer whose ranking selected these candidates")
     ranking_origin: str = Field(default="", description="File the ranking was read from")
     ranking_model: Optional[str] = Field(default=None, description="Model behind the ranking scorer")
@@ -210,6 +244,33 @@ def reframe_config_from_settings(settings: Settings) -> ReframeConfig:
     )
 
 
+def layout_config_from_settings(settings: Settings) -> LayoutConfig:
+    """Build the adaptive layout configuration from application settings."""
+    return LayoutConfig(
+        window_sec=settings.layout_window_sec,
+        persistent_min_visible_sec=settings.layout_persistent_min_visible_sec,
+        persistent_min_visibility_ratio=settings.layout_persistent_min_visibility_ratio,
+        persistent_min_hits=settings.layout_persistent_min_hits,
+        significant_min_area_ratio=settings.layout_significant_min_area_ratio,
+        dominant_min_visibility=settings.layout_dominant_min_visibility,
+        secondary_min_visibility=settings.layout_secondary_min_visibility,
+        group_min_subjects=settings.layout_group_min_subjects,
+        min_detection_coverage=settings.layout_min_detection_coverage,
+        min_tracking_confidence=settings.layout_min_tracking_confidence,
+        min_face_height_ratio=settings.layout_min_face_height_ratio,
+        safe_top_ratio=settings.layout_safe_top_ratio,
+        safe_bottom_ratio=settings.layout_safe_bottom_ratio,
+        min_layout_duration_sec=settings.layout_min_duration_sec,
+        switch_confirmation_sec=settings.layout_switch_confirmation_sec,
+        subject_missing_grace_sec=settings.layout_subject_missing_grace_sec,
+        layout_switch_penalty=settings.layout_switch_penalty,
+        scene_cut_allows_immediate_switch=settings.layout_scene_cut_immediate_switch,
+        full_frame_blur_background=settings.layout_full_frame_blur,
+        full_frame_blur_sigma=settings.layout_full_frame_blur_sigma,
+        full_frame_background_color=settings.layout_full_frame_background_color,
+    )
+
+
 def resolve_encoder(requested: str = ENCODER_AUTO) -> str:
     """Resolve the video encoder, defaulting to libx264 whenever NVENC is unavailable.
 
@@ -240,14 +301,6 @@ def _encoder_args(encoder: str, settings: Settings) -> List[str]:
         "-pix_fmt",
         "yuv420p",
     ]
-
-
-def escape_filtergraph_value(value: str) -> str:
-    """Escape a literal (such as a file path) for use inside a filtergraph argument."""
-    out = value.replace("\\", "\\\\")
-    for char in ("'", ":", ",", ";", "[", "]", "="):
-        out = out.replace(char, "\\" + char)
-    return out
 
 
 def build_vertical_filter(
@@ -364,6 +417,8 @@ def render_short(
     index: Optional[int] = 1,
     debug_overlay: bool = False,
     trajectory_output: Optional[Path] = None,
+    layout_mode: str = LAYOUT_MODE_SINGLE,
+    semantic_context: Optional[SemanticContext] = None,
 ) -> ShortMetadata:
     """Produce one publication-ready 9:16 short from a ranked candidate.
 
@@ -458,12 +513,88 @@ def render_short(
     if trajectory_output is not None:
         save_json(plan.trajectory, trajectory_output)
 
+    # ------------------------------------------------------- stage 2b: layout
+    # Presentation only. Nothing below can move the short's source range - the layout stage
+    # decides the *shape* of the frame, never which seconds are published.
+    if layout_mode not in AVAILABLE_LAYOUT_MODES:
+        raise ValueError(
+            f"Unknown layout_mode '{layout_mode}'. Available: {', '.join(AVAILABLE_LAYOUT_MODES)}"
+        )
+    layout_cfg = layout_config_from_settings(cfg)
+    t_layout = time.perf_counter()
+    layout_plan = build_layout_plan(
+        frames=plan.frames,
+        duration=selection.duration_sec,
+        source_width=plan.trajectory.source_width,
+        source_height=plan.trajectory.source_height,
+        crop_w=plan.trajectory.crop_w,
+        crop_h=plan.trajectory.crop_h,
+        output_height=cfg.shorts_output_height,
+        mode=layout_mode,
+        config=layout_cfg,
+        reframe=reframe_config_from_settings(cfg),
+        semantic=semantic_context,
+    )
+    layout_fallback_reason: Optional[str] = layout_plan.fallback_reason
+    adaptive_plan: Optional[AdaptiveRenderPlan] = None
+    layout_scripts: Dict[str, Path] = {}
+
+    if layout_mode != LAYOUT_MODE_SINGLE:
+        if not supports_named_filter_instances():
+            layout_fallback_reason = (
+                "this FFmpeg build does not support named filter instances (crop@id)"
+            )
+            logger.warning(f"[layout] {layout_fallback_reason}; rendering the single-subject layout")
+        else:
+            try:
+                dual = build_dual_viewports(
+                    plan=layout_plan,
+                    frames=plan.frames,
+                    source_width=plan.trajectory.source_width,
+                    source_height=plan.trajectory.source_height,
+                    output_width=cfg.shorts_output_width,
+                    output_height=cfg.shorts_output_height,
+                    reframe=reframe_config_from_settings(cfg),
+                )
+                adaptive_plan = build_adaptive_render_plan(
+                    plan=layout_plan,
+                    single_trajectory=plan.trajectory,
+                    width=cfg.shorts_output_width,
+                    height=cfg.shorts_output_height,
+                    dual_viewports=dual,
+                    config=layout_cfg,
+                )
+                logger.info(f"[layout] {describe_plan(adaptive_plan)}")
+            except (LayoutRenderError, TrajectoryValidationError) as exc:
+                layout_fallback_reason = f"adaptive layout could not be prepared: {exc}"
+                logger.warning(f"[layout] {layout_fallback_reason}; rendering the single-subject layout")
+                adaptive_plan = None
+    timings["layout_planning_seconds"] = round(time.perf_counter() - t_layout, 3)
+
     debug_file: Optional[str] = None
     if debug_overlay and plan.debug_samples:
         overlay_tmp = output_path.with_name(f"{output_path.stem}_debug.tmp.mp4")
         overlay_final = output_path.with_name(f"{output_path.stem}_debug.mp4")
         written = render_debug_overlay(
-            source_video, plan, selection.short_source_start_sec, overlay_tmp
+            source_video,
+            plan,
+            selection.short_source_start_sec,
+            overlay_tmp,
+            layout_labels=[
+                (
+                    segment.start,
+                    segment.end,
+                    f"layout={segment.layout.upper()}\n"
+                    + (
+                        f"subjects={'+'.join('#' + str(i) for i in segment.subject_ids)}\n"
+                        if segment.subject_ids
+                        else "subjects=none\n"
+                    )
+                    + f"confidence={segment.confidence:.2f}  reason={segment.reason}",
+                )
+                for segment in layout_plan.segments
+            ],
+            safe_band=(layout_cfg.safe_top_ratio, layout_cfg.safe_bottom_ratio),
         )
         if written is not None and written.is_file() and written.stat().st_size > 0:
             os.replace(written, overlay_final)
@@ -500,14 +631,29 @@ def render_short(
         script_path = output_path.with_name(f"{output_path.stem}_crop_commands.txt")
         script_path.write_text(driver.script, encoding="utf-8")
 
+    if adaptive_plan is not None:
+        # Each viewport pans on its own, so each one needs its own command stream.
+        for name in adaptive_plan.script_names():
+            path = output_path.with_name(f"{output_path.stem}_crop_commands_{name}.txt")
+            path.write_text(adaptive_plan.viewports[name].script or "", encoding="utf-8")
+            layout_scripts[name] = path
+
     chosen_encoder = resolve_encoder(encoder if encoder != ENCODER_AUTO else cfg.shorts_encoder)
     encoder_fallback = False
 
-    def _command(active_driver: CropDriverPlan, enc: str, script: Optional[Path]) -> List[str]:
-        filter_complex = (
+    def _classic_filter(active_driver: CropDriverPlan, script: Optional[Path]) -> str:
+        return (
             f"[0:v]{build_vertical_filter(active_driver, width, height, script)}[v];"
             f"[0:a]{audio_filter}[a]"
         )
+
+    def _adaptive_filter(active: AdaptiveRenderPlan) -> str:
+        return (
+            f"{build_adaptive_video_filter(active, layout_scripts)};"
+            f"[0:a]{audio_filter}[a]"
+        )
+
+    def _command(filter_complex: str, enc: str) -> List[str]:
         return [
             "ffmpeg",
             "-nostdin",
@@ -525,9 +671,9 @@ def render_short(
             str(tmp_output),
         ]
 
-    def _attempt(active_driver: CropDriverPlan, enc: str, script: Optional[Path]):
+    def _attempt(filter_complex: str, enc: str):
         _cleanup(tmp_output)
-        result = _run_ffmpeg(_command(active_driver, enc, script))
+        result = _run_ffmpeg(_command(filter_complex, enc))
         if result.returncode != 0:
             _cleanup(tmp_output)
             return None, result.stderr.strip()[-1500:]
@@ -545,25 +691,64 @@ def render_short(
 
     t_render = time.perf_counter()
     try:
-        validation, error = _attempt(driver, chosen_encoder, script_path)
+        validation = None
+        error: Optional[str] = None
 
-        if error and chosen_encoder != ENCODER_X264:
-            logger.warning(f"[shorts] {chosen_encoder} encode failed; retrying with libx264: {error}")
-            chosen_encoder = ENCODER_X264
-            encoder_fallback = True
-            validation, error = _attempt(driver, chosen_encoder, script_path)
+        if adaptive_plan is not None:
+            validation, error = _attempt(_adaptive_filter(adaptive_plan), chosen_encoder)
+            if error and chosen_encoder != ENCODER_X264:
+                logger.warning(
+                    f"[shorts] {chosen_encoder} encode failed on the adaptive layout; "
+                    f"retrying with libx264: {error}"
+                )
+                chosen_encoder = ENCODER_X264
+                encoder_fallback = True
+                validation, error = _attempt(_adaptive_filter(adaptive_plan), chosen_encoder)
+            if error:
+                # An adaptive layout that will not render is not worth losing the short over:
+                # drop back to the single-subject crop, which is the pre-adaptive behaviour.
+                logger.warning(
+                    f"[shorts] Adaptive layout render failed for {timeframe.candidate_id}; "
+                    f"falling back to the single-subject layout. FFmpeg said: {error}"
+                )
+                layout_fallback_reason = f"adaptive layout render failed: {error}"
+                _cleanup(*layout_scripts.values())
+                layout_scripts = {}
+                adaptive_plan = None
+                layout_plan = build_layout_plan(
+                    frames=[],
+                    duration=selection.duration_sec,
+                    source_width=plan.trajectory.source_width,
+                    source_height=plan.trajectory.source_height,
+                    crop_w=plan.trajectory.crop_w,
+                    crop_h=plan.trajectory.crop_h,
+                    output_height=height,
+                    mode=LAYOUT_MODE_SINGLE,
+                    config=layout_cfg,
+                )
+                layout_plan.fallback_reason = layout_fallback_reason
+                error = None
 
-        if error and driver.driver != CROP_DRIVER_STATIC:
-            logger.warning(
-                f"[shorts] Dynamic crop render failed for {timeframe.candidate_id} "
-                f"(driver={driver.driver}); retrying with a static center crop. FFmpeg said: {error}"
-            )
-            render_fallback_used = True
-            render_failure_reason = f"dynamic crop render failed ({driver.driver}): {error}"
-            driver = static_center_driver(info.width, info.height, driver.crop_w, driver.crop_h)
-            _cleanup(script_path)
-            script_path = None
-            validation, error = _attempt(driver, chosen_encoder, None)
+        if adaptive_plan is None:
+            validation, error = _attempt(_classic_filter(driver, script_path), chosen_encoder)
+
+            if error and chosen_encoder != ENCODER_X264:
+                logger.warning(f"[shorts] {chosen_encoder} encode failed; retrying with libx264: {error}")
+                chosen_encoder = ENCODER_X264
+                encoder_fallback = True
+                validation, error = _attempt(_classic_filter(driver, script_path), chosen_encoder)
+
+            if error and driver.driver != CROP_DRIVER_STATIC:
+                logger.warning(
+                    f"[shorts] Dynamic crop render failed for {timeframe.candidate_id} "
+                    f"(driver={driver.driver}); retrying with a static center crop. FFmpeg said: {error}"
+                )
+                render_fallback_used = True
+                render_failure_reason = f"dynamic crop render failed ({driver.driver}): {error}"
+                driver = static_center_driver(info.width, info.height, driver.crop_w, driver.crop_h)
+                _cleanup(script_path)
+                script_path = None
+                validation, error = _attempt(_classic_filter(driver, script_path), chosen_encoder)
 
         if error:
             raise RuntimeError(
@@ -589,6 +774,9 @@ def render_short(
         height=height,
         reframing_mode=REFRAME_MODE_CENTER if render_fallback_used else plan.mode,
         duration_mode=duration_mode,
+        layout_mode_requested=layout_mode,
+        layout=layout_plan,
+        layout_fallback_reason=layout_fallback_reason,
         status=STATUS_FALLBACK if (render_fallback_used and enable_smart_reframe) else STATUS_SUCCESS,
         rank=rank,
         model_rank=rank,
@@ -596,7 +784,7 @@ def render_short(
         index=index,
         file=output_path.name,
         debug_file=debug_file,
-        crop_driver=driver.driver,
+        crop_driver=crop_driver_of(adaptive_plan) if adaptive_plan is not None else driver.driver,
         crop_keyframes=driver.keyframes,
         crop_keyframes_available=driver.keyframes_available,
         crop_resolution_reduced=driver.resolution_reduced,
@@ -617,11 +805,15 @@ def render_short(
         validation=validation,
     )
 
+    layout_summary = ", ".join(
+        f"{name}={seconds:.1f}s" for name, seconds in layout_plan.duration_by_mode.items() if seconds > 0
+    )
     logger.info(
         f"[shorts] Rendered {output_path.name}: {metadata.duration_sec:.2f}s "
-        f"{width}x{height} via {chosen_encoder}/{driver.driver}; "
+        f"{width}x{height} via {chosen_encoder}/{metadata.crop_driver}; "
+        f"layout[{layout_summary}] switches={layout_plan.switch_count}, "
         f"subjects={plan.diagnostics.max_simultaneous_subjects}, "
-        f"switches={plan.diagnostics.dominant_subject_switches}, "
+        f"subject_switches={plan.diagnostics.dominant_subject_switches}, "
         f"tracking={plan.diagnostics.tracking_mode}, "
         f"render={timings.get('render_seconds', 0.0):.1f}s"
     )
@@ -862,6 +1054,7 @@ def render_shorts_for_run(
     encoder: str = ENCODER_AUTO,
     debug_overlay: bool = False,
     output_subdir: str = "shorts",
+    layout_mode: str = LAYOUT_MODE_SINGLE,
 ) -> ShortsManifest:
     """Render one or more 9:16 shorts from an existing run's ranked candidates.
 
@@ -870,6 +1063,8 @@ def render_shorts_for_run(
     """
     if duration_mode not in AVAILABLE_DURATION_MODES:
         raise ValueError(f"Unknown duration_mode '{duration_mode}'. Available: {AVAILABLE_DURATION_MODES}")
+    if layout_mode not in AVAILABLE_LAYOUT_MODES:
+        raise ValueError(f"Unknown layout_mode '{layout_mode}'. Available: {AVAILABLE_LAYOUT_MODES}")
 
     cfg = settings or get_settings()
     context = load_run_context(Path(run_dir))
@@ -924,6 +1119,7 @@ def render_shorts_for_run(
             model_score=score,
             index=index,
             trajectory_output=out_dir / f"{stem}_crop_trajectory.json",
+            layout_mode=layout_mode,
         )
 
         metadata: Optional[ShortMetadata] = None
@@ -940,8 +1136,12 @@ def render_shorts_for_run(
             if enable_smart_reframe:
                 logger.info(f"[shorts] Retrying {candidate_id} with a static center crop")
                 try:
+                    # The salvage render is deliberately the simplest thing that can work:
+                    # one static crop, no layout planning on top of an already failing clip.
                     metadata = render_short(
-                        enable_smart_reframe=False, debug_overlay=False, **common
+                        enable_smart_reframe=False,
+                        debug_overlay=False,
+                        **{**common, "layout_mode": LAYOUT_MODE_SINGLE},
                     )
                     metadata.status = STATUS_FALLBACK
                     metadata.render_fallback_used = True
@@ -981,6 +1181,7 @@ def render_shorts_for_run(
         width=cfg.shorts_output_width,
         height=cfg.shorts_output_height,
         duration_mode=duration_mode,
+        layout_mode=layout_mode,
         requested=len(targets),
         success_count=sum(1 for r in results if r.status == STATUS_SUCCESS),
         fallback_count=sum(1 for r in results if r.status == STATUS_FALLBACK),

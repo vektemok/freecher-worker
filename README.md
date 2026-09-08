@@ -28,7 +28,7 @@ Local worker for automated highlight discovery in long videos and short clip gen
 Freecher produces exactly one output format: **9:16, 1080x1920, MP4, H.264 + AAC**. There is no
 landscape, square, 4:5 or generic aspect-ratio support, and no CLI flag to request one.
 
-Two production stages run *after* ranking. Neither reads nor modifies `heuristic_v1`,
+Three production stages run *after* ranking. None of them reads or modifies `heuristic_v1`,
 `highlight_v2_1`, `multimodal_v1_1` or any scoring weight.
 
 ```
@@ -36,6 +36,7 @@ Video -> Whisper -> candidates -> heuristic_v1 + highlight_v2_1 -> shortlist
       -> multimodal_v1_1 / Luna -> ranked candidate
       -> [1] Dynamic Subclip Refinement
       -> [2] Smart 9:16 Reframing
+      -> [3] Adaptive Vertical Layout   (--layout-mode adaptive)
       -> 1080x1920 MP4 + metadata JSON
 ```
 
@@ -185,6 +186,133 @@ and non-monotonic timestamps are fixed. Geometry that cannot be repaired (crop l
 source) drops straight to the static driver. The full report is logged before FFmpeg is invoked and
 stored in the short's metadata as `trajectory_report`.
 
+### 4. Adaptive Vertical Layout (`adaptive_layout_v1`)
+
+Smart reframing answers *where do I point one vertical crop*. That is the wrong question for a
+two-person exchange or a group shot, where a single crop silently deletes a participant. The
+adaptive layout stage answers a different question first — *what shape does this moment need* —
+and only then hands the geometry to FFmpeg.
+
+```
+final subclip -> visual analysis -> subject tracks -> layout planner -> layout plan -> renderer
+```
+
+The planner renders nothing. It emits a declarative plan that is stored in the short's metadata,
+so what the renderer did is always inspectable after the fact.
+
+| Layout | When | How it is built |
+| --- | --- | --- |
+| `single_subject` | one dominant persistent subject | the existing smart crop, unchanged |
+| `dual_stack` | two persistent subjects that cannot share one safe crop | two independently tracked 1080x960 viewports, stacked |
+| `full_frame_context` | 3+ significant subjects, weak evidence, or ambiguous composition | the whole source frame fitted into 9:16 over a blurred copy of itself |
+
+The product rule behind every tie-break:
+
+> **Loss of context is worse than a smaller subject.**
+
+A slightly smaller person is recoverable. An important participant cropped out of frame is not.
+So when the planner is unsure, it chooses `full_frame_context` rather than an aggressive crop.
+
+**Decision inputs** are temporal, never single-frame. Detections are aggregated into per-subject
+tracks (`visible_duration`, `visibility_ratio`, `continuity_score`, `mean_bbox`,
+`position_variance`, `detection_confidence`, `scene_ids`, ...), and a track only becomes a
+*persistent* subject after `FREECHER_LAYOUT_PERSISTENT_MIN_VISIBLE_SEC` of screen time. A face
+that flickers for two frames can never open a second viewport.
+
+`can_fit_subjects_in_single_vertical_crop()` decides `single` vs `dual` on three tests at once:
+the padded union of the subjects fits horizontally; no subject shrinks below
+`layout_min_face_height_ratio` of the output height; and every face lands inside the safe band,
+clear of the caption and platform-UI zones (`layout_safe_top_ratio`, `layout_safe_bottom_ratio`).
+
+**Temporal stability.** A layout change reads as an edit, so the planner analyses ~0.75 s windows
+and then applies hysteresis: a challenger must win a *share* of the evidence over the last
+`layout_switch_confirmation_sec`, beating the incumbent's share by `layout_switch_penalty`, and
+the incumbent must first have held for `layout_min_duration_sec`. Comparing shares rather than
+single windows is what makes one dissenting window harmless in both directions. A subject the
+detector drops for less than `layout_subject_missing_grace_sec` still counts as present. A real
+scene cut is allowed to switch immediately — the viewer is already being shown something new.
+A 30 s short typically ends up with 0-3 transitions.
+
+**Rendering** is a single FFmpeg pass. Each layout is one branch of one filtergraph, all producing
+full 1080x1920 frames, and the plan's segments select which branch is on screen:
+
+```
+[0:v] split -> single : sendcmd + crop@single                    -> scale/crop 1080x1920
+            -> dual   : sendcmd + crop@dual_top / crop@dual_bottom -> 2x 1080x960 -> vstack
+            -> full   : blurred cover + fitted contain            -> overlay centred
+      -> overlay ... enable='gte(t,s)*lt(t,e)' -> [v]
+```
+
+Two details make that work rather than merely look plausible. Each moving viewport gets its **own**
+`sendcmd` script targeting its **own** named crop instance, because three viewports panning
+independently cannot share one command stream. And the switch predicate is `gte(t,s)*lt(t,e)`
+rather than `between()`, which is inclusive at both ends and would let two layouts claim the frame
+sitting exactly on a segment boundary.
+
+Branches are built only when the plan uses them, so a clip that never leaves `single_subject`
+costs what it cost before. Layout switches are hard cuts; the planner prefers to place them on
+scene cuts, where a hard cut is what the footage is already doing.
+
+**Fallbacks**, in order, so a valid 9:16 MP4 is always produced: an FFmpeg build without named
+filter instances -> `single_subject`; a `dual_stack` segment without two distinct tracks ->
+`full_frame_context`; an adaptive filtergraph that fails to render -> the single-subject crop ->
+static center crop. Every fallback is recorded in `layout_fallback_reason`.
+
+**`--layout-mode`** selects the strategy. The default is `single`, so nothing changes until you
+ask for it:
+
+```bash
+python -m freecher_worker render-shorts RUN \
+  --scorer multimodal_v1_1 \
+  --top 5 \
+  --duration-mode auto \
+  --layout-mode adaptive
+```
+
+`--layout-mode full-frame` forces the context-safe layout for the whole short, which is useful for
+side-by-side review. `--debug-overlay` additionally draws the active layout, its subjects,
+confidence, reason and the safe area onto the diagnostic video.
+
+The layout stage is presentation only. It never reads or changes highlight scoring, retrieval,
+ranking or Dynamic Subclip Refinement: the same candidate publishes exactly the same
+`short_source_start_sec` / `short_source_end_sec` in every layout mode.
+
+Configurable via `FREECHER_LAYOUT_*` (window length, persistence and significance thresholds,
+dominant/secondary visibility, group size, minimum readable face height, safe-area margins,
+hysteresis timings, blur strength and background colour).
+
+The plan is stored per short and summarized in `shorts_manifest.json`:
+
+```json
+"layout": {
+  "version": "adaptive_layout_v1",
+  "mode_requested": "adaptive",
+  "segments": [
+    {"start": 0.0, "end": 9.8, "layout": "single_subject", "subjects": ["track_1"],
+     "confidence": 0.85, "reason": "one dominant persistent subject"},
+    {"start": 9.8, "end": 19.5, "layout": "dual_stack", "subjects": ["track_1", "track_2"],
+     "confidence": 0.82, "reason": "two persistent subjects cannot fit one safe crop"},
+    {"start": 19.5, "end": 30.0, "layout": "full_frame_context", "subjects": [],
+     "confidence": 0.75, "reason": "group scene: 4 significant subjects"}
+  ],
+  "switch_count": 2,
+  "duration_by_mode": {"single_subject": 9.8, "dual_stack": 9.7, "full_frame_context": 10.5},
+  "track_count": 4,
+  "persistent_track_count": 4,
+  "dominant_track_id": 1,
+  "mean_tracking_confidence": 0.92
+}
+```
+
+**Known limitation.** The planner reasons about people, not objects. When a moment is *about* a
+visual object — a bag, a phone, something on the table — a face-only planner has no way to know
+which person must stay in frame. `adaptive_layout_v1` handles this only by preferring
+`full_frame_context` whenever the composition is ambiguous. Understanding what the scene is about
+is `semantic framing v1.1`; the `semantic_context` hook (`important_subject_ids`,
+`important_object`, `speaker_hint`, `prefer_full_frame`) is already wired into the planner and
+deliberately not connected to `multimodal_v1_1` — highlight intelligence and framing intelligence
+stay separate bounded components.
+
 ### Output files and failure handling
 
 Every short is rendered to `<name>.tmp.mp4`, validated with ffprobe, and only then moved into place
@@ -199,6 +327,8 @@ shorts/short_cand_010.mp4             # single --candidate render
 shorts/short_01_cand_010.json
 shorts/short_01_cand_010_crop_trajectory.json
 shorts/short_01_cand_010_crop_commands.txt
+shorts/short_01_cand_010_crop_commands_dual_top.txt     # --layout-mode adaptive
+shorts/short_01_cand_010_crop_commands_dual_bottom.txt  # --layout-mode adaptive
 shorts/short_01_cand_010_debug.mp4    # --debug-overlay
 shorts/shorts_manifest.json
 ```
@@ -224,9 +354,10 @@ python -m freecher_worker render-shorts RUN \
   --duration-mode auto
 ```
 
-Useful flags: `--encoder libx264|h264_nvenc|auto`, `--no-reframe` (static center crop),
-`--no-loudnorm`, `--debug-overlay` (writes a diagnostic video with detection boxes, crop
-rectangle, crop centre and active subject).
+Useful flags: `--encoder libx264|h264_nvenc|auto`, `--layout-mode single|adaptive|full-frame`
+(default `single`), `--no-reframe` (static center crop), `--no-loudnorm`, `--debug-overlay`
+(writes a diagnostic video with detection boxes, crop rectangle, crop centre, active subject and -
+in adaptive mode - the active layout, its subjects, confidence, reason and safe area).
 
 Output lands in `RUN/shorts/`:
 
@@ -256,7 +387,9 @@ shorts/shorts_manifest.json
   "height": 1920,
 
   "reframing_mode": "smart",
-  "duration_mode": "auto"
+  "duration_mode": "auto",
+  "layout_mode_requested": "single",
+  "layout_version": "adaptive_layout_v1"
 }
 ```
 

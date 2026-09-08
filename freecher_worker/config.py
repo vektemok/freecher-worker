@@ -162,6 +162,33 @@ class Settings(BaseSettings):
     reframe_dual_subject_balance: float = Field(default=0.35, description="Max relative weight gap for dual-subject framing")
     reframe_jitter_epsilon_px: float = Field(default=2.0, description="Emitted crop movements below this are suppressed")
 
+    # Phase 3 — Adaptive Vertical Layout (presentation layer only; never touches ranking)
+    layout_mode: str = Field(
+        default="single",
+        description="Vertical layout strategy: single | adaptive | full-frame",
+    )
+    layout_window_sec: float = Field(default=0.75, description="Length of one layout decision window")
+    layout_min_duration_sec: float = Field(default=2.5, description="Shortest stretch a layout may hold")
+    layout_switch_confirmation_sec: float = Field(default=1.5, description="Evidence required before switching layout")
+    layout_subject_missing_grace_sec: float = Field(default=1.2, description="A briefly lost subject still counts as present")
+    layout_switch_penalty: float = Field(default=0.08, description="Confidence margin a new layout must win by")
+    layout_scene_cut_immediate_switch: bool = Field(default=True, description="A real scene cut may switch layout at once")
+    layout_persistent_min_visible_sec: float = Field(default=1.0, description="Screen time before a track is a real subject")
+    layout_persistent_min_visibility_ratio: float = Field(default=0.20, description="Share of the clip a persistent track is visible")
+    layout_persistent_min_hits: int = Field(default=4, description="Detections required behind a persistent track")
+    layout_significant_min_area_ratio: float = Field(default=0.0012, description="Minimum mean subject area as a fraction of the frame")
+    layout_dominant_min_visibility: float = Field(default=0.65, description="Window visibility required of a dominant subject")
+    layout_secondary_min_visibility: float = Field(default=0.45, description="Window visibility required of a second subject")
+    layout_group_min_subjects: int = Field(default=3, description="Significant subjects that make a scene a group scene")
+    layout_min_detection_coverage: float = Field(default=0.35, description="Below this, evidence is too thin to crop")
+    layout_min_tracking_confidence: float = Field(default=0.45, description="Below this, evidence is too thin to crop")
+    layout_min_face_height_ratio: float = Field(default=0.055, description="Smallest readable subject height in the output frame")
+    layout_safe_top_ratio: float = Field(default=0.06, description="Top band reserved for platform UI")
+    layout_safe_bottom_ratio: float = Field(default=0.24, description="Bottom band reserved for captions and platform UI")
+    layout_full_frame_blur: bool = Field(default=True, description="Fill unused vertical space with a blurred copy of the frame")
+    layout_full_frame_blur_sigma: float = Field(default=12.0, description="Blur strength behind a fitted full frame")
+    layout_full_frame_background_color: str = Field(default="black", description="Background used when blur is disabled")
+
     # Phase 3 — Vertical Short Output (always 9:16, no other aspect ratio is supported)
     shorts_output_width: int = Field(default=1080, description="Final short width in pixels (fixed 9:16 output)")
     shorts_output_height: int = Field(default=1920, description="Final short height in pixels (fixed 9:16 output)")

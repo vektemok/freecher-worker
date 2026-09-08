@@ -46,7 +46,9 @@ from freecher_worker.rendering import (
 from freecher_worker.shorts import (
     ASPECT_RATIO,
     AVAILABLE_DURATION_MODES,
+    AVAILABLE_LAYOUT_MODES,
     DURATION_MODE_AUTO,
+    LAYOUT_MODE_SINGLE,
     RANKING_SOURCE_AUTO,
     load_run_context,
     render_shorts_for_run,
@@ -1578,6 +1580,14 @@ def render_short_command(
         "--duration-mode",
         help=f"Subclip duration mode: {', '.join(AVAILABLE_DURATION_MODES)}",
     ),
+    layout_mode: str = typer.Option(
+        LAYOUT_MODE_SINGLE,
+        "--layout-mode",
+        help=(
+            "Vertical layout: single (one tracked crop), adaptive (single / dual stack / full "
+            "frame chosen per moment), full-frame (whole frame over a blurred background)"
+        ),
+    ),
     encoder: str = typer.Option(
         "auto",
         "--encoder",
@@ -1606,6 +1616,7 @@ def render_short_command(
         top=1,
         scorer=scorer,
         duration_mode=duration_mode,
+        layout_mode=layout_mode,
         encoder=encoder,
         no_reframe=no_reframe,
         no_loudnorm=no_loudnorm,
@@ -1639,6 +1650,14 @@ def render_shorts_command(
         "--duration-mode",
         help=f"Subclip duration mode: {', '.join(AVAILABLE_DURATION_MODES)}",
     ),
+    layout_mode: str = typer.Option(
+        LAYOUT_MODE_SINGLE,
+        "--layout-mode",
+        help=(
+            "Vertical layout: single (one tracked crop), adaptive (single / dual stack / full "
+            "frame chosen per moment), full-frame (whole frame over a blurred background)"
+        ),
+    ),
     encoder: str = typer.Option(
         "auto",
         "--encoder",
@@ -1667,6 +1686,7 @@ def render_shorts_command(
         top=top,
         scorer=scorer,
         duration_mode=duration_mode,
+        layout_mode=layout_mode,
         encoder=encoder,
         no_reframe=no_reframe,
         no_loudnorm=no_loudnorm,
@@ -1684,12 +1704,20 @@ def _render_shorts_cli(
     no_reframe: bool,
     no_loudnorm: bool,
     debug: bool,
+    layout_mode: str = LAYOUT_MODE_SINGLE,
 ) -> None:
     """Shared implementation for `render-short` and `render-shorts`."""
     if duration_mode not in AVAILABLE_DURATION_MODES:
         console.print(
             f"[bold red]Error:[/bold red] Unknown duration mode '{duration_mode}'. "
             f"Available: {', '.join(AVAILABLE_DURATION_MODES)}"
+        )
+        raise typer.Exit(code=1)
+
+    if layout_mode not in AVAILABLE_LAYOUT_MODES:
+        console.print(
+            f"[bold red]Error:[/bold red] Unknown layout mode '{layout_mode}'. "
+            f"Available: {', '.join(AVAILABLE_LAYOUT_MODES)}"
         )
         raise typer.Exit(code=1)
 
@@ -1708,6 +1736,7 @@ def _render_shorts_cli(
                   f"{settings.subclip_target_min_duration_sec:g}-{settings.subclip_target_max_duration_sec:g}s, "
                   f"max {settings.subclip_max_duration_sec:g}s)")
     console.print(f"Reframing:       [bold]{'Static center crop' if no_reframe else 'Smart subject tracking'}[/bold]")
+    console.print(f"Layout Mode:     [bold]{layout_mode}[/bold]")
     console.print(f"Audio Loudnorm:  [bold]{'Disabled' if no_loudnorm else 'Enabled (EBU R128)'}[/bold]")
     try:
         context = load_run_context(run_dir)
@@ -1757,6 +1786,7 @@ def _render_shorts_cli(
             enable_audio_normalization=not no_loudnorm,
             encoder=encoder,
             debug_overlay=debug,
+            layout_mode=layout_mode,
         )
     except Exception as exc:
         console.print(f"[bold red]Short production failed:[/bold red] {exc}")

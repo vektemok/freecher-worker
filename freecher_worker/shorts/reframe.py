@@ -77,6 +77,15 @@ class ReframeConfig(BaseModel):
     track_min_reach_px: float = Field(
         default=28.0, ge=0.0, description="Association floor, so small subjects stay trackable"
     )
+    track_max_size_ratio: float = Field(
+        default=3.0,
+        gt=1.0,
+        description="Reject an association whose box is this many times larger/smaller than the track",
+    )
+    track_predict_motion: bool = Field(
+        default=True,
+        description="Associate against the track's predicted position rather than its last one",
+    )
     scene_cut_threshold: float = Field(default=0.35, gt=0.0)
     dual_subject_balance: float = Field(default=0.35, ge=0.0, le=1.0)
     jitter_epsilon_px: float = Field(default=2.0, ge=0.0)
@@ -229,6 +238,52 @@ class DebugSample(BaseModel):
     scene_cut: bool = False
 
 
+class TrackObservation(BaseModel):
+    """One tracked subject as seen in one analysis frame.
+
+    This is the raw material the adaptive layout planner reasons over: it deliberately keeps
+    per-track identity and geometry instead of collapsing to a single framing target, because
+    "which people are on screen right now" is a different question from "where do I point the
+    single crop".
+    """
+
+    track_id: int
+    box: Tuple[int, int, int, int]
+    subject_type: str
+    confidence: float = 1.0
+    speaking_score: float = 0.0
+    hits: int = 1
+
+    @property
+    def center_x(self) -> float:
+        return self.box[0] + self.box[2] / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return self.box[1] + self.box[3] / 2.0
+
+    @property
+    def area(self) -> float:
+        return float(self.box[2] * self.box[3])
+
+
+class FrameObservation(BaseModel):
+    """Everything the analysis pass saw in one sampled frame."""
+
+    time: float
+    scene_cut: bool = False
+    active_track_id: Optional[int] = None
+    tracks: List[TrackObservation] = Field(default_factory=list)
+
+    @property
+    def detected(self) -> bool:
+        return bool(self.tracks)
+
+    @property
+    def mean_confidence(self) -> float:
+        return sum(t.confidence for t in self.tracks) / len(self.tracks) if self.tracks else 0.0
+
+
 class ReframePlan(BaseModel):
     """Crop trajectory plus diagnostics for one short."""
 
@@ -236,6 +291,10 @@ class ReframePlan(BaseModel):
     trajectory: CropTrajectory
     diagnostics: ReframeDiagnostics = Field(default_factory=ReframeDiagnostics)
     debug_samples: List[DebugSample] = Field(default_factory=list)
+    frames: List[FrameObservation] = Field(
+        default_factory=list,
+        description="Per-sample subject tracks, consumed by the adaptive layout planner",
+    )
 
 
 @dataclass
@@ -254,9 +313,16 @@ class SubjectTrack:
     hits: int = 1
     misses: int = 0
     speaking_score: float = 0.0
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
     mouth_patch: Optional[np.ndarray] = field(default=None, repr=False)
 
     def update(self, subject: DetectedSubject, timestamp: float) -> None:
+        dt = timestamp - self.last_seen
+        if dt > 1e-3:
+            # Exponentially smoothed so one noisy detection cannot fling the prediction away.
+            self.velocity_x = 0.5 * self.velocity_x + 0.5 * (subject.center_x - self.center_x) / dt
+            self.velocity_y = 0.5 * self.velocity_y + 0.5 * (subject.center_y - self.center_y) / dt
         self.box = subject.box
         self.center_x = subject.center_x
         self.center_y = subject.center_y
@@ -266,6 +332,23 @@ class SubjectTrack:
         self.last_seen = timestamp
         self.hits += 1
         self.misses = 0
+
+    def predict(self, timestamp: float, cfg: "ReframeConfig") -> Tuple[float, float]:
+        """Where this track is expected to be at ``timestamp``.
+
+        A subject that keeps moving while the detector loses it for a few frames would otherwise
+        be re-identified as a brand-new person the moment it is seen again, which is exactly the
+        track-id churn that makes a two-person layout decision meaningless.
+        """
+        if not cfg.track_predict_motion:
+            return self.center_x, self.center_y
+        gap = max(0.0, timestamp - self.last_seen)
+        if gap <= 0.0 or self.hits < 2:
+            return self.center_x, self.center_y
+        limit = cfg.track_max_motion_px_per_sec
+        vx = min(max(self.velocity_x, -limit), limit)
+        vy = min(max(self.velocity_y, -limit), limit)
+        return self.center_x + vx * gap, self.center_y + vy * gap
 
 
 def calculate_vertical_crop(source_width: int, source_height: int) -> Tuple[int, int]:
@@ -319,12 +402,17 @@ def _associate(
     config = cfg or ReframeConfig()
     pairs: List[Tuple[float, int, int]] = []
     for t_idx, track in enumerate(tracks):
+        predicted_x, predicted_y = track.predict(timestamp, config)
         for s_idx, subject in enumerate(subjects):
+            # A face cannot plausibly become three times bigger between two samples; allowing it
+            # lets a near subject swallow a distant one's identity.
+            larger = max(track.box[2], subject.box[2])
+            smaller = max(1, min(track.box[2], subject.box[2]))
+            if larger / smaller > config.track_max_size_ratio:
+                continue
             iou = _iou(track.box, subject.box)
             reach = _association_reach(track, subject, dt, config)
-            distance = math.hypot(
-                track.center_x - subject.center_x, track.center_y - subject.center_y
-            )
+            distance = math.hypot(predicted_x - subject.center_x, predicted_y - subject.center_y)
             if iou < config.track_match_iou and distance > reach:
                 continue
             # Single blended cost so overlap and proximity stay on one comparable scale.
@@ -372,6 +460,18 @@ def _associate(
             tracks[t_idx].misses += 1
 
     return tracks, matched, next_track_id
+
+
+def _record(track: SubjectTrack) -> TrackObservation:
+    """Snapshot a live track for the layout planner."""
+    return TrackObservation(
+        track_id=track.track_id,
+        box=track.box,
+        subject_type=track.subject_type,
+        confidence=round(float(track.confidence), 4),
+        speaking_score=round(float(track.speaking_score), 4),
+        hits=track.hits,
+    )
 
 
 def _mouth_patch(frame_gray: np.ndarray, box: Sequence[int]) -> Optional[np.ndarray]:
@@ -441,19 +541,23 @@ def estimate_dominant_center(frame_gray: np.ndarray, crop_w: int, source_width: 
     return float((best + window / 2.0) * scale)
 
 
-def _framing_target(
-    track: SubjectTrack,
+def framing_target_for_box(
+    box: Sequence[int],
     crop_w: int,
     crop_h: int,
     source_width: int,
     source_height: int,
     cfg: ReframeConfig,
 ) -> Tuple[float, float, bool]:
-    """Safe-framing target center for one subject; returns (x, y, edge_clamped)."""
-    box_x, box_y, box_w, box_h = track.box
+    """Safe-framing target center for one subject box; returns (x, y, edge_clamped).
+
+    Shared by the single-viewport crop and by each half of a stacked dual layout, so a subject
+    is framed by exactly the same rules whichever viewport it ends up in.
+    """
+    box_x, box_y, box_w, box_h = box
     half_w = crop_w / 2.0
 
-    target_x = track.center_x
+    target_x = box_x + box_w / 2.0
     pad = box_w * cfg.subject_padding_ratio
     left_need = box_x - pad
     right_need = box_x + box_w + pad
@@ -467,7 +571,7 @@ def _framing_target(
             target_x = clamped
 
     # Keep the face near the upper third with headroom, then never cut the top of the head.
-    target_y = track.center_y + crop_h * (0.5 - cfg.head_position_ratio)
+    target_y = (box_y + box_h / 2.0) + crop_h * (0.5 - cfg.head_position_ratio)
     headroom_limit = box_y - cfg.headroom_ratio * box_h + crop_h / 2.0
     target_y = min(target_y, headroom_limit)
     target_y = max(target_y, box_y + box_h - crop_h / 2.0)
@@ -489,6 +593,7 @@ class _Observation:
     track_ids: List[int]
     subject_types: List[str]
     edge_clamped: bool
+    records: List[TrackObservation] = field(default_factory=list)
 
 
 #: Seeking to exactly the clip end lands past the final frame, so the last sample sits just inside.
@@ -771,14 +876,15 @@ def _collect_observations(
                         [t.track_id for t in live],
                         [t.subject_type for t in live],
                         False,
+                        [_record(t) for t in live],
                     )
                 )
                 last_target = last_subject_target = (target_x, target_y)
                 last_subject_time = t_rel
                 continue
 
-        target_x, target_y, edge_clamped = _framing_target(
-            active, crop_w, crop_h, source_width, source_height, cfg
+        target_x, target_y, edge_clamped = framing_target_for_box(
+            active.box, crop_w, crop_h, source_width, source_height, cfg
         )
         if edge_clamped:
             diagnostics.edge_clamped_frames += 1
@@ -797,6 +903,7 @@ def _collect_observations(
                 [t.track_id for t in live],
                 [t.subject_type for t in live],
                 edge_clamped,
+                [_record(t) for t in live],
             )
         )
         last_target = last_subject_target = (target_x, target_y)
@@ -806,8 +913,19 @@ def _collect_observations(
     return observations
 
 
-def _smooth(
-    observations: List[_Observation],
+@dataclass
+class FramingTarget:
+    """One raw framing intent, before smoothing turns it into a crop keyframe."""
+
+    time: float
+    x: float
+    y: float
+    scene_cut: bool = False
+    subject_type: str = FALLBACK_NONE
+
+
+def smooth_crop_points(
+    targets: Sequence[FramingTarget],
     crop_w: int,
     crop_h: int,
     source_width: int,
@@ -818,6 +936,9 @@ def _smooth(
 
     Dead-zone, proportional tracking, velocity and acceleration clamps remove shake and
     micro-jitter; a scene cut is allowed to re-anchor instantly.
+
+    Every viewport goes through this function - the single crop and both halves of a stacked
+    dual layout - so all of them move with the same camera operator.
     """
     points: List[CropPoint] = []
     deadzone = cfg.deadzone_ratio * source_width
@@ -828,19 +949,19 @@ def _smooth(
     last_emitted_x: Optional[int] = None
     last_emitted_y: Optional[int] = None
 
-    for idx, obs in enumerate(observations):
+    for idx, obs in enumerate(targets):
         if idx == 0:
-            cur_x, cur_y = obs.target_x, obs.target_y
+            cur_x, cur_y = obs.x, obs.y
             vel_x = vel_y = 0.0
         elif obs.scene_cut:
-            cur_x, cur_y = obs.target_x, obs.target_y
+            cur_x, cur_y = obs.x, obs.y
             vel_x = vel_y = 0.0
         else:
             dt = max(1e-3, obs.time - prev_t)
             for axis in ("x", "y"):
                 cur = cur_x if axis == "x" else cur_y
                 vel = vel_x if axis == "x" else vel_y
-                target = obs.target_x if axis == "x" else obs.target_y
+                target = obs.x if axis == "x" else obs.y
 
                 error = target - cur
                 if abs(error) <= deadzone:
@@ -892,6 +1013,28 @@ def _smooth(
         )
 
     return points
+
+
+def _smooth(
+    observations: List[_Observation],
+    crop_w: int,
+    crop_h: int,
+    source_width: int,
+    source_height: int,
+    cfg: ReframeConfig,
+) -> List[CropPoint]:
+    """Smooth the analysis pass's own framing targets into the single-viewport trajectory."""
+    return smooth_crop_points(
+        [
+            FramingTarget(o.time, o.target_x, o.target_y, o.scene_cut, o.subject_type)
+            for o in observations
+        ],
+        crop_w,
+        crop_h,
+        source_width,
+        source_height,
+        cfg,
+    )
 
 
 def _trajectory_stats(
@@ -1066,6 +1209,15 @@ def build_reframe_plan(
         ),
         diagnostics=diagnostics,
         debug_samples=debug_samples,
+        frames=[
+            FrameObservation(
+                time=round(o.time, 3),
+                scene_cut=o.scene_cut,
+                active_track_id=o.active_track_id,
+                tracks=o.records,
+            )
+            for o in observations
+        ],
     )
 
 
@@ -1074,8 +1226,15 @@ def render_debug_overlay(
     plan: ReframePlan,
     source_start_sec: float,
     output_path: Path | str,
+    layout_labels: Optional[Sequence[Tuple[float, float, str]]] = None,
+    safe_band: Optional[Tuple[float, float]] = None,
 ) -> Optional[Path]:
     """Render a diagnostic video with detection boxes, crop rectangle and active subject.
+
+    ``layout_labels`` are ``(start, end, text)`` triples describing the layout in force at each
+    moment; ``safe_band`` is the ``(top, bottom)`` caption/UI reservation as a fraction of the
+    crop height. Both are supplied by the caller rather than imported, so the analysis layer
+    never has to know about the layout layer.
 
     Silent, source-resolution, sampled at the analysis rate. Diagnostics only — never published.
     """
@@ -1148,6 +1307,34 @@ def render_debug_overlay(
             frame, f"crop x={sample.crop_x} y={sample.crop_y} {traj.crop_w}x{traj.crop_h}",
             (16, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2,
         )
+
+        if safe_band is not None:
+            top_ratio, bottom_ratio = safe_band
+            safe_top = int(sample.crop_y + top_ratio * traj.crop_h)
+            safe_bottom = int(sample.crop_y + (1.0 - bottom_ratio) * traj.crop_h)
+            cv2.rectangle(
+                frame,
+                (sample.crop_x, safe_top),
+                (sample.crop_x + traj.crop_w, safe_bottom),
+                (255, 255, 0),
+                2,
+            )
+            cv2.putText(
+                frame, "safe area", (sample.crop_x + 8, max(0, safe_top) + 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2,
+            )
+
+        if layout_labels:
+            text = next(
+                (label for start, end, label in layout_labels if start <= sample.time < end),
+                layout_labels[-1][2],
+            )
+            for offset, line in enumerate(text.split("\n")):
+                cv2.putText(
+                    frame, line, (16, 124 + offset * 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2,
+                )
+
         writer.write(frame)
 
     writer.release()

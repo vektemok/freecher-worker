@@ -41,6 +41,14 @@ FFMPEG_EXPRESSION_NODE_LIMIT = 100
 EXPRESSION_KEYFRAME_BUDGET = 45
 
 
+def escape_filtergraph_value(value: str) -> str:
+    """Escape a literal (such as a file path) for use inside a filtergraph argument."""
+    out = value.replace("\\", "\\\\")
+    for char in ("'", ":", ",", ";", "[", "]", "="):
+        out = out.replace(char, "\\" + char)
+    return out
+
+
 class TrajectoryValidationError(ValueError):
     """Raised when a crop trajectory cannot be repaired into something FFmpeg can render."""
 
