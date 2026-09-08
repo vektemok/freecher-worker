@@ -17,6 +17,8 @@ class MultimodalProvider(ABC):
     name: str = "abstract_multimodal_provider"
     model: str = "default"
     prompt_version: str = PROMPT_VERSION_MULTIMODAL_V1
+    reasoning_effort: Optional[str] = None
+    temperature: Optional[float] = None
 
     @abstractmethod
     def score_candidate(self, package: MultimodalCandidatePackage) -> MultimodalModelResult:

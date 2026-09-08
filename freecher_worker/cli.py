@@ -683,6 +683,7 @@ def score_run_command(
             base_url=settings.multimodal_base_url,
             api_key=settings.multimodal_api_key,
             model=actual_model,
+            reasoning_effort=settings.multimodal_reasoning_effort,
         )
         reranker = MultimodalReranker(
             provider=provider,
@@ -922,11 +923,23 @@ def multimodal_score_command(
         "-v",
         help="Path to source video file if moved or not found in manifest/media.json",
     ),
+    reasoning_effort: Optional[str] = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="Reasoning effort for reasoning models (none|low|medium|high|xhigh|max). Defaults to 'none' for gpt-5.6 family.",
+    ),
+    temperature: Optional[float] = typer.Option(
+        None,
+        "--temperature",
+        "-t",
+        help="Sampling temperature (default: 0.1, omitted when reasoning_effort != 'none')",
+    ),
 ) -> None:
     """Run Multimodal Highlight Reranker (v1.1 default or v1) on a deterministic candidate shortlist."""
     resolved_dir = run_dir.resolve()
     settings = get_settings()
     actual_model = model or settings.multimodal_model or "gpt-4o-mini"
+    actual_reasoning_effort = reasoning_effort or settings.multimodal_reasoning_effort
 
     is_v1_1 = scorer_version == SCORER_VERSION_MULTIMODAL_V1_1
     prompt_ver = (
@@ -938,6 +951,8 @@ def multimodal_score_command(
         api_key=settings.multimodal_api_key,
         model=actual_model,
         prompt_version=prompt_ver,
+        reasoning_effort=actual_reasoning_effort,
+        temperature=temperature if temperature is not None else 0.1,
     )
 
     reranker = MultimodalReranker(

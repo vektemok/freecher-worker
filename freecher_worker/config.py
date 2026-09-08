@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     multimodal_llm_top_k: int = Field(default=12, description="Candidates taken from highlight_v2_1 for shortlist")
     multimodal_max_candidates: int = Field(default=20, description="Maximum capacity for multimodal candidate shortlist")
     multimodal_max_long_edge: int = Field(default=640, description="Max long edge dimension in pixels for extracted frames")
+    multimodal_reasoning_effort: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FREECHER_MULTIMODAL_REASONING_EFFORT",
+            "MULTIMODAL_REASONING_EFFORT",
+            "REASONING_EFFORT",
+        ),
+        description="Reasoning effort for reasoning models (none|low|medium|high|xhigh|max)",
+    )
 
     # Paths
     output_dir: Path = Field(default=Path("runs"), description="Base directory for run outputs")

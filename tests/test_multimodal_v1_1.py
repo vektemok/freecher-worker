@@ -27,6 +27,7 @@ from freecher_worker.multimodal import (
     ExtractedFrame,
     FORMULA_VERSION_MULTIMODAL_V1,
     FORMULA_VERSION_MULTIMODAL_V1_1,
+    ModelCapabilities,
     MultimodalCandidatePackage,
     MultimodalModelResult,
     MultimodalProvider,
@@ -34,11 +35,13 @@ from freecher_worker.multimodal import (
     MultimodalUsage,
     ObservedEvidenceItem,
     ObservedRegion,
+    OpenAIDeterministicError,
     OpenAIMultimodalProvider,
     PACKAGE_VERSION_V1,
     PACKAGE_VERSION_V1_1,
     PROMPT_VERSION_MULTIMODAL_V1,
     PROMPT_VERSION_MULTIMODAL_V1_1,
+    REQUEST_SCHEMA_VERSION_MULTIMODAL,
     SCORER_VERSION_MULTIMODAL_V1,
     SCORER_VERSION_MULTIMODAL_V1_1,
     ShortlistDocument,
@@ -50,6 +53,7 @@ from freecher_worker.multimodal import (
     TemporalBurst,
     VisualFeatures,
     build_multimodal_package,
+    compute_api_request_hash,
     compute_combined_activity,
     compute_source_audio_profile,
     compute_source_temporal_activity_profile,
@@ -59,6 +63,7 @@ from freecher_worker.multimodal import (
     extract_candidate_visual_features,
     extract_canonical_fingerprint,
     generate_shortlist,
+    get_model_capabilities,
     multimodal_v1_formula_v1,
     multimodal_v1_1_formula_v1,
     probe_software_decoder,
@@ -1114,4 +1119,289 @@ def test_32_activity_profile_and_frame_extraction_share_decoder_policy(tmp_path:
         act_data = load_json(act_file)
         assert act_data["decoder_info"]["decoder_mode"] == "libdav1d"
         assert act_data["decoder_info"]["hardware_acceleration"] is False
+
+
+def _make_dummy_package(tmp_path: Path, cid: str = "c1") -> MultimodalCandidatePackage:
+    img_file = tmp_path / f"{cid}_frame.jpg"
+    img_file.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+    frame = ExtractedFrame(
+        timestamp_offset=2.5,
+        absolute_timestamp=12.5,
+        image_path=str(img_file),
+        width=640,
+        height=360,
+        source_type="global",
+    )
+    return MultimodalCandidatePackage(
+        candidate_id=cid,
+        start=10.0,
+        end=20.0,
+        duration=10.0,
+        candidate_transcript="Hello world streamer moment",
+        frames=[frame],
+        audio_features=AudioFeatures(
+            rms_mean=0.1, rms_std=0.02, peak=0.5, silence_ratio=0.1, speech_coverage=0.9, energy_change_rate=0.01
+        ),
+        visual_features=VisualFeatures(
+            motion_score=0.2, scene_change_count=0, face_presence_ratio=0.5, decoded_frame_count=1, requested_frame_count=1
+        ),
+        source_fingerprint="035864f48379388e",
+        candidate_set_id="cset_8ac195a200530e96",
+        package_hash="hash_dummy",
+        package_version=PACKAGE_VERSION_V1_1,
+    )
+
+
+def _mock_success_response(cid: str = "c1"):
+    resp = mock.MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps({
+                        "candidate_id": cid,
+                        "observable_event": True,
+                        "visual_payoff": True,
+                        "visual_event": 80.0,
+                        "reaction": 75.0,
+                        "emotion": 70.0,
+                        "humor": 65.0,
+                        "surprise": 60.0,
+                        "energy": 85.0,
+                        "standalone": 90.0,
+                        "retention": 85.0,
+                        "shareability": 80.0,
+                        "boringness": 10.0,
+                        "context_dependency": 15.0,
+                        "outside_payoff": False,
+                        "missing_setup": False,
+                        "insufficient_visual_evidence": False,
+                        "confidence": 0.9,
+                        "best_observed_region": {"start_offset": 2.0, "end_offset": 8.0, "confidence": 0.95, "reason": "peak action"},
+                        "evidence": [{"timestamp_offset": 4.0, "description": "streamer laughed"}],
+                        "reason": "Great highlight clip.",
+                        "quality_score": 85.0,
+                    })
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+    }
+    return resp
+
+
+def test_33_gpt56_luna_reasoning_none_includes_temperature(tmp_path: Path):
+    """33. gpt-5.6-luna with reasoning_effort=none includes both reasoning_effort and temperature in payload."""
+    pkg = _make_dummy_package(tmp_path, "c_luna_none")
+    p = OpenAIMultimodalProvider(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        reasoning_effort="none",
+        temperature=0.1,
+    )
+    mock_resp = _mock_success_response("c_luna_none")
+    with mock.patch("httpx.Client.post", return_value=mock_resp) as mock_post:
+        res = p.score_candidate(pkg)
+        assert res.candidate_id == "c_luna_none"
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args[1]["json"]
+        assert payload["model"] == "gpt-5.6-luna"
+        assert payload["reasoning_effort"] == "none"
+        assert payload["temperature"] == 0.1
+
+
+def test_34_gpt56_luna_reasoning_medium_omits_temperature(tmp_path: Path):
+    """34. gpt-5.6-luna with reasoning_effort!=none omits temperature completely from payload."""
+    pkg = _make_dummy_package(tmp_path, "c_luna_med")
+    p = OpenAIMultimodalProvider(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        reasoning_effort="medium",
+        temperature=0.1,
+    )
+    mock_resp = _mock_success_response("c_luna_med")
+    with mock.patch("httpx.Client.post", return_value=mock_resp) as mock_post:
+        res = p.score_candidate(pkg)
+        assert res.candidate_id == "c_luna_med"
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args[1]["json"]
+        assert payload["model"] == "gpt-5.6-luna"
+        assert payload["reasoning_effort"] == "medium"
+        assert "temperature" not in payload
+
+
+def test_35_gpt4o_mini_legacy_payload_unchanged(tmp_path: Path):
+    """35. gpt-4o-mini legacy payload includes temperature=0.1 and omits reasoning_effort entirely."""
+    pkg = _make_dummy_package(tmp_path, "c_mini")
+    p = OpenAIMultimodalProvider(
+        api_key="test-key",
+        model="gpt-4o-mini",
+        temperature=0.1,
+    )
+    mock_resp = _mock_success_response("c_mini")
+    with mock.patch("httpx.Client.post", return_value=mock_resp) as mock_post:
+        res = p.score_candidate(pkg)
+        assert res.candidate_id == "c_mini"
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args[1]["json"]
+        assert payload["model"] == "gpt-4o-mini"
+        assert payload["temperature"] == 0.1
+        assert "reasoning_effort" not in payload
+
+
+def test_36_deterministic_400_not_retried(tmp_path: Path):
+    """36. Deterministic HTTP 400 error fails immediately on first attempt without retrying."""
+    pkg = _make_dummy_package(tmp_path, "c_err400")
+    p = OpenAIMultimodalProvider(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        reasoning_effort="none",
+        max_retries=3,
+    )
+    mock_err_resp = mock.MagicMock()
+    mock_err_resp.status_code = 400
+    mock_err_resp.json.return_value = {
+        "error": {
+            "message": "Unsupported parameter: 'temperature' is not supported with this reasoning effort.",
+            "type": "invalid_request_error",
+            "param": "temperature",
+            "code": None,
+        }
+    }
+    with mock.patch("httpx.Client.post", return_value=mock_err_resp) as mock_post:
+        with pytest.raises(OpenAIDeterministicError) as exc_info:
+            p.score_candidate(pkg)
+        assert mock_post.call_count == 1
+        assert "Deterministic HTTP 400 error" in str(exc_info.value)
+        assert "Unsupported parameter: 'temperature'" in str(exc_info.value)
+
+
+def test_37_sanitized_api_error_body_surfaced(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """37. Sanitized API error body is surfaced (status, model, message, type, param, code) and secret keys are never leaked."""
+    pkg = _make_dummy_package(tmp_path, "c_sanitized")
+    secret_key = "sk-proj-super-secret-token-do-not-leak"
+    p = OpenAIMultimodalProvider(
+        api_key=secret_key,
+        model="gpt-5.6-luna",
+    )
+    mock_err_resp = mock.MagicMock()
+    mock_err_resp.status_code = 400
+    mock_err_resp.json.return_value = {
+        "error": {
+            "message": "Invalid request parameter value",
+            "type": "invalid_request_error",
+            "param": "sampling_param",
+            "code": "parameter_invalid",
+        }
+    }
+    with mock.patch("httpx.Client.post", return_value=mock_err_resp):
+        with pytest.raises(OpenAIDeterministicError) as exc_info:
+            p.score_candidate(pkg)
+
+        err_text = str(exc_info.value)
+        assert "status_code=400" in err_text
+        assert "model='gpt-5.6-luna'" in err_text
+        assert "error.message='Invalid request parameter value'" in err_text
+        assert "error.type='invalid_request_error'" in err_text
+        assert "error.param='sampling_param'" in err_text
+        assert "error.code='parameter_invalid'" in err_text
+
+        # Crucial security verification: API key must NEVER be leaked in exception or logs
+        assert secret_key not in err_text
+        assert secret_key not in caplog.text
+
+
+def test_38_image_payload_remains_unchanged(tmp_path: Path):
+    """38. Base64 encoded image URLs are preserved in the user message payload with detail=low."""
+    pkg = _make_dummy_package(tmp_path, "c_img")
+    p = OpenAIMultimodalProvider(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        reasoning_effort="none",
+    )
+    mock_resp = _mock_success_response("c_img")
+    with mock.patch("httpx.Client.post", return_value=mock_resp) as mock_post:
+        p.score_candidate(pkg)
+        payload = mock_post.call_args[1]["json"]
+        user_msg = payload["messages"][1]
+        assert user_msg["role"] == "user"
+        image_blocks = [
+            b for b in user_msg["content"]
+            if isinstance(b, dict) and b.get("type") == "image_url"
+        ]
+        assert len(image_blocks) >= 1
+        img_url = image_blocks[0]["image_url"]
+        assert img_url["url"].startswith("data:image/jpeg;base64,")
+        assert img_url["detail"] == "low"
+
+
+def test_39_request_cache_hash_includes_model_reasoning_temperature():
+    """39. compute_api_request_hash differentiates model, reasoning_effort, temperature, and schema version."""
+    h_mini_none_01 = compute_api_request_hash(
+        "pkg1", "openai", "gpt-4o-mini", "v1_1",
+        request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+        reasoning_effort=None, temperature=0.1
+    )
+    h_luna_none_01 = compute_api_request_hash(
+        "pkg1", "openai", "gpt-5.6-luna", "v1_1",
+        request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+        reasoning_effort="none", temperature=0.1
+    )
+    h_luna_med_none = compute_api_request_hash(
+        "pkg1", "openai", "gpt-5.6-luna", "v1_1",
+        request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+        reasoning_effort="medium", temperature=None
+    )
+    h_luna_none_02 = compute_api_request_hash(
+        "pkg1", "openai", "gpt-5.6-luna", "v1_1",
+        request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+        reasoning_effort="none", temperature=0.2
+    )
+    h_mini_old_schema = compute_api_request_hash(
+        "pkg1", "openai", "gpt-4o-mini", "v1_1",
+        request_schema_version="openai_multimodal_request_v1",
+        reasoning_effort=None, temperature=0.1
+    )
+    h_mini_none_01_dup = compute_api_request_hash(
+        "pkg1", "openai", "gpt-4o-mini", "v1_1",
+        request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+        reasoning_effort=None, temperature=0.1
+    )
+
+    assert h_mini_none_01 == h_mini_none_01_dup
+    assert h_mini_none_01 != h_luna_none_01
+    assert h_luna_none_01 != h_luna_med_none
+    assert h_luna_none_01 != h_luna_none_02
+    assert h_mini_none_01 != h_mini_old_schema
+
+
+def test_40_model_capabilities_resolver_and_unknown_models():
+    """40. Capability resolver correctly configures known and unknown models and raises on invalid combinations."""
+    # GPT-5.6 family
+    for m in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        caps = get_model_capabilities(m)
+        assert caps.supports_reasoning_effort is True
+        assert caps.supports_temperature_with_none is True
+        assert caps.default_reasoning_effort == "none"
+        assert "medium" in caps.supported_reasoning_efforts
+
+    # GPT-4o family
+    for m in ("gpt-4o-mini", "gpt-4o"):
+        caps = get_model_capabilities(m)
+        assert caps.supports_reasoning_effort is False
+        assert caps.default_reasoning_effort is None
+
+    # Unknown model
+    caps_unk = get_model_capabilities("unknown-vision-model-xyz")
+    assert caps_unk.supports_reasoning_effort is False
+    assert caps_unk.default_reasoning_effort is None
+
+    # Validation in OpenAIMultimodalProvider
+    with pytest.raises(ValueError, match="does not support reasoning_effort"):
+        OpenAIMultimodalProvider(model="gpt-4o-mini", reasoning_effort="low")
+
+    with pytest.raises(ValueError, match="Unsupported reasoning_effort"):
+        OpenAIMultimodalProvider(model="gpt-5.6-luna", reasoning_effort="invalid_mode")
+
 

@@ -38,14 +38,35 @@ FORMULA_VERSION_MULTIMODAL_V1 = "multimodal_v1_formula_v1"
 FORMULA_VERSION_MULTIMODAL_V1_1 = "multimodal_v1_1_formula_v1"
 
 
+REQUEST_SCHEMA_VERSION_MULTIMODAL = "openai_multimodal_request_v2"
+
+
 def compute_api_request_hash(
     package_hash: str,
     provider_name: str,
     model_name: str,
     prompt_version: str,
+    request_schema_version: str = REQUEST_SCHEMA_VERSION_MULTIMODAL,
+    reasoning_effort: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> str:
-    """Deterministic hash identifying an API evaluation request."""
-    key = f"{package_hash}:{provider_name}:{model_name}:{prompt_version}"
+    """Deterministic hash identifying an API evaluation request.
+
+    Incorporates:
+    - package_hash
+    - provider_name
+    - model_name
+    - prompt_version
+    - request_schema_version ("openai_multimodal_request_v2")
+    - reasoning_effort
+    - effective_temperature
+    """
+    r_effort_str = str(reasoning_effort).lower() if reasoning_effort is not None else "none"
+    temp_str = f"{temperature:.4f}" if temperature is not None else "none"
+    key = (
+        f"{package_hash}:{provider_name}:{model_name}:{prompt_version}:"
+        f"{request_schema_version}:{r_effort_str}:{temp_str}"
+    )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -400,12 +421,19 @@ class MultimodalReranker:
                 force_rebuild=self.force_repackage,
             )
 
-            # API Request caching
+            # API Request caching with reasoning_effort & temperature separation
+            p_reasoning = getattr(self.provider, "reasoning_effort", None)
+            p_temp = getattr(self.provider, "temperature", None)
+            effective_temp = None if (p_reasoning and p_reasoning.lower() != "none") else p_temp
+
             req_hash = compute_api_request_hash(
                 package_hash=package.package_hash,
                 provider_name=self.provider.name,
                 model_name=self.provider.model,
                 prompt_version=self.provider.prompt_version,
+                request_schema_version=REQUEST_SCHEMA_VERSION_MULTIMODAL,
+                reasoning_effort=p_reasoning,
+                temperature=effective_temp,
             )
             api_cache_file = api_cache_dir / f"{req_hash}.json"
 

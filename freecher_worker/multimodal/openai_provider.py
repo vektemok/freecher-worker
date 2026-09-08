@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -161,6 +162,126 @@ def _encode_image_b64(path: str | Path) -> str:
         return base64.b64encode(img_f.read()).decode("utf-8")
 
 
+class OpenAIDeterministicError(RuntimeError):
+    """Deterministic client error (HTTP 400, 401, 403, 404) that should not be retried."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Explicit declaration of model capabilities for multimodal/reasoning evaluation."""
+
+    model_id: str
+    supports_reasoning_effort: bool = False
+    supported_reasoning_efforts: Tuple[str, ...] = ()
+    supports_temperature_with_none: bool = False
+    default_reasoning_effort: Optional[str] = None
+
+
+REASONING_EFFORTS_STANDARD: Tuple[str, ...] = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
+KNOWN_MODEL_CAPABILITIES: Dict[str, ModelCapabilities] = {
+    "gpt-5.6": ModelCapabilities(
+        model_id="gpt-5.6",
+        supports_reasoning_effort=True,
+        supported_reasoning_efforts=REASONING_EFFORTS_STANDARD,
+        supports_temperature_with_none=True,
+        default_reasoning_effort="none",
+    ),
+    "gpt-5.6-sol": ModelCapabilities(
+        model_id="gpt-5.6-sol",
+        supports_reasoning_effort=True,
+        supported_reasoning_efforts=REASONING_EFFORTS_STANDARD,
+        supports_temperature_with_none=True,
+        default_reasoning_effort="none",
+    ),
+    "gpt-5.6-terra": ModelCapabilities(
+        model_id="gpt-5.6-terra",
+        supports_reasoning_effort=True,
+        supported_reasoning_efforts=REASONING_EFFORTS_STANDARD,
+        supports_temperature_with_none=True,
+        default_reasoning_effort="none",
+    ),
+    "gpt-5.6-luna": ModelCapabilities(
+        model_id="gpt-5.6-luna",
+        supports_reasoning_effort=True,
+        supported_reasoning_efforts=REASONING_EFFORTS_STANDARD,
+        supports_temperature_with_none=True,
+        default_reasoning_effort="none",
+    ),
+    "gpt-4o-mini": ModelCapabilities(
+        model_id="gpt-4o-mini",
+        supports_reasoning_effort=False,
+        supported_reasoning_efforts=(),
+        supports_temperature_with_none=False,
+        default_reasoning_effort=None,
+    ),
+    "gpt-4o": ModelCapabilities(
+        model_id="gpt-4o",
+        supports_reasoning_effort=False,
+        supported_reasoning_efforts=(),
+        supports_temperature_with_none=False,
+        default_reasoning_effort=None,
+    ),
+}
+
+
+def get_model_capabilities(model_id: str) -> ModelCapabilities:
+    """Explicit capability resolver for vision/reasoning models.
+
+    Supports explicitly at minimum:
+    - gpt-5.6
+    - gpt-5.6-sol
+    - gpt-5.6-terra
+    - gpt-5.6-luna
+    - gpt-4o-mini
+    - gpt-4o
+
+    Unknown models retain safe legacy behavior unless an unsupported reasoning option
+    is explicitly requested.
+    """
+    m_key = (model_id or "").strip().lower()
+    if m_key in KNOWN_MODEL_CAPABILITIES:
+        return KNOWN_MODEL_CAPABILITIES[m_key]
+
+    for prefix in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6"):
+        if m_key == prefix or m_key.startswith(prefix + "-") or m_key.startswith(prefix + ":"):
+            return ModelCapabilities(
+                model_id=model_id,
+                supports_reasoning_effort=True,
+                supported_reasoning_efforts=REASONING_EFFORTS_STANDARD,
+                supports_temperature_with_none=True,
+                default_reasoning_effort="none",
+            )
+
+    for prefix in ("gpt-4o-mini", "gpt-4o"):
+        if m_key == prefix or m_key.startswith(prefix + "-") or m_key.startswith(prefix + ":"):
+            return ModelCapabilities(
+                model_id=model_id,
+                supports_reasoning_effort=False,
+                supported_reasoning_efforts=(),
+                supports_temperature_with_none=False,
+                default_reasoning_effort=None,
+            )
+
+    # Unknown model: default to safe legacy non-reasoning capabilities
+    return ModelCapabilities(
+        model_id=model_id,
+        supports_reasoning_effort=False,
+        supported_reasoning_efforts=(),
+        supports_temperature_with_none=False,
+        default_reasoning_effort=None,
+    )
+
+
 class OpenAIMultimodalProvider(MultimodalProvider):
     """Multimodal provider interfacing with OpenAI-compatible vision models."""
 
@@ -173,6 +294,7 @@ class OpenAIMultimodalProvider(MultimodalProvider):
         timeout_seconds: float = 45.0,
         max_retries: int = 3,
         temperature: float = 0.1,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         self.name = "openai_multimodal"
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
@@ -183,6 +305,25 @@ class OpenAIMultimodalProvider(MultimodalProvider):
         self.temperature = temperature
         self.prompt_version = prompt_version or PROMPT_VERSION_MULTIMODAL_V1
         self.usage = MultimodalUsage()
+
+        # Capability resolution
+        self.capabilities = get_model_capabilities(self.model)
+
+        if reasoning_effort is not None:
+            r_eff = reasoning_effort.lower().strip()
+            if not self.capabilities.supports_reasoning_effort:
+                raise ValueError(
+                    f"Model '{self.model}' does not support reasoning_effort. "
+                    f"Requested: '{reasoning_effort}'"
+                )
+            if r_eff not in self.capabilities.supported_reasoning_efforts:
+                raise ValueError(
+                    f"Unsupported reasoning_effort '{reasoning_effort}' for model '{self.model}'. "
+                    f"Supported options: {list(self.capabilities.supported_reasoning_efforts)}"
+                )
+            self.reasoning_effort = r_eff
+        else:
+            self.reasoning_effort = self.capabilities.default_reasoning_effort
 
     def get_usage(self) -> MultimodalUsage:
         return self.usage
@@ -326,14 +467,23 @@ class OpenAIMultimodalProvider(MultimodalProvider):
             "Content-Type": "application/json",
         }
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content_blocks},
             ],
-            "temperature": self.temperature,
         }
+
+        # Model-aware sampling & reasoning parameters
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+            # temperature may only be sent when the selected reasoning mode supports it (i.e. reasoning_effort == "none")
+            if self.reasoning_effort.lower() == "none":
+                payload["temperature"] = self.temperature
+        else:
+            # Legacy non-reasoning models (e.g. gpt-4o-mini)
+            payload["temperature"] = self.temperature
 
         url = f"{self.base_url}/chat/completions"
         last_error: Optional[Exception] = None
@@ -342,6 +492,51 @@ class OpenAIMultimodalProvider(MultimodalProvider):
             try:
                 with httpx.Client(timeout=self.timeout_seconds) as client:
                     resp = client.post(url, headers=headers, json=payload)
+                    status_raw = getattr(resp, "status_code", 200)
+                    status_code = status_raw if isinstance(status_raw, int) else 200
+
+                    if status_code >= 400:
+                        err_msg = None
+                        err_type = None
+                        err_param = None
+                        err_code = None
+
+                        try:
+                            err_json = resp.json()
+                            if isinstance(err_json, dict):
+                                err_obj = (
+                                    err_json.get("error")
+                                    if isinstance(err_json.get("error"), dict)
+                                    else err_json
+                                )
+                                err_msg = err_obj.get("message")
+                                err_type = err_obj.get("type")
+                                err_param = err_obj.get("param")
+                                err_code = err_obj.get("code")
+                        except Exception:
+                            err_msg = resp.text[:500] if resp.text else None
+
+                        # Sanitized diagnostics: NEVER log Authorization, API key, or base64 images
+                        diag_msg = (
+                            f"status_code={status_code}, model='{self.model}', "
+                            f"error.message='{err_msg}', error.type='{err_type}', "
+                            f"error.param='{err_param}', error.code='{err_code}'"
+                        )
+                        logger.error(f"[multimodal-openai] HTTP {status_code} error from {url}: {diag_msg}")
+
+                        # Deterministic client errors: fail immediately without retrying
+                        if status_code in (400, 401, 403, 404):
+                            raise OpenAIDeterministicError(
+                                f"Deterministic HTTP {status_code} error for candidate {package.candidate_id}: {diag_msg}"
+                            )
+
+                        # Other HTTP errors (408, 409, 429, 5xx): raise for retry
+                        raise httpx.HTTPStatusError(
+                            f"Transient HTTP {status_code} error for candidate {package.candidate_id}: {diag_msg}",
+                            request=resp.request,
+                            response=resp,
+                        )
+
                     resp.raise_for_status()
                     data = resp.json()
 
@@ -370,6 +565,12 @@ class OpenAIMultimodalProvider(MultimodalProvider):
                 result = MultimodalModelResult.model_validate(parsed)
                 return result
 
+            except OpenAIDeterministicError as exc:
+                # Deterministic error: fail immediately without retry!
+                logger.error(
+                    f"[multimodal-openai] Deterministic error for candidate {package.candidate_id}, failing immediately: {exc}"
+                )
+                raise
             except Exception as exc:
                 last_error = exc
                 logger.warning(

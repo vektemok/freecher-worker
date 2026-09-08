@@ -34,15 +34,22 @@ from .models import (
     TemporalBurst,
     VisualFeatures,
 )
-from .openai_provider import OpenAIMultimodalProvider
+from .openai_provider import (
+    ModelCapabilities,
+    OpenAIDeterministicError,
+    OpenAIMultimodalProvider,
+    get_model_capabilities,
+)
 from .package import PACKAGE_VERSION_V1, PACKAGE_VERSION_V1_1, build_multimodal_package
 from .provider import PROMPT_VERSION_MULTIMODAL_V1, PROMPT_VERSION_MULTIMODAL_V1_1, MultimodalProvider
 from .scorer import (
     FORMULA_VERSION_MULTIMODAL_V1,
     FORMULA_VERSION_MULTIMODAL_V1_1,
+    REQUEST_SCHEMA_VERSION_MULTIMODAL,
     SCORER_VERSION_MULTIMODAL_V1,
     SCORER_VERSION_MULTIMODAL_V1_1,
     MultimodalReranker,
+    compute_api_request_hash,
     extract_canonical_fingerprint,
     multimodal_v1_formula_v1,
     multimodal_v1_1_formula_v1,
@@ -59,6 +66,7 @@ __all__ = [
     "ExtractedFrame",
     "FORMULA_VERSION_MULTIMODAL_V1",
     "FORMULA_VERSION_MULTIMODAL_V1_1",
+    "ModelCapabilities",
     "MultimodalCandidatePackage",
     "MultimodalModelResult",
     "MultimodalProvider",
@@ -66,11 +74,13 @@ __all__ = [
     "MultimodalUsage",
     "ObservedEvidenceItem",
     "ObservedRegion",
+    "OpenAIDeterministicError",
     "OpenAIMultimodalProvider",
     "PACKAGE_VERSION_V1",
     "PACKAGE_VERSION_V1_1",
     "PROMPT_VERSION_MULTIMODAL_V1",
     "PROMPT_VERSION_MULTIMODAL_V1_1",
+    "REQUEST_SCHEMA_VERSION_MULTIMODAL",
     "SCORER_VERSION_MULTIMODAL_V1",
     "SCORER_VERSION_MULTIMODAL_V1_1",
     "SafeDecoderResolution",
@@ -82,6 +92,7 @@ __all__ = [
     "TemporalBurst",
     "VisualFeatures",
     "build_multimodal_package",
+    "compute_api_request_hash",
     "compute_combined_activity",
     "compute_source_audio_profile",
     "compute_source_temporal_activity_profile",
@@ -91,6 +102,7 @@ __all__ = [
     "extract_candidate_visual_features",
     "extract_canonical_fingerprint",
     "generate_shortlist",
+    "get_model_capabilities",
     "multimodal_v1_formula_v1",
     "multimodal_v1_1_formula_v1",
     "probe_software_decoder",
