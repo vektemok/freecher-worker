@@ -116,6 +116,26 @@ class ScorerPredictionItem(BaseModel):
     package_hash: Optional[str] = Field(default=None, description="Deterministic package content hash")
     request_hash: Optional[str] = Field(default=None, description="Deterministic API request cache hash")
 
+    # Contextual reranker (contextual_reranker_v1) observability fields.
+    # Every field is optional, so documents written by earlier scorers stay valid.
+    status: Optional[str] = Field(default=None, description="ranked | rejected_editorial | rejected_critic")
+    editorial_class: Optional[str] = Field(default=None, description="REJECT | WEAK | GOOD | STRONG")
+    scroll_stop: Optional[float] = Field(default=None, description="Likelihood a cold viewer stops scrolling [0,1]")
+    reason_to_watch: Optional[str] = Field(default=None, description="Concrete reason a stranger keeps watching")
+    reason_to_skip: Optional[str] = Field(default=None, description="Concrete reason a stranger swipes away")
+    reject_reasons: Optional[List[str]] = Field(default=None, description="Why the candidate was rejected")
+    critic_result: Optional[str] = Field(default=None, description="KEEP | REJECT | NOT_RUN")
+    critic_reason: Optional[str] = Field(default=None, description="Critic justification")
+    comparison_score: Optional[float] = Field(default=None, description="Comparative tournament points")
+    previous_rank: Optional[int] = Field(default=None, description="Rank in the input scorer before reranking")
+    previous_score: Optional[float] = Field(default=None, description="Score in the input scorer before reranking")
+    previous_multimodal_rank: Optional[int] = Field(default=None, description="Rank in multimodal_v1_1")
+    previous_multimodal_score: Optional[float] = Field(default=None, description="Score in multimodal_v1_1")
+    new_rank: Optional[int] = Field(default=None, description="Rank produced by this scorer")
+    final_rank: Optional[int] = Field(default=None, description="Final emitted rank (alias of rank)")
+    rank_delta: Optional[int] = Field(default=None, description="previous_rank - new_rank (positive = moved up)")
+    contextual: Optional[Dict[str, Any]] = Field(default=None, description="Full contextual reranker record for this candidate")
+
 
 class ScorerPredictionDocument(BaseModel):
     """Container for predictions produced by a scorer on a frozen candidate set."""
@@ -137,6 +157,20 @@ class ScorerPredictionDocument(BaseModel):
         default=None,
         description="Statistical distribution diagnostics for assessing ranking spread",
     )
+
+    # Contextual reranker document-level fields (optional, additive).
+    source_fingerprint: Optional[str] = Field(default=None, description="Canonical source fingerprint id")
+    context_version: Optional[str] = Field(default=None, description="Context schema version used")
+    reranker_version: Optional[str] = Field(default=None, description="Reranker component version")
+    schema_version: Optional[str] = Field(default=None, description="Result schema version")
+    ranking_algorithm_version: Optional[str] = Field(default=None, description="Comparative ranking algorithm version")
+    input_scorer: Optional[str] = Field(default=None, description="Upstream scorer whose candidates were reranked")
+    retrieval_candidate_count: Optional[int] = Field(default=None, description="Candidates entering the reranker")
+    survivor_count: Optional[int] = Field(default=None, description="Candidates surviving the reject filter and critic")
+    rejected_count: Optional[int] = Field(default=None, description="Candidates removed by the reject filter or critic")
+    global_context_ref: Optional[str] = Field(default=None, description="Hash of the global context used")
+    reasoning_effort: Optional[str] = Field(default=None, description="Reasoning effort requested from the model")
+    usage: Optional[Dict[str, Any]] = Field(default=None, description="API call and token accounting")
 
 
 class EvaluationMetrics(BaseModel):

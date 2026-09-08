@@ -86,6 +86,55 @@ class Settings(BaseSettings):
         description="Reasoning effort for reasoning models (none|low|medium|high|xhigh|max)",
     )
 
+    # Contextual Highlight Intelligence / Reranker v3 (contextual_reranker_v1)
+    contextual_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FREECHER_CONTEXTUAL_BASE_URL", "FREECHER_LLM_BASE_URL", "OPENAI_BASE_URL", "LLM_BASE_URL"
+        ),
+        description="Base URL for the contextual reranker LLM API",
+    )
+    contextual_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FREECHER_CONTEXTUAL_API_KEY", "FREECHER_LLM_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"
+        ),
+        description="API key for the contextual reranker LLM API",
+    )
+    contextual_model: str = Field(
+        default="gpt-4o-mini",
+        validation_alias=AliasChoices(
+            "FREECHER_CONTEXTUAL_MODEL", "CONTEXTUAL_MODEL", "FREECHER_MULTIMODAL_MODEL", "FREECHER_LLM_MODEL"
+        ),
+        description="Model used for contextual reranking stages",
+    )
+    contextual_reasoning_effort: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FREECHER_CONTEXTUAL_REASONING_EFFORT",
+            "CONTEXTUAL_REASONING_EFFORT",
+            "FREECHER_MULTIMODAL_REASONING_EFFORT",
+        ),
+        description="Reasoning effort for the contextual reranker (none|low|medium|high|xhigh|max)",
+    )
+    contextual_temperature: float = Field(default=0.1, description="Sampling temperature for contextual stages")
+    contextual_input_scorer: str = Field(
+        default="multimodal_v1_1",
+        description="Upstream scorer whose candidate set the contextual reranker reranks",
+    )
+    contextual_comparison_mode: str = Field(
+        default="full",
+        description="Comparative ranking mode: full | swiss | listwise | none",
+    )
+    contextual_before_seconds: float = Field(default=75.0, description="BEFORE context window (understanding only)")
+    contextual_after_seconds: float = Field(default=25.0, description="AFTER context window (understanding only)")
+    contextual_chapter_target_seconds: float = Field(default=240.0, description="Target chapter length in seconds")
+    contextual_chapter_min_seconds: float = Field(default=150.0, description="Shortest allowed chapter in seconds")
+    contextual_chapter_max_seconds: float = Field(default=420.0, description="Longest allowed chapter in seconds")
+    contextual_listwise_batch_size: int = Field(default=7, description="Candidates compared per listwise request")
+    contextual_final_pairwise_top: int = Field(default=4, description="Top group refined with round-robin pairwise")
+    contextual_top: int = Field(default=5, description="Number of top highlights reported after reranking")
+
     # Paths
     output_dir: Path = Field(default=Path("runs"), description="Base directory for run outputs")
 

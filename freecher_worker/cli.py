@@ -63,6 +63,22 @@ from freecher_worker.multimodal import (
     SCORER_VERSION_MULTIMODAL_V1_1,
     generate_shortlist,
 )
+from freecher_worker.contextual import (
+    COMPARISON_MODES,
+    NO_COVERAGE_MESSAGE,
+    SCORER_VERSION_CONTEXTUAL_V1,
+    ContextualReranker,
+    OpenAIContextualProvider,
+    build_blind_diagnostic,
+    inspect_moment,
+    parse_timestamp,
+)
+from freecher_worker.contextual.diagnostics import DEFAULT_BLIND_SEED
+from freecher_worker.evaluation.editorial_metrics import compute_editorial_metrics
+from freecher_worker.evaluation.regression import (
+    check_regression_dataset,
+    load_regression_dataset,
+)
 from freecher_worker.transcription.models import Transcript
 from freecher_worker.utils.json_io import load_json, save_json
 
@@ -1936,6 +1952,534 @@ def _render_shorts_cli(
     console.print(f"\n[bold {colour}]Produced {produced} of {manifest.requested} vertical short(s).[/bold {colour}]")
     console.print(f"Output: [bold]{run_dir / 'shorts'}[/bold]")
     console.print(f"Manifest: [bold]{run_dir / 'shorts' / 'shorts_manifest.json'}[/bold]\n")
+
+
+@app.command("contextual-rerank")
+def contextual_rerank_command(
+    run_dir: str = typer.Argument(
+        ...,
+        help="Path or ID of an existing run directory (e.g. 'runs/20260907_082719_test')",
+    ),
+    input_scorer: Optional[str] = typer.Option(
+        None,
+        "--input-scorer",
+        help="Upstream scorer whose candidate set is reranked (default: multimodal_v1_1)",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Model used for every contextual stage (e.g. gpt-5.6-luna)",
+    ),
+    reasoning_effort: Optional[str] = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="Reasoning effort for reasoning models (none|low|medium|high|xhigh|max)",
+    ),
+    temperature: Optional[float] = typer.Option(
+        None,
+        "--temperature",
+        "-t",
+        help="Sampling temperature (ignored when reasoning_effort != 'none')",
+    ),
+    top: Optional[int] = typer.Option(
+        None,
+        "--top",
+        help="Number of top highlights to display and record (default: FREECHER_CONTEXTUAL_TOP)",
+    ),
+    comparison_mode: Optional[str] = typer.Option(
+        None,
+        "--comparison-mode",
+        help="Comparative ranking mode: full | swiss | listwise | none",
+    ),
+    no_critic: bool = typer.Option(
+        False,
+        "--no-critic",
+        help="Skip the false-positive critic pass",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Ignore every cached contextual stage and re-request from the API",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Custom destination for the scorer artifact (default: <run>/scores/contextual_reranker_v1.json)",
+    ),
+) -> None:
+    """Rerank an existing candidate set with Contextual Highlight Intelligence (contextual_reranker_v1)."""
+    try:
+        resolved_dir = _resolve_run_path(run_dir)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    actual_model = model or settings.contextual_model
+    actual_mode = comparison_mode or settings.contextual_comparison_mode
+    if actual_mode not in COMPARISON_MODES:
+        console.print(
+            f"[bold red]Error:[/bold red] Unknown --comparison-mode '{actual_mode}'. "
+            f"Valid: {', '.join(COMPARISON_MODES)}"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        provider = OpenAIContextualProvider(
+            base_url=settings.contextual_base_url,
+            api_key=settings.contextual_api_key,
+            model=actual_model,
+            reasoning_effort=reasoning_effort or settings.contextual_reasoning_effort,
+            temperature=temperature if temperature is not None else settings.contextual_temperature,
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    reranker = ContextualReranker(
+        provider=provider,
+        input_scorer=input_scorer or settings.contextual_input_scorer,
+        comparison_mode=actual_mode,
+        critic_enabled=not no_critic,
+        force=force,
+        before_seconds=settings.contextual_before_seconds,
+        after_seconds=settings.contextual_after_seconds,
+        chapter_target_seconds=settings.contextual_chapter_target_seconds,
+        chapter_min_seconds=settings.contextual_chapter_min_seconds,
+        chapter_max_seconds=settings.contextual_chapter_max_seconds,
+        listwise_batch_size=settings.contextual_listwise_batch_size,
+        final_pairwise_top=settings.contextual_final_pairwise_top,
+        top=top if top is not None else settings.contextual_top,
+    )
+
+    console.print(
+        f"Executing [bold]{SCORER_VERSION_CONTEXTUAL_V1}[/bold] on {resolved_dir} "
+        f"(model={actual_model}, mode={actual_mode}, critic={'off' if no_critic else 'on'})..."
+    )
+    try:
+        pred_doc, rerank_doc = reranker.rerank_run(resolved_dir, output_file=output)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    target_path = output or (resolved_dir / "scores" / f"{SCORER_VERSION_CONTEXTUAL_V1}.json")
+    console.print(f"[bold green]Contextual predictions saved to:[/bold green] {target_path}")
+    console.print(f"Candidate Set ID: {rerank_doc.candidate_set_id}")
+    console.print(
+        f"Retrieval candidates: {rerank_doc.retrieval_candidate_count} | "
+        f"Survivors: {rerank_doc.survivor_count} | Rejected: {rerank_doc.rejected_count} | "
+        f"Chapters: {rerank_doc.chapter_count}"
+    )
+    for warning in reranker.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+
+    display_top = rerank_doc.top or len(rerank_doc.results)
+    if rerank_doc.results:
+        console.print(f"\n[bold]Top {min(display_top, len(rerank_doc.results))} highlights:[/bold]")
+        table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+        table.add_column("#", width=4, justify="right")
+        table.add_column("Candidate", width=12)
+        table.add_column("Was", width=6, justify="right")
+        table.add_column("Δ", width=6, justify="right")
+        table.add_column("Class", width=8)
+        table.add_column("Pts", width=6, justify="right")
+        table.add_column("Reason to watch")
+        for record in rerank_doc.results[:display_top]:
+            delta = record.rank_delta
+            delta_str = "n/a" if delta is None else (f"+{delta}" if delta > 0 else str(delta))
+            table.add_row(
+                str(record.rank),
+                record.candidate_id,
+                str(record.previous_rank) if record.previous_rank is not None else "-",
+                delta_str,
+                record.editorial_class,
+                f"{record.comparison_score:.1f}",
+                (record.reason_to_watch or "")[:70],
+            )
+        console.print(table)
+
+    if rerank_doc.rejected:
+        console.print(f"\n[bold]Rejected ({len(rerank_doc.rejected)}):[/bold]")
+        rej_table = Table(show_header=True, header_style="bold red", box=box.SIMPLE)
+        rej_table.add_column("Candidate", width=12)
+        rej_table.add_column("Was", width=6, justify="right")
+        rej_table.add_column("Stage", width=18)
+        rej_table.add_column("Reason")
+        for record in rerank_doc.rejected:
+            reason = "; ".join(record.reject_reasons) or (record.critic_reason or "no reason recorded")
+            rej_table.add_row(
+                record.candidate_id,
+                str(record.previous_rank) if record.previous_rank is not None else "-",
+                record.status,
+                reason[:70],
+            )
+        console.print(rej_table)
+
+    usage = rerank_doc.usage
+    console.print("\n[bold]API usage:[/bold]")
+    usage_table = Table(box=box.SIMPLE)
+    usage_table.add_column("Metric", style="cyan")
+    usage_table.add_column("Value", style="bold", justify="right")
+    usage_table.add_row("Total API calls", str(usage.number_of_api_calls))
+    usage_table.add_row("  chapter context", str(usage.chapter_calls))
+    usage_table.add_row("  global context", str(usage.global_context_calls))
+    usage_table.add_row("  candidate analysis", str(usage.candidate_analysis_calls))
+    usage_table.add_row("  critic", str(usage.critic_calls))
+    usage_table.add_row("  listwise", str(usage.listwise_calls))
+    usage_table.add_row("  comparison", str(usage.comparison_calls))
+    usage_table.add_row("Cache hits", str(usage.cache_hits))
+    usage_table.add_row("Failed calls", str(usage.failed_calls))
+    if usage.usage_reported_by_provider:
+        usage_table.add_row("Input tokens", f"{usage.input_tokens:,}")
+        usage_table.add_row("Output tokens", f"{usage.output_tokens:,}")
+        usage_table.add_row("Total tokens", f"{usage.total_tokens:,}")
+    else:
+        usage_table.add_row("Tokens", "not reported by provider")
+    console.print(usage_table)
+
+
+@app.command("inspect-moment")
+def inspect_moment_command(
+    run_dir: str = typer.Argument(
+        ...,
+        help="Path or ID of an existing run directory",
+    ),
+    time: str = typer.Option(
+        ...,
+        "--time",
+        help="Timestamp to inspect (SS, MM:SS, or HH:MM:SS)",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the inspection as raw JSON",
+    ),
+) -> None:
+    """Show what happened to the candidate covering a given timestamp, stage by stage."""
+    try:
+        resolved_dir = _resolve_run_path(run_dir)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    try:
+        seconds = parse_timestamp(time)
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    try:
+        inspection = inspect_moment(resolved_dir, seconds)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        import json as _json
+
+        console.print(_json.dumps(inspection.model_dump(), indent=2, ensure_ascii=False))
+        return
+
+    console.print(f"\n[bold cyan]Moment inspection: {inspection.timestamp_label}[/bold cyan]")
+    if not inspection.covered:
+        console.print(f"[bold red]{NO_COVERAGE_MESSAGE}[/bold red]")
+        console.print(inspection.message)
+        return
+
+    console.print(
+        f"Candidate: [bold]{inspection.candidate_id}[/bold] "
+        f"({_format_timestamp(inspection.candidate_start or 0.0)} - "
+        f"{_format_timestamp(inspection.candidate_end or 0.0)})"
+    )
+    if len(inspection.overlapping_candidate_ids) > 1:
+        console.print(
+            f"Also overlapped by: {', '.join(inspection.overlapping_candidate_ids[1:])}"
+        )
+    shortlist = inspection.in_retrieval_shortlist
+    console.print(
+        "Retrieval shortlist: "
+        + ("[green]yes[/green]" if shortlist else "[red]no[/red]" if shortlist is False else "unknown")
+    )
+
+    table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    table.add_column("Scorer", width=26)
+    table.add_column("Rank", width=8, justify="right")
+    table.add_column("Score", width=10, justify="right")
+    for row in inspection.scorers:
+        if not row.present:
+            table.add_row(row.scorer, "[dim]absent[/dim]", "-")
+        elif row.rank is None:
+            table.add_row(row.scorer, "[yellow]not scored[/yellow]", "-")
+        else:
+            table.add_row(row.scorer, f"#{row.rank}", f"{row.score:.2f}" if row.score is not None else "-")
+    console.print(table)
+
+    if inspection.editorial_class:
+        console.print(f"Editorial class: [bold]{inspection.editorial_class}[/bold]")
+    if inspection.critic_result:
+        console.print(f"Critic: {inspection.critic_result}")
+    if inspection.reason_to_watch:
+        console.print(f"Reason to watch: {inspection.reason_to_watch}")
+    if inspection.reject_reasons:
+        console.print(f"[red]Reject reasons:[/red] {'; '.join(inspection.reject_reasons)}")
+    console.print(f"\n{inspection.message}")
+    if inspection.candidate_text:
+        console.print(Panel(inspection.candidate_text[:1200], title="Candidate transcript", expand=False))
+
+
+@app.command("export-blind-diagnostic")
+def export_blind_diagnostic_command(
+    run_dir: str = typer.Argument(
+        ...,
+        help="Path or ID of an existing run directory",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Destination directory (default: <run>/contextual/blind_diagnostic)",
+    ),
+    seed: int = typer.Option(
+        DEFAULT_BLIND_SEED,
+        "--seed",
+        help="Deterministic shuffle seed; the same seed reproduces the same package",
+    ),
+    group_a: int = typer.Option(
+        4,
+        "--group-a",
+        help="Candidates drawn from the multimodal rank range (retrieval-boundary probe)",
+    ),
+    group_b: int = typer.Option(
+        4,
+        "--group-b",
+        help="Candidates drawn from outside the retrieval shortlist",
+    ),
+    group_c: int = typer.Option(
+        0,
+        "--group-c",
+        help="Top-ranked contextual candidates to include as a control",
+    ),
+    rank_range: str = typer.Option(
+        "16,32",
+        "--rank-range",
+        help="Multimodal rank range for group A, as 'low,high'",
+    ),
+) -> None:
+    """Export a blind, de-identified diagnostic package plus its private mapping."""
+    try:
+        resolved_dir = _resolve_run_path(run_dir)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    try:
+        low_str, high_str = rank_range.split(",")
+        rank_bounds = (int(low_str.strip()), int(high_str.strip()))
+    except Exception:
+        console.print(f"[bold red]Error:[/bold red] Invalid --rank-range '{rank_range}'. Use 'low,high'.")
+        raise typer.Exit(code=1)
+
+    try:
+        document, mapping = build_blind_diagnostic(
+            resolved_dir,
+            group_a_size=group_a,
+            group_b_size=group_b,
+            group_c_size=group_c,
+            group_a_range=rank_bounds,
+            seed=seed,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    target_dir = output_dir or (resolved_dir / "contextual" / "blind_diagnostic")
+    doc_path = target_dir / "blind_diagnostic.json"
+    map_path = target_dir / "_DO_NOT_OPEN_mapping.json"
+    save_json(document, doc_path)
+    save_json(mapping, map_path)
+
+    console.print(f"[bold green]Blind diagnostic package:[/bold green] {doc_path}")
+    console.print(f"[bold yellow]Private mapping (do not open before reviewing):[/bold yellow] {map_path}")
+    console.print(f"Seed: {seed} | Items: {document.total_items}")
+    console.print(f"Group sizes (private): {mapping.group_sizes}")
+    if document.total_items == 0:
+        console.print(
+            "[yellow]No items selected. Check that scores/multimodal_v1_1.json exists and that "
+            "the rank range matches the shortlist size.[/yellow]"
+        )
+
+
+@app.command("evaluate-contextual")
+def evaluate_contextual_command(
+    eval_file: Path = typer.Argument(
+        ...,
+        help="Path to the labeled evaluation JSON",
+        exists=True,
+        file_okay=True,
+        readable=True,
+    ),
+    scores_file: Path = typer.Argument(
+        ...,
+        help="Path to a contextual_reranker_v1 prediction JSON",
+        exists=True,
+        file_okay=True,
+        readable=True,
+    ),
+    k: str = typer.Option(
+        "5,10",
+        "--k",
+        help="Comma-separated K values (e.g. 5,10)",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print raw JSON metrics",
+    ),
+) -> None:
+    """Report ranking metrics plus RejectPrecision and StrongPrecision for a contextual run."""
+    try:
+        k_values = [int(x.strip()) for x in k.split(",") if x.strip()]
+    except Exception:
+        console.print(f"[bold red]Error:[/bold red] Invalid K values: '{k}'")
+        raise typer.Exit(code=1)
+
+    eval_doc = BlindEvaluationDocument.model_validate(load_json(eval_file))
+    pred_doc = ScorerPredictionDocument.model_validate(load_json(scores_file))
+
+    try:
+        metrics = compute_evaluation_metrics(eval_doc, pred_doc, k_values=k_values)
+        editorial = compute_editorial_metrics(eval_doc, pred_doc)
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        import json as _json
+
+        console.print(
+            _json.dumps(
+                {"ranking": metrics.model_dump(), "editorial": editorial.model_dump()},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    console.print(f"\n[bold cyan]=== Contextual Evaluation: {pred_doc.scorer_version} ===[/bold cyan]")
+    console.print(f"Candidate Set ID: [bold]{eval_doc.candidate_set_id}[/bold]")
+    console.print(
+        f"Coverage: [bold]{eval_doc.labeled_candidates}/{eval_doc.total_candidates}[/bold] labeled\n"
+    )
+
+    table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    table.add_column("Metric", style="dim", width=24)
+    for kv in k_values:
+        table.add_column(f"@{kv}", justify="right", width=12)
+
+    def row(label: str, values: dict, fmt: str) -> None:
+        table.add_row(label, *[format(values.get(kv, 0.0), fmt) for kv in k_values])
+
+    row("Precision", metrics.precision_at_k, ".1%")
+    row("PublishableRate", metrics.publishable_rate_at_k, ".1%")
+    row("PerfectRate", metrics.perfect_rate_at_k, ".1%")
+    row("BadRate", metrics.bad_rate_at_k, ".1%")
+    row("MeanHuman", metrics.mean_human_score_at_k, ".2f")
+    row("nDCG", metrics.ndcg_at_k, ".4f")
+    console.print(table)
+
+    console.print("\n[bold]Editorial decision quality:[/bold]")
+    ed_table = Table(box=box.SIMPLE)
+    ed_table.add_column("Metric", style="cyan", width=28)
+    ed_table.add_column("Value", style="bold", justify="right")
+    ed_table.add_row(
+        "RejectPrecision",
+        f"{editorial.reject_precision:.1%} ({editorial.reject_labeled}/{editorial.reject_count} labeled)"
+        if editorial.reject_precision is not None
+        else "N/A",
+    )
+    ed_table.add_row(
+        "StrongPrecision",
+        f"{editorial.strong_precision:.1%} ({editorial.strong_labeled}/{editorial.strong_count} labeled)"
+        if editorial.strong_precision is not None
+        else "N/A",
+    )
+    ed_table.add_row(
+        "CriticRejectPrecision",
+        f"{editorial.critic_reject_precision:.1%}"
+        if editorial.critic_reject_precision is not None
+        else "N/A",
+    )
+    ed_table.add_row("Class distribution", str(editorial.class_distribution))
+    ed_table.add_row("Mean human by class", str(editorial.mean_human_by_class))
+    console.print(ed_table)
+    if editorial.message:
+        console.print(f"[yellow]Note:[/yellow] {editorial.message}")
+
+
+@app.command("regression-check")
+def regression_check_command(
+    dataset_file: Path = typer.Argument(
+        ...,
+        help="Path to a regression dataset JSON",
+        exists=True,
+        file_okay=True,
+        readable=True,
+    ),
+    scores_file: Path = typer.Argument(
+        ...,
+        help="Path to the prediction JSON to check",
+        exists=True,
+        file_okay=True,
+        readable=True,
+    ),
+    k: int = typer.Option(
+        5,
+        "--k",
+        help="Default K for in_top_k / out_of_top_k expectations",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the raw JSON report",
+    ),
+) -> None:
+    """Check known hard cases (strong positives, false positives, false negatives) against a ranking."""
+    dataset = load_regression_dataset(dataset_file)
+    pred_doc = ScorerPredictionDocument.model_validate(load_json(scores_file))
+    report = check_regression_dataset(dataset, pred_doc, default_k=k)
+
+    if json_output:
+        import json as _json
+
+        console.print(_json.dumps(report.model_dump(), indent=2, ensure_ascii=False))
+    else:
+        console.print(f"\n[bold cyan]=== Regression check: {report.scorer_version} ===[/bold cyan]")
+        console.print(
+            f"Cases: {report.total_cases} | "
+            f"[green]passed {report.passed}[/green] | "
+            f"[red]failed {report.failed}[/red] | skipped {report.skipped}"
+        )
+        if report.results:
+            table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+            table.add_column("Candidate", width=12)
+            table.add_column("Group", width=16)
+            table.add_column("Expect", width=13)
+            table.add_column("OK", width=4, justify="center")
+            table.add_column("Detail")
+            for result in report.results:
+                table.add_row(
+                    result.candidate_id,
+                    result.group,
+                    result.expectation,
+                    "[green]✓[/green]" if result.passed else "[red]✗[/red]",
+                    result.message[:60],
+                )
+            console.print(table)
+
+    if report.failed:
+        raise typer.Exit(code=1)
 
 
 @app.command("doctor")

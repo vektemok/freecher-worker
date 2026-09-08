@@ -10,6 +10,7 @@ from .models import (
     DisagreementReport,
 )
 from .metrics import compute_evaluation_metrics, calculate_dcg, RELEVANCE_THRESHOLD
+from .editorial_metrics import EditorialDecisionMetrics, compute_editorial_metrics
 from .disagreements import extract_disagreements
 from .annotator import run_terminal_annotator, preview_clip
 
@@ -21,6 +22,8 @@ __all__ = [
     "EvaluationMetrics",
     "DisagreementItem",
     "DisagreementReport",
+    "EditorialDecisionMetrics",
+    "compute_editorial_metrics",
     "compute_evaluation_metrics",
     "calculate_dcg",
     "RELEVANCE_THRESHOLD",

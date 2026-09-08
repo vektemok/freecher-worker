@@ -496,6 +496,23 @@ freecher-worker/
             heuristic.py
             llm.py
 
+        contextual/
+            __init__.py
+            versions.py
+            models.py
+            prompts.py
+            provider.py
+            cache.py
+            chapters.py
+            context.py
+            candidate_context.py
+            signals.py
+            editorial.py
+            critic.py
+            comparative.py
+            reranker.py
+            diagnostics.py
+
         pipeline/
             __init__.py
             processor.py
@@ -625,6 +642,128 @@ Generates `evaluation.json` with candidate highlights and blank human feedback f
   }
 ]
 ```
+
+## Contextual Highlight Intelligence (`contextual_reranker_v1`)
+
+A bounded reranking layer that runs **after** retrieval and multimodal evidence and
+**before** the final Top-K selection. It does not replace `multimodal_v1_1`; it consumes
+its output as evidence.
+
+```
+existing ASR -> candidates -> heuristic / highlight_v2_1 retrieval -> multimodal_v1_1 evidence
+   -> GLOBAL + CHAPTER CONTEXT
+   -> CONTEXTUAL REJECT FILTER
+   -> FALSE-POSITIVE CRITIC
+   -> COMPARATIVE RERANKER
+   -> Top highlights -> existing Dynamic Subclip Refinement -> existing renderer
+```
+
+### Why it exists
+
+Candidates were being judged in isolation, so ordinary conversation that *sounded*
+energetic outranked moments with a real payoff. This layer gives the model the whole
+video's context, then forces an editorial decision rather than a score.
+
+### Stages
+
+1. **Chapters** — the transcript is split on real speech gaps (and cached scene changes
+   when a multimodal activity profile exists) into ~3–5 minute chapters. One summary
+   request per chapter; the 60-minute transcript is never sent in one request.
+2. **Global context** — one request derives the whole-video understanding
+   (`video_summary`, `content_type`, participants, goals, running jokes, conflicts) from
+   the chapter summaries alone.
+3. **Candidate context package** — per candidate: global context, its chapter context,
+   a 75 s BEFORE window, the candidate, a 25 s AFTER window, multimodal evidence, and
+   cheap activity-derived reaction signals. **BEFORE/AFTER are for understanding only and
+   are never added to the clip.**
+4. **Editorial classification** — the model returns `REJECT | WEAK | GOOD | STRONG` plus a
+   concrete `reason_to_watch`. A candidate whose reason is missing or merely describes
+   continuation ("the participants continue discussing the sauna") is demoted to REJECT.
+5. **False-positive critic** — a separate strict pass over survivors that only looks for
+   reasons to cut. It never sees human ratings, model scores, or upstream ranks.
+6. **Comparative reranking** — survivors are ordered by comparing them against each other,
+   not by summing numbers: listwise batches, then a Swiss tournament, then round-robin
+   across the top group. For 16 survivors that is ~39 comparisons instead of the 120 a
+   full pairwise matrix needs.
+
+The numeric dimensions (`scroll_stop`, `hook`, `payoff`, ...) are recorded for
+observability. They are **not** a ranking formula.
+
+### Commands
+
+```bash
+# Rerank an existing run (requires scores/multimodal_v1_1.json)
+python -m freecher_worker contextual-rerank runs/benchmark_02 \
+  --input-scorer multimodal_v1_1 \
+  --model gpt-5.6-luna
+```
+
+Options: `--top`, `--model`, `--reasoning-effort`, `--temperature`, `--force`,
+`--no-critic`, `--comparison-mode` (`full | swiss | listwise | none`), `--input-scorer`,
+`--output`.
+
+```bash
+# Where did the moment a human liked actually go?
+python -m freecher_worker inspect-moment runs/benchmark_02 --time 00:18:34
+
+# Blind diagnostic package: candidate generation vs retrieval vs reranking
+python -m freecher_worker export-blind-diagnostic runs/benchmark_02 \
+  --group-a 4 --group-b 4 --seed 1337
+
+# Ranking metrics plus RejectPrecision / StrongPrecision
+python -m freecher_worker evaluate-contextual \
+  runs/benchmark_02/evaluation.json \
+  runs/benchmark_02/scores/contextual_reranker_v1.json
+
+# Known hard cases (strong positives, false positives, false negatives)
+python -m freecher_worker regression-check regression_dataset.json \
+  runs/benchmark_02/scores/contextual_reranker_v1.json
+```
+
+`inspect-moment` prints `NO CANDIDATE COVERAGE` when no candidate window contains the
+timestamp — that is a candidate-generation gap, not a ranking problem.
+
+`export-blind-diagnostic` writes `blind_diagnostic.json` (no candidate ids, no ranks, no
+scores) next to `_DO_NOT_OPEN_mapping.json`. Both are reproducible from `--seed`.
+
+### Artifacts
+
+| Path | Contents |
+| --- | --- |
+| `scores/contextual_reranker_v1.json` | Scorer artifact; survivors ranked first, then rejected candidates with reasons |
+| `contextual/contextual_reranker_v1_run.json` | Full record: comparisons, listwise batches, usage |
+| `contextual/global_context_v1.json` | Whole-video understanding |
+| `contextual/chapter_context_v1.json` | Chapter summaries, setups, payoffs, open loops |
+| `contextual/candidate_context_v1.json` | Per-candidate context packages |
+| `contextual/cache/<stage>/<hash>.json` | Per-stage response cache |
+
+### Caching and cost
+
+Each stage caches separately, so a rerank never recomputes global or chapter context.
+Cache keys carry `model`, `reasoning_effort`, `temperature`, `prompt_version`,
+`prompt_hash`, `schema_version`, `context_version`, and `reranker_version`; changing any
+one invalidates exactly that stage. `--force` bypasses the cache.
+
+Every run reports `number_of_api_calls`, per-stage call counts, cache hits, and input /
+output tokens when the provider returns a usage block.
+
+### Human labels
+
+Human ratings are **never** used during inference — not in a prompt, not in a cache key,
+not in the reject filter. They are only read afterwards by `evaluate-contextual` and
+`regression-check`.
+
+### Configuration
+
+`FREECHER_CONTEXTUAL_MODEL`, `FREECHER_CONTEXTUAL_BASE_URL`, `FREECHER_CONTEXTUAL_API_KEY`,
+`FREECHER_CONTEXTUAL_REASONING_EFFORT`, `FREECHER_CONTEXTUAL_TEMPERATURE`,
+`FREECHER_CONTEXTUAL_INPUT_SCORER`, `FREECHER_CONTEXTUAL_COMPARISON_MODE`,
+`FREECHER_CONTEXTUAL_BEFORE_SECONDS`, `FREECHER_CONTEXTUAL_AFTER_SECONDS`,
+`FREECHER_CONTEXTUAL_CHAPTER_TARGET_SECONDS`, `FREECHER_CONTEXTUAL_LISTWISE_BATCH_SIZE`,
+`FREECHER_CONTEXTUAL_FINAL_PAIRWISE_TOP`, `FREECHER_CONTEXTUAL_TOP`.
+They fall back to the existing `FREECHER_LLM_*` / `FREECHER_MULTIMODAL_*` variables.
+
+---
 
 ### CLI Parameters for `process`
 
