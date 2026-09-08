@@ -119,6 +119,16 @@ Run system diagnostics to check Python, FFmpeg, ffprobe, CUDA, and faster-whispe
 python -m freecher_worker doctor
 ```
 
+### 4. Updating an existing environment
+
+When pulling updates or running workers on an existing setup (Linux / WSL2):
+
+```bash
+cd ~/freecher-worker
+git pull origin master
+source .venv/bin/activate
+```
+
 ---
 
 ## CLI Usage
