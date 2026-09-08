@@ -146,6 +146,29 @@ def compute_evaluation_metrics(
             f"Recall requires 100% labeled candidate pool (currently {labeled_candidates}/{total_candidates} labeled)"
         )
 
+    # Shortlist retrieval quality metrics (User Refinement #6)
+    scored_candidates = len(prediction_doc.predictions)
+    candidate_coverage_ratio = round(scored_candidates / total_candidates, 4) if total_candidates > 0 else 0.0
+    shortlist_size = scored_candidates if scored_candidates < total_candidates else None
+
+    pred_cids = {p.candidate_id for p in prediction_doc.predictions}
+    pool_perfect_count = sum(1 for item in eval_doc.items if item.human_score is not None and item.human_score >= 4.0)
+    pool_pub_count = sum(1 for item in eval_doc.items if item.publishable is True)
+
+    shortlist_perfect_count = sum(
+        1 for item in eval_doc.items if item.candidate_id in pred_cids and item.human_score is not None and item.human_score >= 4.0
+    )
+    shortlist_pub_count = sum(
+        1 for item in eval_doc.items if item.candidate_id in pred_cids and item.publishable is True
+    )
+
+    perfect_recall_in_shortlist = (
+        round(shortlist_perfect_count / pool_perfect_count, 4) if pool_perfect_count > 0 else 1.0
+    )
+    publishable_recall_in_shortlist = (
+        round(shortlist_pub_count / pool_pub_count, 4) if pool_pub_count > 0 else 1.0
+    )
+
     return EvaluationMetrics(
         candidate_set_id=eval_doc.candidate_set_id,
         scorer=prediction_doc.scorer,
@@ -162,4 +185,9 @@ def compute_evaluation_metrics(
         publishable_rate_at_k=publishable_rate_at_k,
         recall_at_k=recall_at_k,
         recall_message=recall_message,
+        scored_candidates=scored_candidates,
+        candidate_coverage_ratio=candidate_coverage_ratio,
+        shortlist_size=shortlist_size,
+        perfect_candidate_recall_in_shortlist=perfect_recall_in_shortlist,
+        publishable_candidate_recall_in_shortlist=publishable_recall_in_shortlist,
     )

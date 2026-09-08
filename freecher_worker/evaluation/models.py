@@ -144,6 +144,26 @@ class EvaluationMetrics(BaseModel):
         default=None,
         description="Explanation if Recall@K could not be computed",
     )
+    scored_candidates: Optional[int] = Field(
+        default=None,
+        description="Number of candidates scored in prediction document",
+    )
+    candidate_coverage_ratio: Optional[float] = Field(
+        default=None,
+        description="Ratio of scored candidates to total candidate pool (scored / total)",
+    )
+    shortlist_size: Optional[int] = Field(
+        default=None,
+        description="Shortlist size if evaluating a reranker or subset",
+    )
+    perfect_candidate_recall_in_shortlist: Optional[float] = Field(
+        default=None,
+        description="Fraction of pool perfect candidates (human_score >= 4.0) captured in the scored shortlist",
+    )
+    publishable_candidate_recall_in_shortlist: Optional[float] = Field(
+        default=None,
+        description="Fraction of pool publishable candidates captured in the scored shortlist",
+    )
 
 
 class DisagreementItem(BaseModel):

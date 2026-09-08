@@ -56,6 +56,27 @@ class Settings(BaseSettings):
         description="Model name for LLM scoring",
     )
 
+    # Multimodal Highlight Reranker Settings
+    multimodal_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_MULTIMODAL_BASE_URL", "FREECHER_LLM_BASE_URL", "OPENAI_BASE_URL", "LLM_BASE_URL"),
+        description="Base URL for Multimodal LLM API",
+    )
+    multimodal_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_MULTIMODAL_API_KEY", "FREECHER_LLM_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"),
+        description="API key for Multimodal LLM API",
+    )
+    multimodal_model: str = Field(
+        default="gpt-4o-mini",
+        validation_alias=AliasChoices("FREECHER_MULTIMODAL_MODEL", "MULTIMODAL_MODEL", "FREECHER_LLM_MODEL", "OPENAI_MODEL"),
+        description="Vision-capable model name for multimodal reranking",
+    )
+    multimodal_heuristic_top_k: int = Field(default=12, description="Candidates taken from heuristic_v1 for shortlist")
+    multimodal_llm_top_k: int = Field(default=12, description="Candidates taken from highlight_v2_1 for shortlist")
+    multimodal_max_candidates: int = Field(default=20, description="Maximum capacity for multimodal candidate shortlist")
+    multimodal_max_long_edge: int = Field(default=640, description="Max long edge dimension in pixels for extracted frames")
+
     # Paths
     output_dir: Path = Field(default=Path("runs"), description="Base directory for run outputs")
 

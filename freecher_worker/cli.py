@@ -43,6 +43,11 @@ from freecher_worker.rendering import (
     render_highlights_for_run,
     render_single_short,
 )
+from freecher_worker.multimodal import (
+    MultimodalReranker,
+    OpenAIMultimodalProvider,
+    generate_shortlist,
+)
 from freecher_worker.transcription.models import Transcript
 from freecher_worker.utils.json_io import load_json, save_json
 
@@ -661,7 +666,42 @@ def score_run_command(
 
     # Instantiate scorer
     requested_scorer = scorer.lower()
-    if requested_scorer in ("llm", "highlight_v2_1"):
+    if requested_scorer in ("multimodal", "multimodal_v1"):
+        settings = get_settings()
+        actual_model = model or settings.multimodal_model or "gpt-4o-mini"
+        provider = OpenAIMultimodalProvider(
+            base_url=settings.multimodal_base_url,
+            api_key=settings.multimodal_api_key,
+            model=actual_model,
+        )
+        reranker = MultimodalReranker(
+            provider=provider,
+            heuristic_top_k=settings.multimodal_heuristic_top_k,
+            llm_top_k=settings.multimodal_llm_top_k,
+            max_candidates=settings.multimodal_max_candidates,
+            allow_missing_llm=allow_fallback,
+        )
+        console.print(f"Executing [bold]multimodal_v1[/bold] reranker on {resolved_dir}...")
+        pred_doc = reranker.rerank_run(resolved_dir, output_file=output)
+        target_path = output or (resolved_dir / "scores" / "multimodal_v1.json")
+        console.print(f"[bold green]Multimodal predictions saved to:[/bold green] {target_path}")
+        console.print(f"Candidate Set ID: {pred_doc.candidate_set_id}")
+        if pred_doc.predictions:
+            console.print(f"Top candidate: #{pred_doc.predictions[0].candidate_id} (Score: {pred_doc.predictions[0].score:.2f})")
+        if pred_doc.distribution_diagnostics and pred_doc.predictions:
+            dist_diag = pred_doc.distribution_diagnostics
+            console.print("\n[bold]Score Distribution Diagnostics:[/bold]")
+            dist_table = Table(box=box.SIMPLE)
+            dist_table.add_column("Metric", style="cyan")
+            dist_table.add_column("Value", style="bold")
+            dist_table.add_row("Min", f"{dist_diag.min:.2f}")
+            dist_table.add_row("Median", f"{dist_diag.median:.2f}")
+            dist_table.add_row("Max", f"{dist_diag.max:.2f}")
+            dist_table.add_row("Unique Scores", f"{dist_diag.unique_score_count_raw} / {dist_diag.unique_score_count_rounded}")
+            dist_table.add_row("Std Dev", f"{dist_diag.standard_deviation:.2f}")
+            console.print(dist_table)
+        return
+    elif requested_scorer in ("llm", "highlight_v2_1"):
         actual_scorer = "highlight_v2_1"
         scorer_ver = "highlight_v2_1"
         settings = get_settings()
@@ -805,6 +845,114 @@ def score_run_command(
             console.print(f"[bold red]WARNING:[/bold red] {dist_diag.warning}\n")
 
 
+@app.command("multimodal-score")
+def multimodal_score_command(
+    run_dir: Path = typer.Argument(
+        ...,
+        help="Path to run directory containing candidates.json",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Custom output path for predictions JSON (default: scores/multimodal_v1.json)",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Vision-capable model name (e.g. gpt-4o-mini, gpt-4o)",
+    ),
+    heuristic_top_k: int = typer.Option(
+        12,
+        "--heuristic-top-k",
+        help="Number of candidates taken from heuristic_v1 for shortlist",
+    ),
+    llm_top_k: int = typer.Option(
+        12,
+        "--llm-top-k",
+        help="Number of candidates taken from highlight_v2_1 for shortlist",
+    ),
+    max_candidates: int = typer.Option(
+        20,
+        "--max-candidates",
+        help="Maximum capacity of candidate shortlist",
+    ),
+    allow_missing_llm: bool = typer.Option(
+        False,
+        "--allow-missing-llm",
+        help="Allow heuristic-only retrieval if scores/highlight_v2_1.json is missing (disabled for benchmark)",
+    ),
+    force_rescore: bool = typer.Option(
+        False,
+        "--force-rescore",
+        help="Force re-scoring via API even if cached response exists",
+    ),
+    force_repackage: bool = typer.Option(
+        False,
+        "--force-repackage",
+        help="Force re-extracting frames and audio features even if cached package exists",
+    ),
+) -> None:
+    """Run Multimodal Highlight Reranker v1 on a deterministic candidate shortlist."""
+    resolved_dir = run_dir.resolve()
+    settings = get_settings()
+    actual_model = model or settings.multimodal_model or "gpt-4o-mini"
+
+    provider = OpenAIMultimodalProvider(
+        base_url=settings.multimodal_base_url,
+        api_key=settings.multimodal_api_key,
+        model=actual_model,
+    )
+
+    reranker = MultimodalReranker(
+        provider=provider,
+        heuristic_top_k=heuristic_top_k,
+        llm_top_k=llm_top_k,
+        max_candidates=max_candidates,
+        allow_missing_llm=allow_missing_llm,
+        force_rescore=force_rescore,
+        force_repackage=force_repackage,
+    )
+
+    console.print(f"Executing [bold]multimodal_v1[/bold] reranker on {resolved_dir}...")
+    pred_doc = reranker.rerank_run(resolved_dir, output_file=output)
+
+    target_path = output or (resolved_dir / "scores" / "multimodal_v1.json")
+    console.print(f"[bold green]Multimodal predictions saved to:[/bold green] {target_path}")
+    console.print(f"Candidate Set ID: {pred_doc.candidate_set_id}")
+    console.print(f"Shortlist candidates evaluated: {len(pred_doc.predictions)}")
+    if pred_doc.predictions:
+        console.print(f"Top candidate: #{pred_doc.predictions[0].candidate_id} (Score: {pred_doc.predictions[0].score:.2f})")
+
+    if pred_doc.distribution_diagnostics and pred_doc.predictions:
+        dist_diag = pred_doc.distribution_diagnostics
+        console.print("\n[bold]Score Distribution Diagnostics:[/bold]")
+        dist_table = Table(box=box.SIMPLE)
+        dist_table.add_column("Metric", style="cyan")
+        dist_table.add_column("Value", style="bold")
+        dist_table.add_row("Min", f"{dist_diag.min:.2f}")
+        dist_table.add_row("P10", f"{dist_diag.p10:.2f}")
+        dist_table.add_row("P25", f"{dist_diag.p25:.2f}")
+        dist_table.add_row("Median", f"{dist_diag.median:.2f}")
+        dist_table.add_row("P75", f"{dist_diag.p75:.2f}")
+        dist_table.add_row("P90", f"{dist_diag.p90:.2f}")
+        dist_table.add_row("Max", f"{dist_diag.max:.2f}")
+        dist_table.add_row(
+            "Unique Scores (raw / rounded)",
+            f"{dist_diag.unique_score_count_raw} / {dist_diag.unique_score_count_rounded}",
+        )
+        dist_table.add_row(
+            "Zero Score Count",
+            f"{dist_diag.zero_score_count} ({dist_diag.zero_score_count / len(pred_doc.predictions):.1%})",
+        )
+        dist_table.add_row("Std Dev", f"{dist_diag.standard_deviation:.2f}")
+        console.print(dist_table)
+
+
 @app.command("evaluate")
 def evaluate_command(
     eval_file: Path = typer.Argument(
@@ -872,7 +1020,18 @@ def evaluate_command(
     # Render formatted evaluation table
     console.print(f"\n[bold cyan]=== Evaluation Report: {metrics.scorer} (v{metrics.scorer_version}) ===[/bold cyan]")
     console.print(f"Candidate Set ID: [bold]{metrics.candidate_set_id}[/bold]")
-    console.print(f"Coverage:         [bold]{metrics.labeled_candidates}/{metrics.total_candidates}[/bold] candidates labeled\n")
+    console.print(f"Coverage:         [bold]{metrics.labeled_candidates}/{metrics.total_candidates}[/bold] candidates labeled")
+    if metrics.scored_candidates is not None and metrics.candidate_coverage_ratio is not None:
+        console.print(
+            f"Scored Pool:      [bold]{metrics.scored_candidates}/{metrics.total_candidates}[/bold] "
+            f"({metrics.candidate_coverage_ratio:.1%} coverage)"
+        )
+        if metrics.perfect_candidate_recall_in_shortlist is not None and metrics.candidate_coverage_ratio < 1.0:
+            console.print(
+                f"Shortlist Recall: Perfect={metrics.perfect_candidate_recall_in_shortlist:.1%}, "
+                f"Publishable={metrics.publishable_candidate_recall_in_shortlist:.1%}"
+            )
+    console.print()
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim", width=22)
@@ -1022,6 +1181,29 @@ def compare_scorers_command(
             else:
                 rec_row.append("N/A")
         table.add_row(f"Recall @ {kv}", *rec_row)
+
+    # Scored coverage and shortlist retrieval quality rows (User Refinement #6)
+    cov_row = [
+        f"{m.scored_candidates or m.total_candidates}/{m.total_candidates} ({m.candidate_coverage_ratio or 1.0:.0%})"
+        for m in all_metrics
+    ]
+    table.add_row("Scored Coverage", *cov_row)
+
+    perf_rec_row = [
+        f"{m.perfect_candidate_recall_in_shortlist:.1%}"
+        if m.perfect_candidate_recall_in_shortlist is not None
+        else "100.0%"
+        for m in all_metrics
+    ]
+    table.add_row("Shortlist Perfect Rec", *perf_rec_row)
+
+    pub_rec_row = [
+        f"{m.publishable_candidate_recall_in_shortlist:.1%}"
+        if m.publishable_candidate_recall_in_shortlist is not None
+        else "100.0%"
+        for m in all_metrics
+    ]
+    table.add_row("Shortlist Publish Rec", *pub_rec_row)
 
     console.print(table)
     console.print()
