@@ -85,6 +85,11 @@ class HighlightScore(BaseModel):
     context_dependency_score: Optional[float] = Field(default=None, ge=0, le=100)
     llm_quality_score: Optional[float] = Field(default=None, ge=0, le=100)
     final_score: Optional[float] = Field(default=None, ge=0, le=100)
+    positive_score: Optional[float] = Field(default=None, ge=0, le=100)
+    total_penalty: Optional[float] = Field(default=None)
+    applied_caps: Optional[list[str]] = None
+    raw_positive_dimensions: Optional[dict[str, float]] = None
+    raw_negative_dimensions: Optional[dict[str, float]] = None
     subscores: Optional[dict[str, float]] = None
     flags: Optional[dict[str, bool]] = None
     scorer_version: Optional[str] = None

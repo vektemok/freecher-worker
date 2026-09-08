@@ -56,6 +56,24 @@ class BlindEvaluationDocument(BaseModel):
         return len(self.items) > 0 and all(item.human_score is not None for item in self.items)
 
 
+class ScoreDistributionDiagnostics(BaseModel):
+    """Statistical distribution diagnostics of scorer predictions for detecting ranking collapse."""
+
+    min: float = Field(description="Minimum predicted score")
+    p10: float = Field(description="10th percentile score")
+    p25: float = Field(description="25th percentile score")
+    median: float = Field(description="50th percentile (median) score")
+    p75: float = Field(description="75th percentile score")
+    p90: float = Field(description="90th percentile score")
+    max: float = Field(description="Maximum predicted score")
+    unique_score_count_raw: int = Field(description="Number of unique unrounded scores")
+    unique_score_count_rounded: int = Field(description="Number of unique rounded scores (2 decimal places)")
+    unique_score_count: int = Field(description="Number of unique scores (alias for unique_score_count_rounded)")
+    zero_score_count: int = Field(description="Count of predictions with final score == 0.0")
+    standard_deviation: float = Field(description="Standard deviation of predicted scores")
+    warning: Optional[str] = Field(default=None, description="Warning message if score collapse or low variance detected")
+
+
 class ScorerPredictionItem(BaseModel):
     """Prediction for a single candidate highlight from an automated scorer."""
 
@@ -72,6 +90,11 @@ class ScorerPredictionItem(BaseModel):
     fallback_reason: Optional[str] = Field(default=None, description="Reason for fallback if any")
     llm_quality_score: Optional[float] = Field(default=None, description="Raw LLM quality assessment 0-100")
     final_score: Optional[float] = Field(default=None, description="Deterministic formula score 0-100")
+    positive_score: Optional[float] = Field(default=None, description="Base positive dimensions score")
+    total_penalty: Optional[float] = Field(default=None, description="Total additive penalty applied")
+    applied_caps: Optional[List[str]] = Field(default=None, description="List of hard caps triggered/applied, formatted as cap_name:value")
+    raw_positive_dimensions: Optional[Dict[str, float]] = Field(default=None, description="Raw positive dimension scores 0-100")
+    raw_negative_dimensions: Optional[Dict[str, float]] = Field(default=None, description="Raw negative dimension scores 0-100")
     flags: Optional[Dict[str, bool]] = Field(default=None, description="Categorical flags (setup_only, transitional, outside_payoff)")
 
 
@@ -79,7 +102,7 @@ class ScorerPredictionDocument(BaseModel):
     """Container for predictions produced by a scorer on a frozen candidate set."""
 
     candidate_set_id: str = Field(description="Candidate set identifier matching CandidateDocument")
-    scorer: str = Field(description="Scorer type name (e.g. heuristic, llm, highlight_v2)")
+    scorer: str = Field(description="Scorer type name (e.g. heuristic, llm, highlight_v2, highlight_v2_1)")
     scorer_version: str = Field(description="Version string of the scorer")
     model: Optional[str] = Field(default=None, description="Underlying model name if applicable")
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat(), description="Timestamp")
@@ -91,6 +114,10 @@ class ScorerPredictionDocument(BaseModel):
     score_formula_version: Optional[str] = Field(default=None, description="Version of score formula")
     context_window_seconds: Optional[float] = Field(default=None, description="Seconds of transcript context provided")
     temperature: Optional[float] = Field(default=None, description="Sampling temperature")
+    distribution_diagnostics: Optional[ScoreDistributionDiagnostics] = Field(
+        default=None,
+        description="Statistical distribution diagnostics for assessing ranking spread",
+    )
 
 
 class EvaluationMetrics(BaseModel):

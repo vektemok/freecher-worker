@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import typer
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -33,7 +34,7 @@ from freecher_worker.evaluation.metrics import compute_evaluation_metrics
 from freecher_worker.evaluation.annotator import run_terminal_annotator, preview_clip
 from freecher_worker.evaluation.disagreements import extract_disagreements
 from freecher_worker.scoring.heuristic import HeuristicScorer
-from freecher_worker.scoring.llm import OpenAILLMScorer
+from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
 from freecher_worker.media.clipper import is_nvenc_available
 from freecher_worker.pipeline.processor import Manifest, run_pipeline
 from freecher_worker.rendering import (
@@ -658,25 +659,11 @@ def score_run_command(
         console.print("[yellow]No candidates found in candidates.json.[/yellow]")
         raise typer.Exit(code=0)
 
-    # Check for candidate set mismatch warning against evaluation files if present
-    for eval_cand_name in ("evaluation_blind.json", "evaluation.json"):
-        eval_cand_file = resolved_dir / eval_cand_name
-        if eval_cand_file.is_file():
-            try:
-                ed = load_json(eval_cand_file)
-                if isinstance(ed, dict) and "candidate_set_id" in ed:
-                    if ed["candidate_set_id"] != candidate_set_id:
-                        console.print(
-                            f"[bold yellow]Warning:[/bold yellow] Candidate set ID mismatch between "
-                            f"candidates.json ('{candidate_set_id}') and {eval_cand_name} ('{ed['candidate_set_id']}')."
-                        )
-            except Exception:
-                pass
-
     # Instantiate scorer
     requested_scorer = scorer.lower()
-    if requested_scorer in ("llm", "highlight_v2"):
-        actual_scorer = "highlight_v2"
+    if requested_scorer in ("llm", "highlight_v2_1"):
+        actual_scorer = "highlight_v2_1"
+        scorer_ver = "highlight_v2_1"
         settings = get_settings()
         actual_model = model or settings.llm_model or "gpt-4o-mini"
         active_scorer = OpenAILLMScorer(
@@ -684,14 +671,26 @@ def score_run_command(
             api_key=settings.llm_api_key,
             model=actual_model,
             allow_fallback=allow_fallback,
+            scorer_version="highlight_v2_1",
+        )
+    elif requested_scorer == "highlight_v2":
+        actual_scorer = "highlight_v2"
+        scorer_ver = "highlight_v2"
+        settings = get_settings()
+        actual_model = model or settings.llm_model or "gpt-4o-mini"
+        active_scorer = OpenAILLMScorer(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=actual_model,
+            allow_fallback=allow_fallback,
+            scorer_version="highlight_v2",
         )
     else:
         requested_scorer = "heuristic"
         actual_scorer = "heuristic"
+        scorer_ver = "heuristic_v1"
         actual_model = None
         active_scorer = HeuristicScorer()
-
-    scorer_ver = getattr(active_scorer, "version", "heuristic_v1")
 
     # Load transcript if present for context extraction
     transcript_file = resolved_dir / "transcript.json"
@@ -726,16 +725,26 @@ def score_run_command(
             },
             scorer=actual_scorer,
             scorer_version=scorer_ver,
-            requested_model=model if requested_scorer in ("llm", "highlight_v2") else None,
+            requested_model=model if requested_scorer in ("llm", "highlight_v2", "highlight_v2_1") else None,
             actual_model=getattr(sc_item, "actual_model", actual_model),
             fallback_used=getattr(sc_item, "fallback_used", False),
             fallback_reason=getattr(sc_item, "fallback_reason", None),
             llm_quality_score=getattr(sc_item, "llm_quality_score", None),
             final_score=getattr(sc_item, "final_score", sc_item.score),
+            positive_score=getattr(sc_item, "positive_score", None),
+            total_penalty=getattr(sc_item, "total_penalty", None),
+            applied_caps=getattr(sc_item, "applied_caps", None),
+            raw_positive_dimensions=getattr(sc_item, "raw_positive_dimensions", None),
+            raw_negative_dimensions=getattr(sc_item, "raw_negative_dimensions", None),
             flags=getattr(sc_item, "flags", None),
         )
         for r_idx, (c, sc_item) in enumerate(cand_score_pairs, start=1)
     ]
+
+    # Compute score distribution diagnostics
+    scores_list = [p.score for p in pred_items]
+    unrounded_list = [getattr(p, "final_score", p.score) for p in pred_items]
+    dist_diag = compute_score_distribution(scores_list, unrounded_list) if scores_list else None
 
     pred_doc = ScorerPredictionDocument(
         candidate_set_id=candidate_set_id,
@@ -750,12 +759,13 @@ def score_run_command(
         score_formula_version=getattr(active_scorer, "score_formula_version", None),
         context_window_seconds=getattr(active_scorer, "context_window_seconds", None),
         temperature=getattr(active_scorer, "temperature", None),
+        distribution_diagnostics=dist_diag,
     )
 
     scores_dir = resolved_dir / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
-    if scorer_ver == "highlight_v2":
-        file_base = "highlight_v2"
+    if scorer_ver in ("highlight_v2_1", "highlight_v2"):
+        file_base = scorer_ver
     elif scorer_ver.startswith(f"{actual_scorer}_"):
         file_base = scorer_ver
     else:
@@ -767,6 +777,32 @@ def score_run_command(
     console.print(f"Candidate Set ID: {candidate_set_id}")
     if pred_items:
         console.print(f"Top candidate: #{pred_items[0].candidate_id} (Score: {pred_items[0].score:.1f})")
+
+    # Display distribution summary table
+    if dist_diag and pred_items:
+        console.print("\n[bold]Score Distribution Diagnostics:[/bold]")
+        dist_table = Table(box=box.SIMPLE)
+        dist_table.add_column("Metric", style="cyan")
+        dist_table.add_column("Value", style="bold")
+        dist_table.add_row("Min", f"{dist_diag.min:.2f}")
+        dist_table.add_row("P10", f"{dist_diag.p10:.2f}")
+        dist_table.add_row("P25", f"{dist_diag.p25:.2f}")
+        dist_table.add_row("Median", f"{dist_diag.median:.2f}")
+        dist_table.add_row("P75", f"{dist_diag.p75:.2f}")
+        dist_table.add_row("P90", f"{dist_diag.p90:.2f}")
+        dist_table.add_row("Max", f"{dist_diag.max:.2f}")
+        dist_table.add_row(
+            "Unique Scores (raw / rounded)",
+            f"{dist_diag.unique_score_count_raw} / {dist_diag.unique_score_count_rounded}",
+        )
+        dist_table.add_row(
+            "Zero Score Count",
+            f"{dist_diag.zero_score_count} ({dist_diag.zero_score_count / len(pred_items):.1%})",
+        )
+        dist_table.add_row("Std Dev", f"{dist_diag.standard_deviation:.2f}")
+        console.print(dist_table)
+        if dist_diag.warning:
+            console.print(f"[bold red]WARNING:[/bold red] {dist_diag.warning}\n")
 
 
 @app.command("evaluate")
