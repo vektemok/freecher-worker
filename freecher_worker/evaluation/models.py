@@ -64,17 +64,33 @@ class ScorerPredictionItem(BaseModel):
     score: float = Field(ge=0.0, le=100.0, description="Overall score normalized to 0-100")
     reason: Optional[str] = Field(default=None, description="Explanation for score")
     subscores: Optional[Dict[str, float]] = Field(default=None, description="Breakdown of subscores")
+    scorer: Optional[str] = Field(default=None, description="Scorer identifier for this item")
+    scorer_version: Optional[str] = Field(default=None, description="Scorer version for this item")
+    requested_model: Optional[str] = Field(default=None, description="Model requested")
+    actual_model: Optional[str] = Field(default=None, description="Model actually used")
+    fallback_used: bool = Field(default=False, description="Whether fallback scoring was used")
+    fallback_reason: Optional[str] = Field(default=None, description="Reason for fallback if any")
+    llm_quality_score: Optional[float] = Field(default=None, description="Raw LLM quality assessment 0-100")
+    final_score: Optional[float] = Field(default=None, description="Deterministic formula score 0-100")
+    flags: Optional[Dict[str, bool]] = Field(default=None, description="Categorical flags (setup_only, transitional, outside_payoff)")
 
 
 class ScorerPredictionDocument(BaseModel):
     """Container for predictions produced by a scorer on a frozen candidate set."""
 
     candidate_set_id: str = Field(description="Candidate set identifier matching CandidateDocument")
-    scorer: str = Field(description="Scorer type name (e.g. heuristic, llm)")
+    scorer: str = Field(description="Scorer type name (e.g. heuristic, llm, highlight_v2)")
     scorer_version: str = Field(description="Version string of the scorer")
     model: Optional[str] = Field(default=None, description="Underlying model name if applicable")
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat(), description="Timestamp")
     predictions: list[ScorerPredictionItem] = Field(default_factory=list, description="Ranked predictions")
+    requested_scorer: Optional[str] = Field(default=None, description="Scorer requested in CLI/API")
+    actual_scorer: Optional[str] = Field(default=None, description="Actual scorer implementation executed")
+    prompt_version: Optional[str] = Field(default=None, description="Version of LLM prompt template")
+    prompt_hash: Optional[str] = Field(default=None, description="SHA-256 hash of prompt")
+    score_formula_version: Optional[str] = Field(default=None, description="Version of score formula")
+    context_window_seconds: Optional[float] = Field(default=None, description="Seconds of transcript context provided")
+    temperature: Optional[float] = Field(default=None, description="Sampling temperature")
 
 
 class EvaluationMetrics(BaseModel):
@@ -89,6 +105,8 @@ class EvaluationMetrics(BaseModel):
     precision_at_k: Dict[int, float] = Field(default_factory=dict, description="Precision@K for human_score >= 3")
     ndcg_at_k: Dict[int, float] = Field(default_factory=dict, description="nDCG@K using 2^rel - 1 gain")
     mean_human_score_at_k: Dict[int, float] = Field(default_factory=dict, description="Mean human score in top K")
+    perfect_rate_at_k: Dict[int, float] = Field(default_factory=dict, description="PerfectRate@K for human_score >= 4.0")
+    bad_rate_at_k: Dict[int, float] = Field(default_factory=dict, description="BadRate@K for human_score <= 2.0")
     hit_rate_at_k: Dict[int, float] = Field(default_factory=dict, description="HitRate@K (at least 1 score >= 3)")
     publishable_rate_at_k: Dict[int, float] = Field(default_factory=dict, description="Publishable rate in top K")
     recall_at_k: Optional[Dict[int, float]] = Field(

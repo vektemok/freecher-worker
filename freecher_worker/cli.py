@@ -595,13 +595,18 @@ def score_run_command(
         "heuristic",
         "--scorer",
         "-s",
-        help="Highlight scoring method ('heuristic' or 'llm')",
+        help="Highlight scoring method ('heuristic', 'highlight_v2', or 'llm')",
     ),
     model: Optional[str] = typer.Option(
         None,
         "--model",
         "-m",
         help="Model name for LLM scorer (e.g. 'gpt-4o-mini')",
+    ),
+    allow_fallback: bool = typer.Option(
+        False,
+        "--allow-fallback",
+        help="Allow fallback to heuristic if LLM fails (default: False for benchmark purity)",
     ),
     output: Optional[Path] = typer.Option(
         None,
@@ -627,6 +632,21 @@ def score_run_command(
         cand_doc = CandidateDocument.model_validate(cand_data)
         candidates = cand_doc.candidates
         candidate_set_id = cand_doc.candidate_set_id
+        # Integrity verification
+        expected_id = compute_candidate_set_id(
+            transcript_hash=cand_doc.transcript_hash,
+            min_seconds=cand_doc.min_seconds,
+            target_seconds=cand_doc.target_seconds,
+            max_seconds=cand_doc.max_seconds,
+            overlap_seconds=cand_doc.overlap_seconds,
+            segmentation_version=cand_doc.segmentation_version,
+        )
+        if candidate_set_id and candidate_set_id != expected_id:
+            console.print(
+                f"[bold red]Error:[/bold red] candidate_set_id integrity check failed! "
+                f"Document has '{candidate_set_id}', but computed '{expected_id}'."
+            )
+            raise typer.Exit(code=1)
     elif isinstance(cand_data, list):
         candidates = [CandidateWindow.model_validate(c) for c in cand_data]
         candidate_set_id = "legacy_cset"
@@ -638,22 +658,54 @@ def score_run_command(
         console.print("[yellow]No candidates found in candidates.json.[/yellow]")
         raise typer.Exit(code=0)
 
+    # Check for candidate set mismatch warning against evaluation files if present
+    for eval_cand_name in ("evaluation_blind.json", "evaluation.json"):
+        eval_cand_file = resolved_dir / eval_cand_name
+        if eval_cand_file.is_file():
+            try:
+                ed = load_json(eval_cand_file)
+                if isinstance(ed, dict) and "candidate_set_id" in ed:
+                    if ed["candidate_set_id"] != candidate_set_id:
+                        console.print(
+                            f"[bold yellow]Warning:[/bold yellow] Candidate set ID mismatch between "
+                            f"candidates.json ('{candidate_set_id}') and {eval_cand_name} ('{ed['candidate_set_id']}')."
+                        )
+            except Exception:
+                pass
+
     # Instantiate scorer
-    if scorer == "llm":
+    requested_scorer = scorer.lower()
+    if requested_scorer in ("llm", "highlight_v2"):
+        actual_scorer = "highlight_v2"
         settings = get_settings()
+        actual_model = model or settings.llm_model or "gpt-4o-mini"
         active_scorer = OpenAILLMScorer(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
-            model=model or settings.llm_model or "gpt-4o-mini",
+            model=actual_model,
+            allow_fallback=allow_fallback,
         )
     else:
+        requested_scorer = "heuristic"
+        actual_scorer = "heuristic"
+        actual_model = None
         active_scorer = HeuristicScorer()
 
-    scorer_name = getattr(active_scorer, "name", type(active_scorer).__name__).lower()
     scorer_ver = getattr(active_scorer, "version", "heuristic_v1")
 
-    console.print(f"Scoring {len(candidates)} candidates using [bold]{scorer_name}[/bold] (v{scorer_ver})...")
-    scores = active_scorer.score_batch(candidates)
+    # Load transcript if present for context extraction
+    transcript_file = resolved_dir / "transcript.json"
+    transcript_obj = None
+    if transcript_file.is_file():
+        try:
+            transcript_obj = Transcript.model_validate(load_json(transcript_file))
+        except Exception as exc:
+            console.print(f"[dim]Note: Could not load transcript.json for context: {exc}[/dim]")
+
+    console.print(
+        f"Scoring {len(candidates)} candidates using [bold]{actual_scorer}[/bold] (v{scorer_ver})..."
+    )
+    scores = active_scorer.score_batch(candidates, transcript=transcript_obj)
 
     # Sort descending by score
     cand_score_pairs = list(zip(candidates, scores))
@@ -665,31 +717,49 @@ def score_run_command(
             rank=r_idx,
             score=sc_item.score,
             reason=sc_item.reason,
-            subscores={
+            subscores=getattr(sc_item, "subscores", None) or {
                 "hook_score": sc_item.hook_score,
                 "standalone_score": sc_item.standalone_score,
                 "emotion_score": sc_item.emotion_score,
                 "information_score": sc_item.information_score,
                 "shareability_score": getattr(sc_item, "shareability_score", 0.0),
             },
+            scorer=actual_scorer,
+            scorer_version=scorer_ver,
+            requested_model=model if requested_scorer in ("llm", "highlight_v2") else None,
+            actual_model=getattr(sc_item, "actual_model", actual_model),
+            fallback_used=getattr(sc_item, "fallback_used", False),
+            fallback_reason=getattr(sc_item, "fallback_reason", None),
+            llm_quality_score=getattr(sc_item, "llm_quality_score", None),
+            final_score=getattr(sc_item, "final_score", sc_item.score),
+            flags=getattr(sc_item, "flags", None),
         )
         for r_idx, (c, sc_item) in enumerate(cand_score_pairs, start=1)
     ]
 
     pred_doc = ScorerPredictionDocument(
         candidate_set_id=candidate_set_id,
-        scorer=scorer_name,
+        scorer=actual_scorer,
         scorer_version=scorer_ver,
-        model=model if scorer == "llm" else None,
+        model=actual_model,
         predictions=pred_items,
+        requested_scorer=requested_scorer,
+        actual_scorer=actual_scorer,
+        prompt_version=getattr(active_scorer, "prompt_version", None),
+        prompt_hash=getattr(active_scorer, "prompt_hash", None),
+        score_formula_version=getattr(active_scorer, "score_formula_version", None),
+        context_window_seconds=getattr(active_scorer, "context_window_seconds", None),
+        temperature=getattr(active_scorer, "temperature", None),
     )
 
     scores_dir = resolved_dir / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
-    if scorer_ver.startswith(f"{scorer_name}_"):
+    if scorer_ver == "highlight_v2":
+        file_base = "highlight_v2"
+    elif scorer_ver.startswith(f"{actual_scorer}_"):
         file_base = scorer_ver
     else:
-        file_base = f"{scorer_name}_{scorer_ver}"
+        file_base = f"{actual_scorer}_{scorer_ver}"
     target_path = output or (scores_dir / f"{file_base}.json")
     save_json(pred_doc, target_path)
 
@@ -779,6 +849,10 @@ def evaluate_command(
     table.add_row("nDCG", *[f"{metrics.ndcg_at_k.get(kv, 0.0):.4f}" for kv in metrics.k_values])
     # MeanHumanScore@K
     table.add_row("Mean Human Score", *[f"{metrics.mean_human_score_at_k.get(kv, 0.0):.2f}/4" for kv in metrics.k_values])
+    # PerfectRate@K (human_score >= 4)
+    table.add_row("Perfect Rate (>=4)", *[f"{metrics.perfect_rate_at_k.get(kv, 0.0):.1%}" for kv in metrics.k_values])
+    # BadRate@K (human_score <= 2)
+    table.add_row("Bad Rate (<=2)", *[f"{metrics.bad_rate_at_k.get(kv, 0.0):.1%}" for kv in metrics.k_values])
     # PublishableRate@K
     table.add_row("Publishable Rate", *[f"{metrics.publishable_rate_at_k.get(kv, 0.0):.1%}" for kv in metrics.k_values])
     # HitRate@K
@@ -895,6 +969,12 @@ def compare_scorers_command(
 
         mhs_row = [f"{m.mean_human_score_at_k.get(kv, 0.0):.2f}/4" for m in all_metrics]
         table.add_row(f"Mean Score @ {kv}", *mhs_row)
+
+        perf_row = [f"{m.perfect_rate_at_k.get(kv, 0.0):.1%}" for m in all_metrics]
+        table.add_row(f"Perfect Rate @ {kv}", *perf_row)
+
+        bad_row = [f"{m.bad_rate_at_k.get(kv, 0.0):.1%}" for m in all_metrics]
+        table.add_row(f"Bad Rate @ {kv}", *bad_row)
 
         pub_row = [f"{m.publishable_rate_at_k.get(kv, 0.0):.1%}" for m in all_metrics]
         table.add_row(f"Publishable @ {kv}", *pub_row)

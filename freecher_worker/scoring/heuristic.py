@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Set
+from typing import Any, Optional, Set
 
 from freecher_worker.highlights.models import CandidateWindow, HighlightScore
 from .base import HighlightScorer
@@ -53,7 +53,11 @@ class HeuristicScorer(HighlightScorer):
         "и", "а", "но", "да", "короче", "так вот", "ну", "and", "but", "so", "well",
     }
 
-    def score(self, candidate: CandidateWindow) -> HighlightScore:
+    def score(
+        self,
+        candidate: CandidateWindow,
+        context: Optional[dict[str, Any]] = None,
+    ) -> HighlightScore:
         """Score candidate using deterministic heuristics."""
         text = candidate.text.strip()
         duration = max(1.0, candidate.duration)

@@ -76,6 +76,21 @@ class HighlightScore(BaseModel):
     fallback_used: bool = Field(default=False, description="Whether fallback scoring was engaged (e.g. LLM failure)")
     fallback_reason: Optional[str] = Field(default=None, description="Reason why fallback was triggered")
 
+    # Extended dimensions & metadata for Highlight Intelligence v2
+    story_payoff_score: Optional[float] = Field(default=None, ge=0, le=100)
+    humor_score: Optional[float] = Field(default=None, ge=0, le=100)
+    surprise_score: Optional[float] = Field(default=None, ge=0, le=100)
+    retention_score: Optional[float] = Field(default=None, ge=0, le=100)
+    boringness_score: Optional[float] = Field(default=None, ge=0, le=100)
+    context_dependency_score: Optional[float] = Field(default=None, ge=0, le=100)
+    llm_quality_score: Optional[float] = Field(default=None, ge=0, le=100)
+    final_score: Optional[float] = Field(default=None, ge=0, le=100)
+    subscores: Optional[dict[str, float]] = None
+    flags: Optional[dict[str, bool]] = None
+    scorer_version: Optional[str] = None
+    requested_model: Optional[str] = None
+    actual_model: Optional[str] = None
+
 
 class Highlight(BaseModel):
     """Ranked and selected highlight ready for clipping."""

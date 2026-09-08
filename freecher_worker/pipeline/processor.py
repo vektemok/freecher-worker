@@ -450,11 +450,12 @@ def run_pipeline(
         scoring_start = time.perf_counter()
         active_scorer = scorer
         if active_scorer is None:
-            if cfg.scorer == "llm":
+            if cfg.scorer in ("llm", "highlight_v2"):
                 active_scorer = OpenAILLMScorer(
                     base_url=cfg.llm_base_url,
                     api_key=cfg.llm_api_key,
                     model=cfg.llm_model or "gpt-4o-mini",
+                    allow_fallback=True,
                 )
             else:
                 active_scorer = HeuristicScorer()
@@ -462,7 +463,7 @@ def run_pipeline(
         scorer_name = getattr(active_scorer, "name", type(active_scorer).__name__)
         scorer_ver = getattr(active_scorer, "version", "heuristic_v1")
 
-        scores = active_scorer.score_batch(candidates)
+        scores = active_scorer.score_batch(candidates, transcript=transcript)
 
         for sc in scores:
             if getattr(sc, "fallback_used", False):

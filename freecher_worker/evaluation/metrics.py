@@ -77,6 +77,8 @@ def compute_evaluation_metrics(
     precision_at_k: Dict[int, float] = {}
     ndcg_at_k: Dict[int, float] = {}
     mean_human_score_at_k: Dict[int, float] = {}
+    perfect_rate_at_k: Dict[int, float] = {}
+    bad_rate_at_k: Dict[int, float] = {}
     publishable_rate_at_k: Dict[int, float] = {}
 
     for k in k_values:
@@ -104,6 +106,14 @@ def compute_evaluation_metrics(
             mean_human_score_at_k[k] = round(sum(top_k_scores) / len(top_k_scores), 3)
         else:
             mean_human_score_at_k[k] = 0.0
+
+        # PerfectRate@K (human_score >= 4.0)
+        perfect_count = sum(1 for r in cutoff_relevances if r >= 4.0)
+        perfect_rate_at_k[k] = round(perfect_count / k, 4) if k > 0 else 0.0
+
+        # BadRate@K (human_score <= 2.0)
+        bad_count = sum(1 for r in cutoff_relevances if r <= 2.0)
+        bad_rate_at_k[k] = round(bad_count / k, 4) if k > 0 else 0.0
 
         # PublishableRate@K
         pub_count = sum(1 for p in ranked_publishable[:k] if p)
@@ -146,6 +156,8 @@ def compute_evaluation_metrics(
         precision_at_k=precision_at_k,
         ndcg_at_k=ndcg_at_k,
         mean_human_score_at_k=mean_human_score_at_k,
+        perfect_rate_at_k=perfect_rate_at_k,
+        bad_rate_at_k=bad_rate_at_k,
         hit_rate_at_k=hit_rate_at_k,
         publishable_rate_at_k=publishable_rate_at_k,
         recall_at_k=recall_at_k,

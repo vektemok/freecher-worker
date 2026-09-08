@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,12 +37,24 @@ class Settings(BaseSettings):
     clip_padding_seconds: float = Field(default=2.0, description="Contextual padding before/after highlight in seconds")
 
     # Scorer Settings
-    scorer: str = Field(default="heuristic", description="Scorer implementation ('heuristic' or 'llm')")
+    scorer: str = Field(default="heuristic", description="Scorer implementation ('heuristic' or 'llm' or 'highlight_v2')")
 
     # Optional OpenAI-compatible LLM Scorer
-    llm_base_url: Optional[str] = Field(default=None, description="Base URL for OpenAI-compatible LLM API")
-    llm_api_key: Optional[str] = Field(default=None, description="API key for OpenAI-compatible LLM API")
-    llm_model: Optional[str] = Field(default="gpt-4o-mini", description="Model name for LLM scoring")
+    llm_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_LLM_BASE_URL", "ARNY_LLM_BASE_URL", "OPENAI_BASE_URL", "LLM_BASE_URL"),
+        description="Base URL for OpenAI-compatible LLM API",
+    )
+    llm_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_LLM_API_KEY", "ARNY_LLM_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"),
+        description="API key for OpenAI-compatible LLM API",
+    )
+    llm_model: Optional[str] = Field(
+        default="gpt-4o-mini",
+        validation_alias=AliasChoices("FREECHER_LLM_MODEL", "ARNY_LLM_MODEL", "OPENAI_MODEL", "LLM_MODEL"),
+        description="Model name for LLM scoring",
+    )
 
     # Paths
     output_dir: Path = Field(default=Path("runs"), description="Base directory for run outputs")
