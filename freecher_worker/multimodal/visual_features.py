@@ -52,6 +52,9 @@ def extract_candidate_visual_features(
     decoder_used: str = "ffmpeg_default_software",
     requested_count: int = 8,
     failed_count: int = 0,
+    decoder_mode: Optional[str] = None,
+    requested_decoder: Optional[str] = None,
+    hardware_acceleration: bool = False,
 ) -> VisualFeatures:
     """Compute local visual features across candidate extracted frames.
 
@@ -82,6 +85,8 @@ def extract_candidate_visual_features(
         except Exception as exc:
             logger.debug(f"[multimodal-visual] Failed loading frame {p}: {exc}")
 
+    resolved_mode = decoder_mode or (decoder_used if decoder_used in ("libdav1d", "ffmpeg_auto") else "ffmpeg_auto")
+
     decoded_count = len(gray_frames)
     if decoded_count == 0:
         return VisualFeatures(
@@ -93,6 +98,9 @@ def extract_candidate_visual_features(
             requested_frame_count=requested_count,
             failed_frame_count=failed_count or requested_count,
             decoder_used=decoder_used,
+            decoder_mode=resolved_mode,
+            requested_decoder=requested_decoder,
+            hardware_acceleration=hardware_acceleration,
         )
 
     # 1. Motion Score & Scene Changes
@@ -145,6 +153,8 @@ def extract_candidate_visual_features(
     else:
         person_presence_ratio = None
 
+    resolved_mode = decoder_mode or (decoder_used if decoder_used in ("libdav1d", "ffmpeg_auto") else "ffmpeg_auto")
+
     return VisualFeatures(
         motion_score=motion_score,
         scene_change_count=scene_changes,
@@ -154,4 +164,7 @@ def extract_candidate_visual_features(
         requested_frame_count=requested_count,
         failed_frame_count=failed_count,
         decoder_used=decoder_used,
+        decoder_mode=resolved_mode,
+        requested_decoder=requested_decoder,
+        hardware_acceleration=hardware_acceleration,
     )

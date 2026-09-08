@@ -24,6 +24,7 @@ from freecher_worker.utils.json_io import load_json, save_json
 
 from .activity import compute_source_temporal_activity_profile
 from .audio_features import compute_source_audio_profile
+from .frames import resolve_safe_video_decoder
 from .models import MultimodalCandidatePackage, MultimodalModelResult
 from .package import PACKAGE_VERSION_V1, PACKAGE_VERSION_V1_1, build_multimodal_package
 from .provider import MultimodalProvider, PROMPT_VERSION_MULTIMODAL_V1_1
@@ -346,12 +347,14 @@ class MultimodalReranker:
             activity_cache_file = (
                 r_dir / "multimodal" / "cache" / "source_temporal_activity_profile_v1_1.json"
             )
+            dec_res = resolve_safe_video_decoder(codec, source_video_path=video_path)
             source_activity_profile = compute_source_temporal_activity_profile(
                 wav_path=wav_path,
                 video_path=video_path,
                 source_fingerprint=source_fingerprint,
                 cache_file=activity_cache_file,
-                decoder_name=codec,
+                decoder_name=dec_res.ffmpeg_decoder_arg,
+                decoder_info=dec_res.to_dict(),
             )
 
         # 6. Deterministic shortlist generation
@@ -471,7 +474,10 @@ class MultimodalReranker:
                 audio_features=audio_feat_dict,
                 visual_features=visual_feat_dict,
                 frame_count=len(package.frames),
-                actual_decoder=package.visual_features.decoder_used,
+                actual_decoder=package.visual_features.decoder_used if package.visual_features else None,
+                actual_decoder_mode=package.visual_features.decoder_mode if package.visual_features else None,
+                requested_decoder=package.visual_features.requested_decoder if package.visual_features else None,
+                decoder_info=package.decoder_info,
                 package_hash=package.package_hash,
                 request_hash=req_hash,
             )

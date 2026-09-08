@@ -43,6 +43,7 @@ from freecher_worker.multimodal import (
     SCORER_VERSION_MULTIMODAL_V1_1,
     ShortlistDocument,
     ShortlistItem,
+    SafeDecoderResolution,
     SourceAudioProfile,
     SourceTemporalActivityPoint,
     SourceTemporalActivityProfile,
@@ -61,7 +62,9 @@ from freecher_worker.multimodal import (
     multimodal_v1_formula_v1,
     multimodal_v1_1_formula_v1,
     probe_software_decoder,
+    resolve_safe_video_decoder,
     resolve_source_video_path,
+    run_decoder_smoke_test,
     select_temporal_burst_peaks,
     slice_candidate_activity_curve,
 )
@@ -916,3 +919,199 @@ def test_26_highlight_v2_1_metrics_and_scoring_unchanged():
     score, subscores, diag = highlight_v2_1_formula_v1(features)
     assert 60.0 <= score <= 90.0
     assert diag["positive_score"] > 0 and "raw_score" in diag
+
+
+def test_27_av1_never_selects_native_av1():
+    """27. Native 'av1' decoder is never selected as explicit FFmpeg argument; falls back safely to ffmpeg_auto."""
+    with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"av1", "libaom-av1"}):
+        res = resolve_safe_video_decoder("av1")
+        assert res.decoder_mode == "ffmpeg_auto"
+        assert res.ffmpeg_decoder_arg is None
+        assert res.hardware_acceleration is False
+        assert res.source_codec == "av1"
+
+        dec_arg, desc = probe_software_decoder("av1")
+        assert dec_arg is None
+        assert "ffmpeg_auto" in desc
+
+
+def test_28_libdav1d_preferred_when_smoke_test_succeeds(tmp_path: Path):
+    """28. libdav1d is preferred for AV1 when available and runtime smoke test passes."""
+    mock_vid = tmp_path / "sample.mp4"
+    mock_vid.write_bytes(b"TEST_VIDEO")
+
+    with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"libdav1d", "av1"}), \
+         mock.patch("freecher_worker.multimodal.frames.run_decoder_smoke_test", return_value=True):
+        res = resolve_safe_video_decoder("av1", source_video_path=mock_vid)
+        assert res.decoder_mode == "libdav1d"
+        assert res.requested_decoder == "libdav1d"
+        assert res.ffmpeg_decoder_arg == "libdav1d"
+        assert res.hardware_acceleration is False
+        assert res.smoke_test_passed is True
+
+        dec_arg, desc = probe_software_decoder("av1", source_video_path=mock_vid)
+        assert dec_arg == "libdav1d"
+        assert "libdav1d" in desc
+
+
+def test_29_ffmpeg_auto_used_when_libdav1d_smoke_fails(tmp_path: Path):
+    """29. If libdav1d smoke test fails, gracefully falls back to ffmpeg_auto (omitting -c:v)."""
+    mock_vid = tmp_path / "sample.mp4"
+    mock_vid.write_bytes(b"TEST_VIDEO")
+
+    with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"libdav1d", "av1"}), \
+         mock.patch("freecher_worker.multimodal.frames.run_decoder_smoke_test", return_value=False):
+        res = resolve_safe_video_decoder("av1", source_video_path=mock_vid)
+        assert res.decoder_mode == "ffmpeg_auto"
+        assert res.requested_decoder == "libdav1d"
+        assert res.ffmpeg_decoder_arg is None
+        assert res.hardware_acceleration is False
+        assert res.smoke_test_passed is False
+
+        dec_arg, desc = probe_software_decoder("av1", source_video_path=mock_vid)
+        assert dec_arg is None
+        assert "ffmpeg_auto" in desc
+
+
+def test_30_hardware_av1_decoders_never_selected():
+    """30. Hardware AV1 decoders (cuvid, qsv, nvdec) are never selected."""
+    with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"av1_cuvid", "av1_qsv", "av1_nvdec", "av1"}):
+        res = resolve_safe_video_decoder("av1")
+        assert res.decoder_mode == "ffmpeg_auto"
+        assert res.ffmpeg_decoder_arg is None
+        assert res.hardware_acceleration is False
+        assert res.requested_decoder is None
+
+        dec_arg, desc = probe_software_decoder("av1")
+        assert dec_arg is None
+        assert "cuvid" not in desc.lower()
+        assert "qsv" not in desc.lower()
+        assert "nvdec" not in desc.lower()
+
+
+def test_31_command_builder_does_not_translate_libdav1d_to_av1(tmp_path: Path):
+    """31. Command builder passes -c:v libdav1d when libdav1d is used, never -c:v av1; omits -c:v on auto/av1."""
+    from freecher_worker.multimodal.activity import _compute_source_visual_timeline
+    mock_vid = tmp_path / "test.mp4"
+    mock_vid.write_bytes(b"DUMMY_MP4")
+
+    # A. Activity visual timeline command checks
+    with mock.patch("subprocess.Popen") as mock_popen:
+        mock_proc = mock.MagicMock()
+        mock_proc.stdout.read.return_value = b""
+        mock_proc.wait.return_value = 0
+        mock_proc.poll.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        # A1: libdav1d -> -c:v libdav1d
+        _compute_source_visual_timeline(mock_vid, duration_seconds=5.0, decoder_name="libdav1d")
+        cmd1 = mock_popen.call_args[0][0]
+        assert "-c:v" in cmd1
+        assert cmd1[cmd1.index("-c:v") + 1] == "libdav1d"
+        assert cmd1[cmd1.index("-c:v") + 1] != "av1"
+
+        # A2: "av1" -> omitted, never -c:v av1
+        _compute_source_visual_timeline(mock_vid, duration_seconds=5.0, decoder_name="av1")
+        cmd2 = mock_popen.call_args[0][0]
+        assert "-c:v" not in cmd2
+
+        # A3: "ffmpeg_auto" -> omitted
+        _compute_source_visual_timeline(mock_vid, duration_seconds=5.0, decoder_name="ffmpeg_auto")
+        cmd3 = mock_popen.call_args[0][0]
+        assert "-c:v" not in cmd3
+
+    # B. Frame extraction command checks
+    c = _make_candidate("c_test", start=0.0, end=10.0)
+    dst = tmp_path / "extracted_frames"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    with mock.patch("freecher_worker.multimodal.frames.probe_media") as mock_probe, \
+         mock.patch("subprocess.run") as mock_run, \
+         mock.patch("freecher_worker.multimodal.frames.run_decoder_smoke_test", return_value=True):
+        mock_probe.return_value = mock.MagicMock(video_codec="av1")
+        mock_res = mock.MagicMock(returncode=0)
+        mock_run.return_value = mock_res
+
+        # B1: when libdav1d is resolved
+        with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"libdav1d"}):
+            extract_candidate_frames(
+                source_video_path=mock_vid,
+                candidate=c,
+                destination_dir=dst,
+                uniform_fractions=(0.5,),
+            )
+            cmd_frame1 = mock_run.call_args[0][0]
+            assert "-c:v" in cmd_frame1
+            assert cmd_frame1[cmd_frame1.index("-c:v") + 1] == "libdav1d"
+            assert cmd_frame1[cmd_frame1.index("-c:v") + 1] != "av1"
+
+        # Clean dst
+        for f in dst.glob("*.jpg"):
+            f.unlink()
+
+        # B2: when only native av1 exists in system
+        with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"av1"}):
+            extract_candidate_frames(
+                source_video_path=mock_vid,
+                candidate=c,
+                destination_dir=dst,
+                uniform_fractions=(0.5,),
+            )
+            cmd_frame2 = mock_run.call_args[0][0]
+            assert "-c:v" not in cmd_frame2
+
+
+def test_32_activity_profile_and_frame_extraction_share_decoder_policy(tmp_path: Path):
+    """32. Activity profiling and candidate frame extraction share the exact same resolver policy and persist decoder_info."""
+    _setup_mock_run_dir(tmp_path, count=5)
+
+    def _mock_sub_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) > 0 and str(cmd[-1]).endswith(".jpg"):
+            Path(cmd[-1]).write_bytes(b"DUMMY_IMAGE")
+        return mock.MagicMock(returncode=0, stderr=b"")
+
+    with mock.patch("freecher_worker.multimodal.frames.get_available_ffmpeg_decoders", return_value={"libdav1d", "av1"}), \
+         mock.patch("freecher_worker.multimodal.frames.run_decoder_smoke_test", return_value=True), \
+         mock.patch("freecher_worker.multimodal.scorer.probe_media") as mock_probe_scorer, \
+         mock.patch("freecher_worker.multimodal.frames.probe_media") as mock_probe_frames, \
+         mock.patch("freecher_worker.multimodal.activity.probe_media") as mock_probe_act, \
+         mock.patch("subprocess.run", side_effect=_mock_sub_run), \
+         mock.patch("subprocess.Popen") as mock_popen:
+        mock_media = mock.MagicMock(video_codec="av1", duration_seconds=10.0, fps=30.0, width=1920, height=1080)
+        mock_probe_scorer.return_value = mock_media
+        mock_probe_frames.return_value = mock_media
+        mock_probe_act.return_value = mock_media
+
+        mock_proc = mock.MagicMock()
+        mock_proc.stdout.read.return_value = b""
+        mock_proc.wait.return_value = 0
+        mock_proc.poll.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        mock_prov = MockMultimodalV11Provider(prompt_version=PROMPT_VERSION_MULTIMODAL_V1_1)
+        reranker = MultimodalReranker(
+            provider=mock_prov,
+            scorer_version="multimodal_v1_1",
+            heuristic_top_k=2,
+            llm_top_k=2,
+            max_candidates=4,
+        )
+
+        pred_doc = reranker.rerank_run(tmp_path)
+        assert len(pred_doc.predictions) > 0
+        p0 = pred_doc.predictions[0]
+
+        # Verify decoder info persisted on ScorerPredictionItem
+        assert p0.actual_decoder_mode == "libdav1d"
+        assert p0.requested_decoder == "libdav1d"
+        assert p0.decoder_info is not None
+        assert p0.decoder_info["decoder_mode"] == "libdav1d"
+        assert p0.decoder_info["hardware_acceleration"] is False
+
+        # Verify activity profile decoder info matches
+        act_file = tmp_path / "multimodal" / "cache" / "source_temporal_activity_profile_v1_1.json"
+        assert act_file.is_file()
+        act_data = load_json(act_file)
+        assert act_data["decoder_info"]["decoder_mode"] == "libdav1d"
+        assert act_data["decoder_info"]["hardware_acceleration"] is False
+

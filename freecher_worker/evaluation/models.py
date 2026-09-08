@@ -110,6 +110,9 @@ class ScorerPredictionItem(BaseModel):
     visual_features: Optional[Dict[str, Any]] = Field(default=None, description="Candidate visual feature metrics")
     frame_count: Optional[int] = Field(default=None, description="Number of extracted frames evaluated")
     actual_decoder: Optional[str] = Field(default=None, description="FFmpeg video decoder used")
+    actual_decoder_mode: Optional[str] = Field(default=None, description="Resolved decoder mode (libdav1d or ffmpeg_auto)")
+    requested_decoder: Optional[str] = Field(default=None, description="Requested decoder before resolution")
+    decoder_info: Optional[Dict[str, Any]] = Field(default=None, description="Full decoder resolution metadata")
     package_hash: Optional[str] = Field(default=None, description="Deterministic package content hash")
     request_hash: Optional[str] = Field(default=None, description="Deterministic API request cache hash")
 

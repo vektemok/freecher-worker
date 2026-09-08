@@ -8,7 +8,14 @@ from .activity import (
     slice_candidate_activity_curve,
 )
 from .audio_features import compute_source_audio_profile, extract_candidate_audio_features
-from .frames import compute_v1_1_sample_timestamps, extract_candidate_frames, probe_software_decoder
+from .frames import (
+    SafeDecoderResolution,
+    compute_v1_1_sample_timestamps,
+    extract_candidate_frames,
+    probe_software_decoder,
+    resolve_safe_video_decoder,
+    run_decoder_smoke_test,
+)
 from .models import (
     ActivityCurveSummary,
     ActivityPoint,
@@ -66,6 +73,7 @@ __all__ = [
     "PROMPT_VERSION_MULTIMODAL_V1_1",
     "SCORER_VERSION_MULTIMODAL_V1",
     "SCORER_VERSION_MULTIMODAL_V1_1",
+    "SafeDecoderResolution",
     "ShortlistDocument",
     "ShortlistItem",
     "SourceAudioProfile",
@@ -86,7 +94,9 @@ __all__ = [
     "multimodal_v1_formula_v1",
     "multimodal_v1_1_formula_v1",
     "probe_software_decoder",
+    "resolve_safe_video_decoder",
     "resolve_source_video_path",
+    "run_decoder_smoke_test",
     "select_temporal_burst_peaks",
     "slice_candidate_activity_curve",
 ]

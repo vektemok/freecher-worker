@@ -233,12 +233,32 @@ def build_multimodal_package(
 
     # 2. Extract visual features
     frame_paths = [f.image_path for f in frames]
+    from freecher_worker.media.probe import probe_media
+    try:
+        media_info = probe_media(source_video_path)
+        src_codec = getattr(media_info, "video_codec", "unknown")
+    except Exception:
+        src_codec = "unknown"
+
+    dec_mode = decoder_used if decoder_used in ("libdav1d", "ffmpeg_auto") else "ffmpeg_auto"
+    req_dec = "libdav1d" if "av1" in src_codec.lower() else (decoder_used if decoder_used != "ffmpeg_auto" else None)
+
     visual_features = extract_candidate_visual_features(
         frame_paths=frame_paths,
         decoder_used=decoder_used,
         requested_count=req_count,
         failed_count=fail_count,
+        decoder_mode=dec_mode,
+        requested_decoder=req_dec,
+        hardware_acceleration=False,
     )
+
+    decoder_info = {
+        "source_codec": src_codec,
+        "decoder_mode": dec_mode,
+        "requested_decoder": req_dec,
+        "hardware_acceleration": False,
+    }
 
     # 3. Extract audio features
     audio_features = extract_candidate_audio_features(
@@ -275,6 +295,7 @@ def build_multimodal_package(
         package_version=package_version,
         temporal_bursts=bursts,
         activity_curve=activity_summary,
+        decoder_info=decoder_info,
     )
 
     save_json(package, package_json_path)

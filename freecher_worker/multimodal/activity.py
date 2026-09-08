@@ -165,8 +165,10 @@ def _compute_source_visual_timeline(
     frame_bytes_len = w * h
 
     cmd = ["ffmpeg", "-loglevel", "error", "-y"]
-    if decoder_name:
+    if decoder_name and decoder_name not in ("ffmpeg_auto", "auto", "av1", "none"):
         cmd.extend(["-c:v", decoder_name])
+    elif decoder_name == "av1":
+        logger.warning("[multimodal-activity] Refusing to use broken native FFmpeg '-c:v av1'. Using automatic software decoder selection.")
     cmd.extend([
         "-i", str(src),
         "-vf", f"fps=1/{bin_seconds},scale={w}:{h}",
@@ -221,6 +223,7 @@ def compute_source_temporal_activity_profile(
     source_fingerprint: str,
     cache_file: Optional[Path | str] = None,
     decoder_name: Optional[str] = None,
+    decoder_info: Optional[Dict[str, Any]] = None,
     force_recompute: bool = False,
 ) -> SourceTemporalActivityProfile:
     """Build and cache whole-source temporal activity profile once.
@@ -242,6 +245,31 @@ def compute_source_temporal_activity_profile(
         except Exception as exc:
             logger.warning(f"[multimodal-activity] Failed to load cached activity profile: {exc}")
 
+    # Resolve safe video software decoder if not provided
+    from freecher_worker.media.probe import probe_media
+    from .frames import resolve_safe_video_decoder
+
+    if decoder_info is None:
+        try:
+            m_info = probe_media(video_path)
+            dec_res = resolve_safe_video_decoder(m_info.video_codec, source_video_path=video_path)
+            actual_decoder_arg = dec_res.ffmpeg_decoder_arg
+            actual_decoder_info = dec_res.to_dict()
+        except Exception:
+            actual_decoder_arg = None
+            actual_decoder_info = {
+                "source_codec": "unknown",
+                "decoder_mode": "ffmpeg_auto",
+                "requested_decoder": None,
+                "hardware_acceleration": False,
+            }
+    else:
+        if decoder_name in ("ffmpeg_auto", "auto", "av1", "none"):
+            actual_decoder_arg = None
+        else:
+            actual_decoder_arg = decoder_name
+        actual_decoder_info = decoder_info
+
     logger.info("[multimodal-activity] Computing single-pass source temporal activity profile...")
 
     energies, deltas, speeches, duration = _compute_source_audio_timeline(
@@ -252,7 +280,7 @@ def compute_source_temporal_activity_profile(
     motions, scenes = _compute_source_visual_timeline(
         video_path=video_path,
         duration_seconds=duration,
-        decoder_name=decoder_name,
+        decoder_name=actual_decoder_arg,
         bin_seconds=ACTIVITY_BIN_SECONDS,
     )
 
@@ -291,6 +319,7 @@ def compute_source_temporal_activity_profile(
         bin_size_seconds=ACTIVITY_BIN_SECONDS,
         duration_seconds=duration,
         timeline=timeline,
+        decoder_info=actual_decoder_info,
     )
 
     if cache_file:

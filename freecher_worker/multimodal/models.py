@@ -38,6 +38,9 @@ class VisualFeatures(BaseModel):
     requested_frame_count: int = Field(description="Count of requested frames")
     failed_frame_count: int = Field(default=0, description="Count of frame extraction failures")
     decoder_used: str = Field(default="software", description="FFmpeg decoder used for frame extraction")
+    decoder_mode: Optional[str] = Field(default=None, description="Resolved decoder mode ('libdav1d' or 'ffmpeg_auto')")
+    requested_decoder: Optional[str] = Field(default=None, description="Requested decoder before resolution")
+    hardware_acceleration: bool = Field(default=False, description="Hardware acceleration flag (strictly False)")
 
 
 class ExtractedFrame(BaseModel):
@@ -71,6 +74,7 @@ class SourceTemporalActivityProfile(BaseModel):
     bin_size_seconds: float = 1.0
     duration_seconds: float
     timeline: List[SourceTemporalActivityPoint] = Field(default_factory=list)
+    decoder_info: Optional[Dict[str, Any]] = Field(default=None, description="Decoder resolution metadata")
 
 
 class ActivityPoint(BaseModel):
@@ -144,6 +148,10 @@ class MultimodalCandidatePackage(BaseModel):
     activity_curve: Optional[ActivityCurveSummary] = Field(
         default=None,
         description="Candidate-local 1-second activity curve (v1.1)",
+    )
+    decoder_info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Decoder resolution metadata (source_codec, decoder_mode, requested_decoder, hardware_acceleration)",
     )
 
 
