@@ -112,6 +112,94 @@ def multimodal_v1_formula_v1(
     return final_score, subscores, diagnostics
 
 
+def resolve_source_video_path(
+    run_dir: Path | str,
+    source_video_override: Optional[Path | str] = None,
+) -> Path:
+    """Locate the source video file for a run directory.
+
+    Resolution order:
+    1. Explicit override (CLI --source-video / API argument)
+    2. media.json in run_dir ("path")
+    3. manifest.json in run_dir ("source" or "source_fingerprint.path")
+    4. Direct video files inside run_dir (*.mp4, *.mkv, *.webm, *.mov, *.avi)
+    5. Basename matches in current working directory or run_dir parent
+    """
+    r_dir = Path(run_dir).resolve()
+
+    # 1. Explicit override
+    if source_video_override:
+        ov = Path(source_video_override).resolve()
+        if ov.is_file():
+            return ov
+        if (r_dir / Path(source_video_override).name).is_file():
+            return (r_dir / Path(source_video_override).name).resolve()
+        if (Path.cwd() / Path(source_video_override).name).is_file():
+            return (Path.cwd() / Path(source_video_override).name).resolve()
+        raise FileNotFoundError(
+            f"Explicit source video override not found: {source_video_override}"
+        )
+
+    possible_paths: list[str] = []
+
+    # 2. media.json in run_dir
+    media_file = r_dir / "media.json"
+    if media_file.is_file():
+        try:
+            m_data = load_json(media_file)
+            if isinstance(m_data, dict) and m_data.get("path"):
+                possible_paths.append(str(m_data["path"]))
+        except Exception:
+            pass
+
+    # 3. manifest.json in run_dir
+    manifest_file = r_dir / "manifest.json"
+    if manifest_file.is_file():
+        try:
+            man_data = load_json(manifest_file)
+            if isinstance(man_data, dict):
+                if man_data.get("source"):
+                    possible_paths.append(str(man_data["source"]))
+                fp_path = man_data.get("source_fingerprint", {}).get("path")
+                if fp_path:
+                    possible_paths.append(str(fp_path))
+        except Exception:
+            pass
+
+    # Check all extracted candidate paths
+    for p_str in possible_paths:
+        p = Path(p_str)
+        if p.is_file():
+            return p.resolve()
+        if (r_dir / p.name).is_file():
+            return (r_dir / p.name).resolve()
+        if (Path.cwd() / p.name).is_file():
+            return (Path.cwd() / p.name).resolve()
+        if (r_dir.parent / p.name).is_file():
+            return (r_dir.parent / p.name).resolve()
+
+    # 4. Check direct video files in run_dir
+    direct_vids = (
+        list(r_dir.glob("*.mp4"))
+        + list(r_dir.glob("*.mkv"))
+        + list(r_dir.glob("*.webm"))
+        + list(r_dir.glob("*.mov"))
+        + list(r_dir.glob("*.avi"))
+    )
+    if direct_vids:
+        for pref in ("source.mp4", "input.mp4", "video.mp4"):
+            if (r_dir / pref).is_file():
+                return (r_dir / pref).resolve()
+        return direct_vids[0].resolve()
+
+    checked_msg = ", ".join(f"'{p}'" for p in possible_paths) if possible_paths else "none found in manifest/media.json"
+    raise FileNotFoundError(
+        f"No source video found for run at {r_dir}. "
+        f"Checked paths recorded in run: [{checked_msg}]. "
+        f"Please provide the source video path explicitly via --source-video / -s."
+    )
+
+
 class MultimodalReranker:
     """Orchestrator for candidate shortlisting, multimodal packaging, evaluation, and reranking."""
 
@@ -124,6 +212,7 @@ class MultimodalReranker:
         allow_missing_llm: bool = False,
         force_rescore: bool = False,
         force_repackage: bool = False,
+        source_video: Optional[Path | str] = None,
     ) -> None:
         self.provider = provider
         self.heuristic_top_k = heuristic_top_k
@@ -132,6 +221,7 @@ class MultimodalReranker:
         self.allow_missing_llm = allow_missing_llm
         self.force_rescore = force_rescore
         self.force_repackage = force_repackage
+        self.source_video_override = source_video
 
         self.scorer_version = SCORER_VERSION_MULTIMODAL_V1
         self.prompt_version = provider.prompt_version
@@ -165,21 +255,10 @@ class MultimodalReranker:
                 logger.warning(f"[multimodal-rerank] Failed loading transcript: {exc}")
 
         # 2. Locate source video
-        if source_video_override and Path(source_video_override).is_file():
-            video_path = Path(source_video_override).resolve()
-        else:
-            cand_video = getattr(cand_doc, "source_video", None)
-            if cand_video and Path(cand_video).is_file():
-                video_path = Path(cand_video).resolve()
-            elif (r_dir / "source.mp4").is_file():
-                video_path = r_dir / "source.mp4"
-            else:
-                # Check for any .mp4 or .mkv in run_dir
-                vids = list(r_dir.glob("*.mp4")) + list(r_dir.glob("*.mkv"))
-                if vids:
-                    video_path = vids[0].resolve()
-                else:
-                    raise FileNotFoundError(f"No source video found for run at {r_dir}")
+        video_path = resolve_source_video_path(
+            run_dir=r_dir,
+            source_video_override=source_video_override or self.source_video_override,
+        )
 
         # Probe video fingerprint
         media_info = probe_media(video_path)

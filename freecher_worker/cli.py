@@ -620,6 +620,12 @@ def score_run_command(
         "-o",
         help="Custom destination for scores JSON file (default: <run_dir>/scores/<scorer>_<version>.json)",
     ),
+    source_video: Optional[Path] = typer.Option(
+        None,
+        "--source-video",
+        "-v",
+        help="Path to source video file (used by multimodal reranker if moved)",
+    ),
 ) -> None:
     """Score a frozen candidate set in an existing run without re-transcribing or clipping."""
     try:
@@ -680,9 +686,14 @@ def score_run_command(
             llm_top_k=settings.multimodal_llm_top_k,
             max_candidates=settings.multimodal_max_candidates,
             allow_missing_llm=allow_fallback,
+            source_video=source_video,
         )
         console.print(f"Executing [bold]multimodal_v1[/bold] reranker on {resolved_dir}...")
-        pred_doc = reranker.rerank_run(resolved_dir, output_file=output)
+        pred_doc = reranker.rerank_run(
+            resolved_dir,
+            output_file=output,
+            source_video_override=source_video,
+        )
         target_path = output or (resolved_dir / "scores" / "multimodal_v1.json")
         console.print(f"[bold green]Multimodal predictions saved to:[/bold green] {target_path}")
         console.print(f"Candidate Set ID: {pred_doc.candidate_set_id}")
@@ -896,6 +907,12 @@ def multimodal_score_command(
         "--force-repackage",
         help="Force re-extracting frames and audio features even if cached package exists",
     ),
+    source_video: Optional[Path] = typer.Option(
+        None,
+        "--source-video",
+        "-v",
+        help="Path to source video file if moved or not found in manifest/media.json",
+    ),
 ) -> None:
     """Run Multimodal Highlight Reranker v1 on a deterministic candidate shortlist."""
     resolved_dir = run_dir.resolve()
@@ -916,10 +933,15 @@ def multimodal_score_command(
         allow_missing_llm=allow_missing_llm,
         force_rescore=force_rescore,
         force_repackage=force_repackage,
+        source_video=source_video,
     )
 
     console.print(f"Executing [bold]multimodal_v1[/bold] reranker on {resolved_dir}...")
-    pred_doc = reranker.rerank_run(resolved_dir, output_file=output)
+    pred_doc = reranker.rerank_run(
+        resolved_dir,
+        output_file=output,
+        source_video_override=source_video,
+    )
 
     target_path = output or (resolved_dir / "scores" / "multimodal_v1.json")
     console.print(f"[bold green]Multimodal predictions saved to:[/bold green] {target_path}")

@@ -22,6 +22,7 @@ from .scorer import (
     SCORER_VERSION_MULTIMODAL_V1,
     MultimodalReranker,
     multimodal_v1_formula_v1,
+    resolve_source_video_path,
 )
 from .shortlist import generate_shortlist
 from .visual_features import extract_candidate_visual_features
@@ -48,6 +49,7 @@ __all__ = [
     "generate_shortlist",
     "multimodal_v1_formula_v1",
     "probe_software_decoder",
+    "resolve_source_video_path",
     "FORMULA_VERSION_MULTIMODAL_V1",
     "SCORER_VERSION_MULTIMODAL_V1",
 ]

@@ -1005,3 +1005,60 @@ def test_evaluation_metrics_shortlist_recall():
     assert metrics.perfect_candidate_recall_in_shortlist == 0.5
     # Pool has 3 publishable candidates (c1, c2, c3). Shortlist contains c1 and c3. Recall = 2/3 = 66.7%
     assert metrics.publishable_candidate_recall_in_shortlist == pytest.approx(0.6667, abs=1e-3)
+
+
+def test_resolve_source_video_from_media_json(tmp_path: Path):
+    """30. resolve_source_video_path locates video via media.json path."""
+    from freecher_worker.multimodal import resolve_source_video_path
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    vid = tmp_path / "original_vid.mp4"
+    vid.write_bytes(b"VID_DATA")
+
+    save_json({"path": str(vid)}, run_dir / "media.json")
+    resolved = resolve_source_video_path(run_dir)
+    assert resolved == vid.resolve()
+
+
+def test_resolve_source_video_from_manifest(tmp_path: Path):
+    """31. resolve_source_video_path locates video via manifest.json source."""
+    from freecher_worker.multimodal import resolve_source_video_path
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    vid = tmp_path / "manifest_vid.mp4"
+    vid.write_bytes(b"VID_DATA")
+
+    save_json({"source": str(vid)}, run_dir / "manifest.json")
+    resolved = resolve_source_video_path(run_dir)
+    assert resolved == vid.resolve()
+
+
+def test_resolve_source_video_explicit_override(tmp_path: Path):
+    """32. resolve_source_video_path prioritizes explicit override."""
+    from freecher_worker.multimodal import resolve_source_video_path
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    vid1 = tmp_path / "vid1.mp4"
+    vid1.write_bytes(b"V1")
+    vid2 = tmp_path / "vid2.mp4"
+    vid2.write_bytes(b"V2")
+
+    save_json({"path": str(vid1)}, run_dir / "media.json")
+    resolved = resolve_source_video_path(run_dir, source_video_override=vid2)
+    assert resolved == vid2.resolve()
+
+
+def test_resolve_source_video_not_found_informative_error(tmp_path: Path):
+    """33. resolve_source_video_path raises informative FileNotFoundError when video missing."""
+    from freecher_worker.multimodal import resolve_source_video_path
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    save_json({"path": "/nonexistent/path/video.mp4"}, run_dir / "media.json")
+
+    with pytest.raises(FileNotFoundError, match="No source video found for run"):
+        resolve_source_video_path(run_dir)
+
