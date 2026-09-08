@@ -110,8 +110,21 @@ class ShortMetadata(BaseModel):
     crop_keyframes_available: int = 0
     crop_resolution_reduced: bool = False
     trajectory_report: Optional[TrajectoryReport] = None
-    reframing_fallback: bool = Field(default=False, description="Dynamic reframing was abandoned")
-    reframing_failure_reason: Optional[str] = None
+    render_fallback_used: bool = Field(
+        default=False,
+        description="The dynamic crop render failed or was unusable, so a static crop was rendered",
+    )
+    render_failure_reason: Optional[str] = Field(
+        default=None, description="Why the dynamic crop render was abandoned, if it was"
+    )
+    tracking_mode: str = Field(
+        default="subject",
+        description="How framing was driven: subject | mixed | dominant_region | center",
+    )
+    tracking_fallback_rate: float = Field(
+        default=0.0,
+        description="Fraction of analyzed frames framed by a tracking fallback; independent of render success",
+    )
     encoder: str = ENCODER_X264
     encoder_fallback_used: bool = False
     audio_normalized: bool = False
@@ -145,6 +158,9 @@ class ShortsManifest(BaseModel):
     width: int = 1080
     height: int = 1920
     duration_mode: str = DURATION_MODE_AUTO
+    ranking_source: str = Field(default="", description="Scorer whose ranking selected these candidates")
+    ranking_origin: str = Field(default="", description="File the ranking was read from")
+    ranking_model: Optional[str] = Field(default=None, description="Model behind the ranking scorer")
     requested: int = 0
     success_count: int = 0
     fallback_count: int = 0
@@ -173,6 +189,9 @@ def reframe_config_from_settings(settings: Settings) -> ReframeConfig:
     return ReframeConfig(
         analysis_fps=settings.reframe_analysis_fps,
         detect_max_width=settings.reframe_detect_max_width,
+        face_score_threshold=settings.reframe_face_score_threshold,
+        face_model_path=str(settings.reframe_face_model_path) if settings.reframe_face_model_path else None,
+        allow_model_download=settings.reframe_allow_model_download,
         subject_padding_ratio=settings.reframe_subject_padding_ratio,
         head_position_ratio=settings.reframe_head_position_ratio,
         headroom_ratio=settings.reframe_headroom_ratio,
@@ -418,8 +437,8 @@ def render_short(
         )
     timings["reframe_analysis_seconds"] = round(time.perf_counter() - t_reframe, 3)
 
-    reframing_fallback = not enable_smart_reframe
-    reframing_failure_reason: Optional[str] = None
+    render_fallback_used = not enable_smart_reframe
+    render_failure_reason: Optional[str] = None
     trajectory_report: Optional[TrajectoryReport] = None
 
     try:
@@ -433,8 +452,8 @@ def render_short(
         )
         crop_w, crop_h = calculate_vertical_crop(info.width, info.height)
         driver = static_center_driver(info.width, info.height, crop_w, crop_h)
-        reframing_fallback = True
-        reframing_failure_reason = f"trajectory validation failed: {exc}"
+        render_fallback_used = True
+        render_failure_reason = f"trajectory validation failed: {exc}"
 
     if trajectory_output is not None:
         save_json(plan.trajectory, trajectory_output)
@@ -539,8 +558,8 @@ def render_short(
                 f"[shorts] Dynamic crop render failed for {timeframe.candidate_id} "
                 f"(driver={driver.driver}); retrying with a static center crop. FFmpeg said: {error}"
             )
-            reframing_fallback = True
-            reframing_failure_reason = f"dynamic crop render failed ({driver.driver}): {error}"
+            render_fallback_used = True
+            render_failure_reason = f"dynamic crop render failed ({driver.driver}): {error}"
             driver = static_center_driver(info.width, info.height, driver.crop_w, driver.crop_h)
             _cleanup(script_path)
             script_path = None
@@ -568,9 +587,9 @@ def render_short(
         duration_sec=selection.duration_sec,
         width=width,
         height=height,
-        reframing_mode=REFRAME_MODE_CENTER if reframing_fallback else plan.mode,
+        reframing_mode=REFRAME_MODE_CENTER if render_fallback_used else plan.mode,
         duration_mode=duration_mode,
-        status=STATUS_FALLBACK if (reframing_fallback and enable_smart_reframe) else STATUS_SUCCESS,
+        status=STATUS_FALLBACK if (render_fallback_used and enable_smart_reframe) else STATUS_SUCCESS,
         rank=rank,
         model_rank=rank,
         model_score=model_score,
@@ -582,8 +601,10 @@ def render_short(
         crop_keyframes_available=driver.keyframes_available,
         crop_resolution_reduced=driver.resolution_reduced,
         trajectory_report=trajectory_report,
-        reframing_fallback=reframing_fallback,
-        reframing_failure_reason=reframing_failure_reason,
+        render_fallback_used=render_fallback_used,
+        render_failure_reason=render_failure_reason,
+        tracking_mode=plan.diagnostics.tracking_mode,
+        tracking_fallback_rate=plan.diagnostics.tracking_fallback_rate,
         encoder=chosen_encoder,
         encoder_fallback_used=encoder_fallback,
         audio_normalized=audio_normalized,
@@ -601,7 +622,7 @@ def render_short(
         f"{width}x{height} via {chosen_encoder}/{driver.driver}; "
         f"subjects={plan.diagnostics.max_simultaneous_subjects}, "
         f"switches={plan.diagnostics.dominant_subject_switches}, "
-        f"fallback={'yes' if plan.diagnostics.fallback_used else 'no'}, "
+        f"tracking={plan.diagnostics.tracking_mode}, "
         f"render={timings.get('render_seconds', 0.0):.1f}s"
     )
     return metadata
@@ -610,6 +631,42 @@ def render_short(
 # ---------------------------------------------------------------------------
 # Run-level orchestration
 # ---------------------------------------------------------------------------
+
+
+#: Ranking sources in production preference order. The multimodal reranker is the final stage
+#: of the ranking pipeline, so its verdict outranks the earlier heuristic and LLM passes.
+SCORER_PREFERENCE = (
+    "multimodal_v1_1",
+    "multimodal_v1",
+    "highlight_v2_1",
+    "highlight_v2",
+    "heuristic_v1",
+)
+RANKING_SOURCE_AUTO = "auto"
+RANKING_SOURCE_HIGHLIGHTS = "highlights"
+
+
+class RankedCandidate(BaseModel):
+    """One candidate as ranked by a specific scorer."""
+
+    candidate_id: str
+    rank: int
+    score: Optional[float] = None
+
+
+class RankingSource(BaseModel):
+    """Where a batch's candidate ordering came from."""
+
+    name: str = Field(description="Scorer version, or 'highlights' for the pipeline's own output")
+    origin: str = Field(description="File the ranking was read from, relative to the run directory")
+    model: Optional[str] = Field(default=None, description="Underlying model, when the scorer used one")
+    candidates: List[RankedCandidate] = Field(default_factory=list)
+
+    def rank_of(self, candidate_id: str) -> Optional[int]:
+        return next((c.rank for c in self.candidates if c.candidate_id == candidate_id), None)
+
+    def score_of(self, candidate_id: str) -> Optional[float]:
+        return next((c.score for c in self.candidates if c.candidate_id == candidate_id), None)
 
 
 class RunContext(BaseModel):
@@ -622,7 +679,17 @@ class RunContext(BaseModel):
     candidates: Dict[str, CandidateWindow] = Field(default_factory=dict)
     highlights: List[Highlight] = Field(default_factory=list)
     advisory_regions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
-    ranked_order: List[str] = Field(default_factory=list)
+    rankings: Dict[str, RankingSource] = Field(
+        default_factory=dict, description="Every ranking found in the run, keyed by scorer name"
+    )
+
+    def available_rankings(self) -> List[str]:
+        """Scorer names present in this run, in production preference order."""
+        ordered = [name for name in SCORER_PREFERENCE if name in self.rankings]
+        ordered += sorted(n for n in self.rankings if n not in SCORER_PREFERENCE and n != RANKING_SOURCE_HIGHLIGHTS)
+        if RANKING_SOURCE_HIGHLIGHTS in self.rankings:
+            ordered.append(RANKING_SOURCE_HIGHLIGHTS)
+        return ordered
 
 
 def load_run_context(run_dir: Path) -> RunContext:
@@ -661,25 +728,53 @@ def load_run_context(run_dir: Path) -> RunContext:
             (Highlight.model_validate(h) for h in load_json(highlights_file)), key=lambda h: h.rank
         )
 
+    # Every scorer that ran on this candidate set leaves scores/<scorer_version>.json behind.
     advisory: Dict[str, Dict[str, Any]] = {}
-    ranked_order: List[str] = []
-    for name in ("multimodal_v1_1.json", "multimodal_v1.json"):
-        scores_file = run_dir / "scores" / name
-        if not scores_file.is_file():
-            continue
-        try:
-            doc = load_json(scores_file)
+    rankings: Dict[str, RankingSource] = {}
+    scores_dir = run_dir / "scores"
+    if scores_dir.is_dir():
+        for scores_file in sorted(scores_dir.glob("*.json")):
+            try:
+                doc = load_json(scores_file)
+            except Exception as exc:
+                logger.warning(f"[shorts] Unable to read {scores_file}: {exc}")
+                continue
+            if not isinstance(doc, dict) or "predictions" not in doc:
+                continue
+
+            name = doc.get("scorer_version") or doc.get("scorer") or scores_file.stem
+            ranked: List[RankedCandidate] = []
             for prediction in sorted(doc.get("predictions", []), key=lambda p: p.get("rank", 10**6)):
                 cid = prediction.get("candidate_id")
                 if not cid:
                     continue
-                ranked_order.append(cid)
+                ranked.append(
+                    RankedCandidate(
+                        candidate_id=cid,
+                        rank=int(prediction.get("rank", len(ranked) + 1)),
+                        score=prediction.get("score"),
+                    )
+                )
                 region = prediction.get("best_observed_region")
                 if region and cid not in advisory:
                     advisory[cid] = region
-        except Exception as exc:
-            logger.warning(f"[shorts] Unable to read {scores_file}: {exc}")
-        break
+            if ranked:
+                rankings[name] = RankingSource(
+                    name=name,
+                    origin=str(scores_file.relative_to(run_dir)),
+                    model=doc.get("model"),
+                    candidates=ranked,
+                )
+
+    if highlights:
+        rankings[RANKING_SOURCE_HIGHLIGHTS] = RankingSource(
+            name=RANKING_SOURCE_HIGHLIGHTS,
+            origin="highlights.json",
+            candidates=[
+                RankedCandidate(candidate_id=h.candidate_id, rank=h.rank, score=h.score)
+                for h in highlights
+            ],
+        )
 
     return RunContext(
         run_dir=run_dir,
@@ -689,51 +784,77 @@ def load_run_context(run_dir: Path) -> RunContext:
         candidates=candidates,
         highlights=highlights,
         advisory_regions=advisory,
-        ranked_order=ranked_order,
+        rankings=rankings,
     )
 
 
-def resolve_timeframe(context: RunContext, candidate_id: str) -> Tuple[CandidateTimeframe, Optional[int]]:
-    """Locate a candidate's absolute window, preferring the ranked highlight record."""
-    for highlight in context.highlights:
-        if highlight.candidate_id == candidate_id:
-            return (
-                CandidateTimeframe(
-                    candidate_id=candidate_id,
-                    source_start_sec=highlight.start,
-                    source_end_sec=highlight.end,
-                ),
-                highlight.rank,
-            )
+def resolve_ranking_source(context: RunContext, scorer: str = RANKING_SOURCE_AUTO) -> RankingSource:
+    """Pick which ranking drives the batch.
 
+    ``auto`` walks :data:`SCORER_PREFERENCE` and therefore uses the multimodal reranker whenever
+    the run has one. This matters: ``highlights.json`` holds the *heuristic* pipeline's top-K, so
+    preferring it silently rendered the wrong candidates once a multimodal pass had reordered them.
+    """
+    available = context.available_rankings()
+    if not available:
+        raise FileNotFoundError(
+            f"No ranking found in {context.run_dir}. Expected scores/<scorer>.json or highlights.json"
+        )
+
+    if scorer and scorer != RANKING_SOURCE_AUTO:
+        key = scorer.removesuffix(".json")
+        if key not in context.rankings:
+            raise KeyError(
+                f"Ranking '{scorer}' not found in this run. Available: {', '.join(available)}"
+            )
+        return context.rankings[key]
+
+    chosen = context.rankings[available[0]]
+    if len(available) > 1:
+        logger.info(
+            f"[shorts] Ranking source '{chosen.name}' selected automatically "
+            f"(also available: {', '.join(available[1:])})"
+        )
+    return chosen
+
+
+def resolve_timeframe(context: RunContext, candidate_id: str) -> CandidateTimeframe:
+    """Locate a candidate's absolute window from the frozen candidate set."""
     window = context.candidates.get(candidate_id)
-    if window is None:
-        raise KeyError(f"Candidate '{candidate_id}' not found in this run")
-    return (
-        CandidateTimeframe(
+    if window is not None:
+        return CandidateTimeframe(
             candidate_id=candidate_id,
             source_start_sec=window.start,
             source_end_sec=window.end,
-        ),
-        None,
-    )
+        )
+
+    for highlight in context.highlights:
+        if highlight.candidate_id == candidate_id:
+            return CandidateTimeframe(
+                candidate_id=candidate_id,
+                source_start_sec=highlight.start,
+                source_end_sec=highlight.end,
+            )
+
+    raise KeyError(f"Candidate '{candidate_id}' not found in this run")
 
 
-def select_ranked_candidates(context: RunContext, top: int) -> List[str]:
+def select_ranked_candidates(
+    context: RunContext,
+    top: int,
+    scorer: str = RANKING_SOURCE_AUTO,
+) -> Tuple[List[str], RankingSource]:
     """Return the top-N candidate ids in ranking order, without re-ranking anything."""
-    if context.highlights:
-        return [h.candidate_id for h in context.highlights[:top]]
-    if context.ranked_order:
-        return context.ranked_order[:top]
-    raise FileNotFoundError(
-        "No ranked highlights found in this run (expected highlights.json or scores/multimodal_v1_1.json)"
-    )
+    source = resolve_ranking_source(context, scorer)
+    ordered = sorted(source.candidates, key=lambda c: c.rank)
+    return [c.candidate_id for c in ordered[:top]], source
 
 
 def render_shorts_for_run(
     run_dir: Path,
     candidate_ids: Optional[List[str]] = None,
     top: int = 5,
+    scorer: str = RANKING_SOURCE_AUTO,
     duration_mode: str = DURATION_MODE_AUTO,
     settings: Optional[Settings] = None,
     enable_smart_reframe: bool = True,
@@ -753,7 +874,15 @@ def render_shorts_for_run(
     cfg = settings or get_settings()
     context = load_run_context(Path(run_dir))
     explicit = candidate_ids is not None
-    targets = candidate_ids or select_ranked_candidates(context, top)
+    if explicit:
+        ranking = resolve_ranking_source(context, scorer)
+        targets = candidate_ids
+    else:
+        targets, ranking = select_ranked_candidates(context, top, scorer)
+    logger.info(
+        f"[shorts] Ranking source: {ranking.name} ({ranking.origin}); "
+        f"targets: {', '.join(targets)}"
+    )
 
     out_dir = Path(run_dir) / output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -769,7 +898,8 @@ def render_shorts_for_run(
         output_path = out_dir / f"{stem}.mp4"
 
         try:
-            timeframe, rank = resolve_timeframe(context, candidate_id)
+            timeframe = resolve_timeframe(context, candidate_id)
+            rank = ranking.rank_of(candidate_id)
         except Exception as exc:
             logger.error(f"[shorts] Skipping {candidate_id}: {exc}")
             results.append(
@@ -777,9 +907,7 @@ def render_shorts_for_run(
             )
             continue
 
-        score = next(
-            (h.score for h in context.highlights if h.candidate_id == candidate_id), None
-        )
+        score = ranking.score_of(candidate_id)
 
         common = dict(
             source_video=context.source_video,
@@ -816,8 +944,8 @@ def render_shorts_for_run(
                         enable_smart_reframe=False, debug_overlay=False, **common
                     )
                     metadata.status = STATUS_FALLBACK
-                    metadata.reframing_fallback = True
-                    metadata.reframing_failure_reason = failure_reason
+                    metadata.render_fallback_used = True
+                    metadata.render_failure_reason = failure_reason
                 except Exception as fallback_exc:
                     failure_reason = f"{failure_reason} | static fallback also failed: {fallback_exc}"
                     logger.error(f"[shorts] Static fallback failed for {candidate_id}: {fallback_exc}")
@@ -841,12 +969,15 @@ def render_shorts_for_run(
                 rank=rank,
                 status=metadata.status,
                 file=metadata.file,
-                reason=metadata.reframing_failure_reason,
+                reason=metadata.render_failure_reason,
             )
         )
 
     manifest = ShortsManifest(
         source_video=str(context.source_video),
+        ranking_source=ranking.name,
+        ranking_origin=ranking.origin,
+        ranking_model=ranking.model,
         width=cfg.shorts_output_width,
         height=cfg.shorts_output_height,
         duration_mode=duration_mode,

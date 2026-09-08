@@ -47,7 +47,10 @@ from freecher_worker.shorts import (
     ASPECT_RATIO,
     AVAILABLE_DURATION_MODES,
     DURATION_MODE_AUTO,
+    RANKING_SOURCE_AUTO,
+    load_run_context,
     render_shorts_for_run,
+    resolve_ranking_source,
 )
 from freecher_worker.multimodal import (
     MultimodalReranker,
@@ -1561,6 +1564,15 @@ def render_short_command(
         "-c",
         help="Candidate ID to turn into a vertical short (e.g. 'cand_037')",
     ),
+    scorer: str = typer.Option(
+        RANKING_SOURCE_AUTO,
+        "--scorer",
+        "-s",
+        help=(
+            "Ranking to render from: auto (final multimodal ranking when present), "
+            "multimodal_v1_1, highlight_v2_1, heuristic_v1, or highlights"
+        ),
+    ),
     duration_mode: str = typer.Option(
         DURATION_MODE_AUTO,
         "--duration-mode",
@@ -1592,6 +1604,7 @@ def render_short_command(
         run_arg=run_arg,
         candidate_ids=[candidate],
         top=1,
+        scorer=scorer,
         duration_mode=duration_mode,
         encoder=encoder,
         no_reframe=no_reframe,
@@ -1611,6 +1624,15 @@ def render_shorts_command(
         "--top",
         "-n",
         help="How many top-ranked candidates to turn into shorts",
+    ),
+    scorer: str = typer.Option(
+        RANKING_SOURCE_AUTO,
+        "--scorer",
+        "-s",
+        help=(
+            "Ranking to render from: auto (final multimodal ranking when present), "
+            "multimodal_v1_1, highlight_v2_1, heuristic_v1, or highlights"
+        ),
     ),
     duration_mode: str = typer.Option(
         DURATION_MODE_AUTO,
@@ -1643,6 +1665,7 @@ def render_shorts_command(
         run_arg=run_arg,
         candidate_ids=None,
         top=top,
+        scorer=scorer,
         duration_mode=duration_mode,
         encoder=encoder,
         no_reframe=no_reframe,
@@ -1655,6 +1678,7 @@ def _render_shorts_cli(
     run_arg: str,
     candidate_ids: Optional[list[str]],
     top: int,
+    scorer: str,
     duration_mode: str,
     encoder: str,
     no_reframe: bool,
@@ -1685,16 +1709,48 @@ def _render_shorts_cli(
                   f"max {settings.subclip_max_duration_sec:g}s)")
     console.print(f"Reframing:       [bold]{'Static center crop' if no_reframe else 'Smart subject tracking'}[/bold]")
     console.print(f"Audio Loudnorm:  [bold]{'Disabled' if no_loudnorm else 'Enabled (EBU R128)'}[/bold]")
+    try:
+        context = load_run_context(run_dir)
+        ranking = resolve_ranking_source(context, scorer)
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(f"Ranking source:  [bold cyan]{ranking.name}[/bold cyan] ({ranking.origin})")
+    if ranking.model:
+        console.print(f"Ranking model:   [bold]{ranking.model}[/bold]")
+    available = context.available_rankings()
+    if len(available) > 1:
+        console.print(f"Also available:  [dim]{', '.join(n for n in available if n != ranking.name)}[/dim]")
+
+    preview = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE)
+    preview.add_column("Model Rank", width=11, justify="right")
+    preview.add_column("Candidate ID", width=14)
+    preview.add_column("Model Score", width=12, justify="right")
+
+    ordered = sorted(ranking.candidates, key=lambda c: c.rank)
+    selected = (
+        [c for c in ordered if c.candidate_id in candidate_ids] if candidate_ids else ordered[:top]
+    )
+    for entry in selected:
+        preview.add_row(
+            f"#{entry.rank}",
+            entry.candidate_id,
+            f"{entry.score:.1f}" if entry.score is not None else "-",
+        )
+    console.print(preview)
     if candidate_ids:
-        console.print(f"Candidate:       [bold]{', '.join(candidate_ids)}[/bold]\n")
-    else:
-        console.print(f"Top Candidates:  [bold]{top}[/bold]\n")
+        missing = [c for c in candidate_ids if ranking.rank_of(c) is None]
+        if missing:
+            console.print(f"[yellow]Not ranked by {ranking.name}:[/yellow] {', '.join(missing)}")
+    console.print()
 
     try:
         manifest = render_shorts_for_run(
             run_dir=run_dir,
             candidate_ids=candidate_ids,
             top=top,
+            scorer=scorer,
             duration_mode=duration_mode,
             settings=settings,
             enable_smart_reframe=not no_reframe,
@@ -1778,40 +1834,59 @@ def _render_shorts_cli(
         if item.advisory_interpretation:
             lines.append(f"[bold]advisory_region:[/bold] {item.advisory_interpretation}")
         if reframe:
+            det_colour = "green" if reframe.detection_coverage >= 0.5 else (
+                "yellow" if reframe.detection_coverage > 0 else "red"
+            )
             lines.append("")
             lines.append(
-                f"[bold]detections:[/bold] {reframe.detected_subjects_total}"
-                f"   [bold]detection_coverage:[/bold] {reframe.detection_coverage:.0%}"
-                f"   [bold]track_count:[/bold] {reframe.unique_tracks}"
+                f"[bold]detector:[/bold] {reframe.detector_description}"
+                + ("" if reframe.detector_operational else "  [red](NOT OPERATIONAL)[/red]")
+            )
+            lines.append(
+                f"[bold]analyzed_frames:[/bold] {reframe.analyzed_frames}"
+                f"   [bold]frames_with_face:[/bold] {reframe.frames_with_face}"
+                f"   [bold]frames_with_person:[/bold] {reframe.frames_with_person}"
+                f"   [bold]detections:[/bold] {reframe.detected_subjects_total}"
+            )
+            lines.append(
+                f"[bold]detection_coverage:[/bold] "
+                f"[{det_colour}]{reframe.detection_coverage:.0%}[/{det_colour}]"
                 f"   [bold]tracking_coverage:[/bold] {reframe.tracking_coverage:.0%}"
+                f"   [bold]track_count:[/bold] {reframe.track_count}"
+                f"   [bold]active_subject_switches:[/bold] {reframe.active_subject_switches}"
             )
             lines.append(
-                f"[bold]dominant_subject_switches:[/bold] {reframe.dominant_subject_switches}"
-                f"   [bold]dual_subject_frames:[/bold] {reframe.dual_subject_frames}"
+                f"[bold]dual_subject_frames:[/bold] {reframe.dual_subject_frames}"
                 f"   [bold]scene_cuts:[/bold] {reframe.scene_cuts}"
+                f"   [bold]tracking_mode:[/bold] {reframe.tracking_mode}"
             )
             lines.append(
-                f"[bold]fallback_previous:[/bold] {reframe.fallback_previous_frames}"
-                f"   [bold]fallback_dominant:[/bold] {reframe.fallback_dominant_frames}"
-                f"   [bold]fallback_center:[/bold] {reframe.fallback_center_frames}"
-                f"   [bold]fallback_rate:[/bold] {reframe.fallback_rate:.0%}"
+                f"[bold]tracking_fallback_rate:[/bold] {reframe.tracking_fallback_rate:.0%}"
+                f"   [bold]previous:[/bold] {reframe.previous_fallback_rate:.0%}"
+                f"   [bold]dominant_fallback_rate:[/bold] {reframe.dominant_fallback_rate:.0%}"
+                f"   [bold]center_fallback_rate:[/bold] {reframe.center_fallback_rate:.0%}"
             )
             traj = reframe.trajectory
             lines.append(
                 f"[bold]crop_x:[/bold] {traj.crop_x_min}-{traj.crop_x_max}"
                 f"   [bold]crop_y:[/bold] {traj.crop_y_min}-{traj.crop_y_max}"
-                f"   [bold]peak_crop_velocity:[/bold] {traj.max_velocity_px_per_sec:.1f}px/s"
             )
-        fallback_colour = "yellow" if item.reframing_fallback else "green"
+            lines.append(
+                f"[bold]peak_crop_velocity:[/bold] {traj.max_velocity_px_per_sec:.1f}px/s"
+                f"   [bold]peak_velocity_non_scene_cut:[/bold] "
+                f"{traj.peak_velocity_non_scene_cut:.1f}px/s"
+                f"   [bold]scene_cut_snaps:[/bold] {traj.scene_cut_snaps}"
+            )
+        fallback_colour = "yellow" if item.render_fallback_used else "green"
         lines.append("")
         lines.append(
             f"[bold]crop_driver:[/bold] {item.crop_driver} "
             f"({item.crop_keyframes}/{item.crop_keyframes_available} keyframes)"
-            f"   [bold]reframing_fallback:[/bold] "
-            f"[{fallback_colour}]{str(item.reframing_fallback).lower()}[/{fallback_colour}]"
+            f"   [bold]render_fallback_used:[/bold] "
+            f"[{fallback_colour}]{str(item.render_fallback_used).lower()}[/{fallback_colour}]"
         )
-        if item.reframing_failure_reason:
-            lines.append(f"[bold]reframing_failure_reason:[/bold] [yellow]{item.reframing_failure_reason}[/yellow]")
+        if item.render_failure_reason:
+            lines.append(f"[bold]render_failure_reason:[/bold] [yellow]{item.render_failure_reason}[/yellow]")
         lines.append(
             f"[bold]render_time:[/bold] {item.timings.get('render_seconds', 0.0):.1f}s"
             f"   [bold]reframe_analysis:[/bold] {item.timings.get('reframe_analysis_seconds', 0.0):.1f}s"
@@ -1823,7 +1898,7 @@ def _render_shorts_cli(
         console.print(Panel(
             "\n".join(lines),
             title=f"{item.file} ({item.candidate_id})",
-            border_style="cyan" if not item.reframing_fallback else "yellow",
+            border_style="cyan" if not item.render_fallback_used else "yellow",
         ))
 
     produced = len(manifest.shorts)

@@ -220,10 +220,9 @@ def test_run_context_exposes_candidates_ranking_and_advisory(tmp_path):
     assert set(context.candidates) == {"cand_037", "cand_038"}
     assert [h.candidate_id for h in context.highlights] == ["cand_037", "cand_038"]
     assert context.advisory_regions["cand_037"]["end_offset"] == 26.0
-    assert select_ranked_candidates(context, top=1) == ["cand_037"]
+    assert select_ranked_candidates(context, top=1)[0] == ["cand_037"]
 
-    timeframe, rank = resolve_timeframe(context, "cand_037")
-    assert rank == 1
+    timeframe = resolve_timeframe(context, "cand_037")
     assert timeframe.source_start_sec == CANDIDATE_START
     assert timeframe.duration_sec == pytest.approx(60.0)
 
@@ -244,7 +243,7 @@ def test_unknown_candidate_is_reported_clearly(tmp_path):
 def test_render_short_produces_a_valid_1080x1920_mp4(tmp_path):
     run_dir = build_run(tmp_path)
     context = load_run_context(run_dir)
-    timeframe, _ = resolve_timeframe(context, "cand_037")
+    timeframe = resolve_timeframe(context, "cand_037")
     output = run_dir / "shorts" / "short_cand_037.mp4"
 
     metadata = render_short(
@@ -521,7 +520,7 @@ def test_single_render_cannot_overwrite_a_batch_result(tmp_path):
 def test_render_refuses_to_overwrite_another_candidates_output(tmp_path):
     run_dir = build_run(tmp_path)
     context = load_run_context(run_dir)
-    timeframe, _ = resolve_timeframe(context, "cand_037")
+    timeframe = resolve_timeframe(context, "cand_037")
     output = run_dir / "shorts" / "short_01_cand_037.mp4"
 
     render_short(
@@ -532,7 +531,7 @@ def test_render_refuses_to_overwrite_another_candidates_output(tmp_path):
     )
     (output.with_suffix(".json")).write_text(json.dumps({"candidate_id": "cand_037"}))
 
-    other, _ = resolve_timeframe(context, "cand_038")
+    other = resolve_timeframe(context, "cand_038")
     with pytest.raises(FileExistsError, match="cand_037"):
         render_short(
             source_video=context.source_video, timeframe=other, output_path=output,
@@ -547,7 +546,7 @@ def test_failed_render_leaves_no_zero_byte_file(tmp_path, monkeypatch):
     """A failing FFmpeg must not leave `short_03.mp4 = 0 bytes` looking like a valid short."""
     run_dir = build_run(tmp_path)
     context = load_run_context(run_dir)
-    timeframe, _ = resolve_timeframe(context, "cand_037")
+    timeframe = resolve_timeframe(context, "cand_037")
     output = run_dir / "shorts" / "short_cand_037.mp4"
 
     def always_fails(cmd, timeout=1800.0):
@@ -577,7 +576,7 @@ def test_output_appears_atomically(tmp_path, monkeypatch):
     """The final path must never exist while FFmpeg is still writing."""
     run_dir = build_run(tmp_path)
     context = load_run_context(run_dir)
-    timeframe, _ = resolve_timeframe(context, "cand_037")
+    timeframe = resolve_timeframe(context, "cand_037")
     output = run_dir / "shorts" / "short_cand_037.mp4"
 
     real = subprocess.run
@@ -605,7 +604,7 @@ def test_dynamic_crop_failure_falls_back_to_static_within_the_same_render(tmp_pa
     """A dynamic-crop FFmpeg failure must yield a static-crop short, not lose the short."""
     run_dir = build_run(tmp_path)
     context = load_run_context(run_dir)
-    timeframe, _ = resolve_timeframe(context, "cand_037")
+    timeframe = resolve_timeframe(context, "cand_037")
     output = run_dir / "shorts" / "short_cand_037.mp4"
 
     real = subprocess.run
@@ -628,9 +627,9 @@ def test_dynamic_crop_failure_falls_back_to_static_within_the_same_render(tmp_pa
         enable_audio_normalization=False, encoder=ENCODER_X264,
     )
 
-    assert metadata.reframing_fallback is True
+    assert metadata.render_fallback_used is True
     assert metadata.status == "fallback"
-    assert "Invalid argument" in (metadata.reframing_failure_reason or "")
+    assert "Invalid argument" in (metadata.render_failure_reason or "")
     assert metadata.crop_driver == "static"
     video = next(s for s in probe(output)["streams"] if s["codec_type"] == "video")
     assert (video["width"], video["height"]) == (1080, 1920)
@@ -724,4 +723,4 @@ def test_metadata_records_the_crop_driver_and_trajectory_report(tmp_path):
     assert 0 <= report.min_x <= report.max_x <= report.max_x_allowed
     assert item.reframe.detection_coverage <= 1.0
     assert item.reframe.tracking_coverage <= 1.0
-    assert item.reframe.fallback_rate <= 1.0
+    assert item.reframe.tracking_fallback_rate <= 1.0

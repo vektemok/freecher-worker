@@ -44,6 +44,11 @@ from .render import (
     ENCODER_NVENC,
     ENCODER_X264,
     SHORTS_PIPELINE_VERSION,
+    RANKING_SOURCE_AUTO,
+    RANKING_SOURCE_HIGHLIGHTS,
+    SCORER_PREFERENCE,
+    RankedCandidate,
+    RankingSource,
     RunContext,
     ShortMetadata,
     ShortResult,
@@ -52,6 +57,7 @@ from .render import (
     escape_filtergraph_value,
     load_run_context,
     resolve_crop_driver,
+    resolve_ranking_source,
     short_stem,
     reframe_config_from_settings,
     render_short,
@@ -95,6 +101,12 @@ from .timeframe import (
 )
 
 __all__ = [
+    "resolve_ranking_source",
+    "RankingSource",
+    "RankedCandidate",
+    "SCORER_PREFERENCE",
+    "RANKING_SOURCE_HIGHLIGHTS",
+    "RANKING_SOURCE_AUTO",
     "CROP_DRIVER_EXPRESSION",
     "CROP_DRIVER_SENDCMD",
     "CROP_DRIVER_STATIC",

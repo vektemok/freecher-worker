@@ -134,8 +134,18 @@ class Settings(BaseSettings):
 
     # Phase 3 — Smart 9:16 Reframing
     reframe_analysis_fps: float = Field(default=5.0, description="Frame sampling rate for detection and tracking")
-    reframe_detector: str = Field(default="haar", description="Subject detector implementation name")
-    reframe_detect_max_width: int = Field(default=640, description="Frames downscaled to this width before detection")
+    reframe_detector: str = Field(
+        default="auto",
+        description="Subject detector: auto (YuNet, then legacy) | yunet | haar | center",
+    )
+    reframe_detect_max_width: int = Field(default=960, description="Frames downscaled to this width before detection")
+    reframe_face_score_threshold: float = Field(default=0.6, description="Minimum YuNet face confidence")
+    reframe_face_model_path: Optional[Path] = Field(
+        default=None, description="Explicit path to the YuNet ONNX weights (or their directory)"
+    )
+    reframe_allow_model_download: bool = Field(
+        default=True, description="Allow downloading detector weights into the local model cache"
+    )
     reframe_subject_padding_ratio: float = Field(default=0.55, description="Padding around subject box as a ratio of its width")
     reframe_head_position_ratio: float = Field(default=0.38, description="Vertical position of the face inside the crop (0=top)")
     reframe_headroom_ratio: float = Field(default=0.45, description="Minimum headroom above the face as a ratio of face height")

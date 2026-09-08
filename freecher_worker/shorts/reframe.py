@@ -38,6 +38,11 @@ REFRAME_VERSION = "smart_reframe_v1"
 REFRAME_MODE_SMART = "smart"
 REFRAME_MODE_CENTER = "center"
 
+TRACKING_MODE_SUBJECT = "subject"
+TRACKING_MODE_MIXED = "mixed"
+TRACKING_MODE_DOMINANT = "dominant_region"
+TRACKING_MODE_CENTER = "center"
+
 FALLBACK_NONE = "subject"
 FALLBACK_DUAL = "dual_subject"
 FALLBACK_PREVIOUS = "previous_stable"
@@ -49,7 +54,10 @@ class ReframeConfig(BaseModel):
     """Tunable parameters for detection, subject arbitration, framing and smoothing."""
 
     analysis_fps: float = Field(default=5.0, gt=0.0)
-    detect_max_width: int = Field(default=640, gt=0)
+    detect_max_width: int = Field(default=960, gt=0)
+    face_score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    face_model_path: Optional[str] = Field(default=None)
+    allow_model_download: bool = Field(default=True)
     subject_padding_ratio: float = Field(default=0.55, ge=0.0)
     head_position_ratio: float = Field(default=0.38, ge=0.0, le=1.0)
     headroom_ratio: float = Field(default=0.45, ge=0.0)
@@ -62,6 +70,13 @@ class ReframeConfig(BaseModel):
     switch_margin: float = Field(default=0.25, ge=0.0)
     min_switch_interval_sec: float = Field(default=1.5, ge=0.0)
     track_max_misses: int = Field(default=6, ge=0)
+    track_match_iou: float = Field(default=0.15, ge=0.0, le=1.0)
+    track_max_motion_px_per_sec: float = Field(
+        default=600.0, gt=0.0, description="How far a subject may plausibly move between samples"
+    )
+    track_min_reach_px: float = Field(
+        default=28.0, ge=0.0, description="Association floor, so small subjects stay trackable"
+    )
     scene_cut_threshold: float = Field(default=0.35, gt=0.0)
     dual_subject_balance: float = Field(default=0.35, ge=0.0, le=1.0)
     jitter_epsilon_px: float = Field(default=2.0, ge=0.0)
@@ -72,6 +87,11 @@ class TrajectoryStats(BaseModel):
 
     mean_velocity_px_per_sec: float = 0.0
     max_velocity_px_per_sec: float = 0.0
+    peak_velocity_non_scene_cut: float = Field(
+        default=0.0,
+        description="Peak pan velocity excluding scene-cut re-anchors, which are allowed to jump",
+    )
+    scene_cut_snaps: int = Field(default=0, description="Transitions that re-anchored on a scene cut")
     total_travel_px: float = 0.0
     stationary_ratio: float = Field(default=1.0, description="Fraction of samples with no crop movement")
     crop_x_min: int = 0
@@ -86,9 +106,13 @@ class ReframeDiagnostics(BaseModel):
 
     version: str = REFRAME_VERSION
     detector: str = ""
+    detector_description: str = ""
+    detector_operational: bool = True
     analysis_fps: float = 0.0
     sampled_frames: int = 0
     frames_with_detection: int = 0
+    frames_with_face: int = 0
+    frames_with_person: int = 0
     frames_with_active_subject: int = 0
     detected_subjects_total: int = 0
     max_simultaneous_subjects: int = 0
@@ -99,32 +123,94 @@ class ReframeDiagnostics(BaseModel):
     fallback_previous_frames: int = 0
     fallback_dominant_frames: int = 0
     fallback_center_frames: int = 0
-    fallback_used: bool = False
+    fallback_used: bool = Field(
+        default=False, description="Any tracking fallback rung was used (not a render failure)"
+    )
+    tracking_mode: str = Field(
+        default=TRACKING_MODE_SUBJECT,
+        description="subject | mixed | dominant_region | center - how framing was actually driven",
+    )
     edge_clamped_frames: int = 0
     analysis_seconds: float = 0.0
     trajectory: TrajectoryStats = Field(default_factory=TrajectoryStats)
 
+    def _rate(self, count: int) -> float:
+        return round(count / self.sampled_frames, 4) if self.sampled_frames else 0.0
+
+    @property
+    def analyzed_frames(self) -> int:
+        """Frames actually sampled and analyzed."""
+        return self.sampled_frames
+
+    @property
+    def track_count(self) -> int:
+        """Distinct subjects tracked across the clip."""
+        return self.unique_tracks
+
+    @property
+    def active_subject_switches(self) -> int:
+        """Times the active subject changed."""
+        return self.dominant_subject_switches
+
     @property
     def detection_coverage(self) -> float:
-        """Fraction of sampled frames in which the detector found at least one subject."""
-        return round(self.frames_with_detection / self.sampled_frames, 4) if self.sampled_frames else 0.0
+        """Fraction of analyzed frames in which the detector found at least one subject."""
+        return self._rate(self.frames_with_detection)
+
+    @property
+    def face_coverage(self) -> float:
+        """Fraction of analyzed frames containing at least one detected face."""
+        return self._rate(self.frames_with_face)
+
+    @property
+    def person_coverage(self) -> float:
+        """Fraction of analyzed frames containing at least one detected person."""
+        return self._rate(self.frames_with_person)
 
     @property
     def tracking_coverage(self) -> float:
-        """Fraction of sampled frames framed from a tracked subject rather than a fallback."""
-        return (
-            round(self.frames_with_active_subject / self.sampled_frames, 4) if self.sampled_frames else 0.0
-        )
+        """Fraction of analyzed frames framed from a tracked subject rather than a fallback."""
+        return self._rate(self.frames_with_active_subject)
 
     @property
-    def fallback_rate(self) -> float:
-        """Fraction of sampled frames that used any rung of the fallback ladder."""
-        used = (
+    def tracking_fallback_rate(self) -> float:
+        """Fraction of analyzed frames framed by any rung of the tracking fallback ladder.
+
+        This says nothing about whether the render succeeded: a clip can be reframed entirely
+        from the dominant-region fallback and still be rendered by the dynamic crop driver.
+        """
+        return self._rate(
             self.fallback_previous_frames
             + self.fallback_dominant_frames
             + self.fallback_center_frames
         )
-        return round(used / self.sampled_frames, 4) if self.sampled_frames else 0.0
+
+    @property
+    def previous_fallback_rate(self) -> float:
+        """Fraction of analyzed frames that held the last known subject framing."""
+        return self._rate(self.fallback_previous_frames)
+
+    @property
+    def dominant_fallback_rate(self) -> float:
+        """Fraction of analyzed frames framed on the dominant visual region."""
+        return self._rate(self.fallback_dominant_frames)
+
+    @property
+    def center_fallback_rate(self) -> float:
+        """Fraction of analyzed frames that fell all the way back to a center crop."""
+        return self._rate(self.fallback_center_frames)
+
+    def resolve_tracking_mode(self) -> str:
+        """Classify how the framing was actually driven across the clip."""
+        if not self.sampled_frames:
+            return TRACKING_MODE_CENTER
+        if self.frames_with_active_subject == self.sampled_frames:
+            return TRACKING_MODE_SUBJECT
+        if self.frames_with_active_subject > 0:
+            return TRACKING_MODE_MIXED
+        if self.fallback_dominant_frames > 0:
+            return TRACKING_MODE_DOMINANT
+        return TRACKING_MODE_CENTER
 
 
 class DebugSample(BaseModel):
@@ -133,6 +219,7 @@ class DebugSample(BaseModel):
     time: float
     boxes: List[Tuple[int, int, int, int]] = Field(default_factory=list)
     track_ids: List[int] = Field(default_factory=list)
+    subject_types: List[str] = Field(default_factory=list)
     active_track_id: Optional[int] = None
     target_x: float = 0.0
     target_y: float = 0.0
@@ -202,24 +289,49 @@ def _iou(a: Sequence[int], b: Sequence[int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _association_reach(
+    track: SubjectTrack,
+    subject: DetectedSubject,
+    dt: float,
+    cfg: ReframeConfig,
+) -> float:
+    """How far apart a track and a detection may be and still be the same subject.
+
+    Gating on box size alone breaks down for small, fast subjects: a 20 px facecam moving 16 px
+    between samples overlaps its previous box by almost nothing, so it would be re-identified as
+    a brand-new person on every single frame. The gate therefore also allows for plausible motion
+    over the elapsed time, with an absolute floor.
+    """
+    size_reach = 0.6 * max(track.box[2], subject.box[2], 1)
+    motion_reach = cfg.track_max_motion_px_per_sec * max(dt, 1e-3)
+    return max(size_reach, motion_reach, cfg.track_min_reach_px)
+
+
 def _associate(
     tracks: List[SubjectTrack],
     subjects: List[DetectedSubject],
     timestamp: float,
     next_track_id: int,
+    dt: float = 0.2,
+    cfg: Optional[ReframeConfig] = None,
 ) -> Tuple[List[SubjectTrack], List[Tuple[SubjectTrack, DetectedSubject]], int]:
-    """Greedy IoU/distance association of detections to existing tracks."""
+    """Greedy association of detections to existing tracks by overlap and proximity."""
+    config = cfg or ReframeConfig()
     pairs: List[Tuple[float, int, int]] = []
     for t_idx, track in enumerate(tracks):
         for s_idx, subject in enumerate(subjects):
             iou = _iou(track.box, subject.box)
-            if iou >= 0.20:
-                pairs.append((-iou, t_idx, s_idx))
+            reach = _association_reach(track, subject, dt, config)
+            distance = math.hypot(
+                track.center_x - subject.center_x, track.center_y - subject.center_y
+            )
+            if iou < config.track_match_iou and distance > reach:
                 continue
-            reach = 0.6 * max(track.box[2], subject.box[2], 1)
-            dist = abs(track.center_x - subject.center_x) + abs(track.center_y - subject.center_y)
-            if dist <= reach:
-                pairs.append((dist / max(reach, 1.0), t_idx, s_idx))
+            # Single blended cost so overlap and proximity stay on one comparable scale.
+            cost = 0.5 * (1.0 - iou) + 0.5 * min(1.0, distance / max(reach, 1.0))
+            if track.subject_type != subject.subject_type:
+                cost += 0.25
+            pairs.append((cost, t_idx, s_idx))
 
     pairs.sort()
     existing_count = len(tracks)
@@ -375,6 +487,7 @@ class _Observation:
     active_track_id: Optional[int]
     boxes: List[Tuple[int, int, int, int]]
     track_ids: List[int]
+    subject_types: List[str]
     edge_clamped: bool
 
 
@@ -439,10 +552,13 @@ def build_center_crop_plan(
         ),
         diagnostics=ReframeDiagnostics(
             detector=detector_name,
+            detector_description="disabled (static center crop)",
+            detector_operational=False,
             analysis_fps=analysis_fps,
             sampled_frames=len(points),
             fallback_center_frames=len(points),
             fallback_used=True,
+            tracking_mode=TRACKING_MODE_CENTER,
             trajectory=TrajectoryStats(
                 crop_x_min=crop_x, crop_x_max=crop_x, crop_y_min=crop_y, crop_y_max=crop_y
             ),
@@ -480,6 +596,7 @@ def _collect_observations(
     pending_since = 0.0
     last_switch = -1e9
     prev_small: Optional[np.ndarray] = None
+    previous_sample_time = -1.0 / max(cfg.analysis_fps, 1e-3)
     last_target: Optional[Tuple[float, float]] = None
     last_subject_target: Optional[Tuple[float, float]] = None
     last_subject_time = -1e9
@@ -502,7 +619,7 @@ def _collect_observations(
             else:
                 diagnostics.fallback_center_frames += 1
             observations.append(
-                _Observation(t_rel, target[0], target[1], fallback, fallback, False, None, [], [], False)
+                _Observation(t_rel, target[0], target[1], fallback, fallback, False, None, [], [], [], False)
             )
             continue
 
@@ -544,8 +661,16 @@ def _collect_observations(
         diagnostics.max_simultaneous_subjects = max(diagnostics.max_simultaneous_subjects, len(subjects))
         if subjects:
             diagnostics.frames_with_detection += 1
+        if any(s.subject_type == "face" for s in subjects):
+            diagnostics.frames_with_face += 1
+        if any(s.subject_type == "person" for s in subjects):
+            diagnostics.frames_with_person += 1
 
-        tracks, matched, next_track_id = _associate(tracks, subjects, t_rel, next_track_id)
+        sample_dt = max(1e-3, t_rel - previous_sample_time)
+        previous_sample_time = t_rel
+        tracks, matched, next_track_id = _associate(
+            tracks, subjects, t_rel, next_track_id, dt=sample_dt, cfg=cfg
+        )
         for track, subject in matched:
             _update_speaking(track, _mouth_patch(small_gray, [int(v * scale) for v in subject.box]))
         tracks = [t for t in tracks if t.misses <= cfg.track_max_misses]
@@ -577,7 +702,7 @@ def _collect_observations(
                     fallback = FALLBACK_CENTER
                     diagnostics.fallback_center_frames += 1
             observations.append(
-                _Observation(t_rel, target_x, target_y, fallback, fallback, scene_cut, None, [], [], False)
+                _Observation(t_rel, target_x, target_y, fallback, fallback, scene_cut, None, [], [], [], False)
             )
             last_target = (target_x, target_y)
             continue
@@ -644,6 +769,7 @@ def _collect_observations(
                         active_id,
                         [t.box for t in live],
                         [t.track_id for t in live],
+                        [t.subject_type for t in live],
                         False,
                     )
                 )
@@ -669,6 +795,7 @@ def _collect_observations(
                 active_id,
                 [t.box for t in live],
                 [t.track_id for t in live],
+                [t.subject_type for t in live],
                 edge_clamped,
             )
         )
@@ -767,18 +894,35 @@ def _smooth(
     return points
 
 
-def _trajectory_stats(points: List[CropPoint]) -> TrajectoryStats:
+def _trajectory_stats(
+    points: List[CropPoint],
+    scene_cuts: Optional[List[bool]] = None,
+) -> TrajectoryStats:
+    """Summarize crop motion, separating deliberate scene-cut re-anchors from panning.
+
+    A scene cut is allowed to move the crop instantly, so its apparent velocity is unbounded and
+    would otherwise dominate the peak. ``peak_velocity_non_scene_cut`` is the number that must
+    respect the configured velocity limit.
+    """
     if not points:
         return TrajectoryStats()
 
+    cuts = scene_cuts or [False] * len(points)
     velocities: List[float] = []
+    smooth_velocities: List[float] = []
     travel = 0.0
     stationary = 0
+    snaps = 0
     for i in range(1, len(points)):
         dt = max(1e-3, points[i].time - points[i - 1].time)
         dx = abs(points[i].crop_x - points[i - 1].crop_x)
         travel += dx
-        velocities.append(dx / dt)
+        velocity = dx / dt
+        velocities.append(velocity)
+        if i < len(cuts) and cuts[i]:
+            snaps += 1
+        else:
+            smooth_velocities.append(velocity)
         if dx == 0:
             stationary += 1
 
@@ -788,6 +932,8 @@ def _trajectory_stats(points: List[CropPoint]) -> TrajectoryStats:
     return TrajectoryStats(
         mean_velocity_px_per_sec=round(sum(velocities) / len(velocities), 3) if velocities else 0.0,
         max_velocity_px_per_sec=round(max(velocities), 3) if velocities else 0.0,
+        peak_velocity_non_scene_cut=round(max(smooth_velocities), 3) if smooth_velocities else 0.0,
+        scene_cut_snaps=snaps,
         total_travel_px=round(travel, 2),
         stationary_ratio=round(stationary / denominator, 4),
         crop_x_min=min(xs),
@@ -845,7 +991,20 @@ def build_reframe_plan(
     diagnostics = ReframeDiagnostics(detector=detector_name, analysis_fps=cfg.analysis_fps)
 
     try:
-        active_detector = detector or get_subject_detector(detector_name)
+        active_detector = detector or get_subject_detector(
+            detector_name,
+            model_path=Path(cfg.face_model_path) if cfg.face_model_path else None,
+            allow_download=cfg.allow_model_download,
+            score_threshold=cfg.face_score_threshold,
+        )
+        diagnostics.detector = getattr(active_detector, "name", detector_name)
+        diagnostics.detector_description = active_detector.describe()
+        diagnostics.detector_operational = active_detector.is_operational
+        if not active_detector.is_operational:
+            logger.error(
+                f"[reframe] Detector '{diagnostics.detector_description}' is not operational on this "
+                f"build; framing will fall back to the dominant visual region"
+            )
         observations = _collect_observations(
             video_path=path,
             start_seconds=source_start_sec,
@@ -872,12 +1031,9 @@ def build_reframe_plan(
         return plan
 
     points = _smooth(observations, crop_w, crop_h, width, height, cfg)
-    diagnostics.fallback_used = (
-        diagnostics.fallback_previous_frames
-        + diagnostics.fallback_dominant_frames
-        + diagnostics.fallback_center_frames
-    ) > 0
-    diagnostics.trajectory = _trajectory_stats(points)
+    diagnostics.fallback_used = diagnostics.tracking_fallback_rate > 0.0
+    diagnostics.tracking_mode = diagnostics.resolve_tracking_mode()
+    diagnostics.trajectory = _trajectory_stats(points, [o.scene_cut for o in observations])
     diagnostics.analysis_seconds = round(time.perf_counter() - started, 3)
 
     debug_samples: List[DebugSample] = []
@@ -888,6 +1044,7 @@ def build_reframe_plan(
                     time=round(obs.time, 3),
                     boxes=obs.boxes,
                     track_ids=obs.track_ids,
+                    subject_types=obs.subject_types,
                     active_track_id=obs.active_track_id,
                     target_x=round(obs.target_x, 2),
                     target_y=round(obs.target_y, 2),
@@ -948,13 +1105,15 @@ def render_debug_overlay(
         if not ok or frame is None:
             continue
 
-        for box, track_id in zip(sample.boxes, sample.track_ids):
+        types = sample.subject_types or ["?"] * len(sample.boxes)
+        for box, track_id, subject_type in zip(sample.boxes, sample.track_ids, types):
             x, y, w, h = box
             is_active = track_id == sample.active_track_id
             color = (0, 255, 0) if is_active else (180, 180, 180)
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3 if is_active else 1)
             cv2.putText(
-                frame, f"#{track_id}", (x, max(14, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+                frame, f"#{track_id} {subject_type}", (x, max(14, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
             )
 
         cv2.rectangle(
@@ -975,8 +1134,20 @@ def render_debug_overlay(
         cv2.drawMarker(
             frame, (int(sample.target_x), int(sample.target_y)), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2
         )
-        label = f"t={sample.time:.2f}s  mode={sample.fallback}" + ("  SCENE CUT" if sample.scene_cut else "")
-        cv2.putText(frame, label, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        tracked = sample.fallback in (FALLBACK_NONE, FALLBACK_DUAL, "face", "person")
+        state = "TRACKED" if tracked else f"FALLBACK:{sample.fallback}"
+        colour = (0, 255, 0) if tracked else (0, 165, 255)
+        cv2.putText(
+            frame,
+            f"t={sample.time:.2f}s  {state}  subjects={len(sample.boxes)}"
+            + (f"  active=#{sample.active_track_id}" if sample.active_track_id is not None else "")
+            + ("  SCENE CUT" if sample.scene_cut else ""),
+            (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, colour, 2,
+        )
+        cv2.putText(
+            frame, f"crop x={sample.crop_x} y={sample.crop_y} {traj.crop_w}x{traj.crop_h}",
+            (16, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2,
+        )
         writer.write(frame)
 
     writer.release()

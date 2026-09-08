@@ -92,6 +92,76 @@ scene cut is allowed to re-anchor instantly.
 Fallback ladder, so a valid 9:16 MP4 is always produced: last stable crop -> dominant visual
 region (column gradient energy) -> static center crop.
 
+### Ranking source
+
+`render-shorts` renders from the **final** ranking in the run. The multimodal reranker is the last
+stage of the ranking pipeline, so `--scorer auto` (the default) prefers it:
+
+```
+multimodal_v1_1 > multimodal_v1 > highlight_v2_1 > highlight_v2 > heuristic_v1 > highlights.json
+```
+
+Note that `highlights.json` holds the *heuristic* pipeline's top-K. Preferring it silently
+rendered the wrong candidates whenever a multimodal pass had reordered them.
+
+Pick a ranking explicitly with `--scorer`:
+
+```bash
+python -m freecher_worker render-shorts RUN --scorer multimodal_v1_1 --top 5
+```
+
+The chosen source, its file, its model and the selected candidates with their model ranks and
+scores are printed before anything is rendered, and recorded in the manifest as
+`ranking_source` / `ranking_origin` / `ranking_model`.
+
+Candidate time windows always come from `candidates.json`, the frozen candidate set, so a
+candidate ranked only by the multimodal pass can still be rendered.
+
+### Subject detection
+
+The production baseline is **YuNet** (OpenCV Zoo, ~230 KB ONNX): CPU-fast and far more reliable
+than Haar cascades, including on the small facecam-sized faces that Haar misses entirely.
+
+Weights resolve in this order, and every download is SHA-256 verified:
+
+1. `FREECHER_REFRAME_FACE_MODEL_PATH` (honoured strictly - never silently substituted)
+2. `$FREECHER_MODELS_DIR` or `~/.cache/freecher-worker/models/`
+3. `<repo>/models/` or `./models/`
+4. download into (2), unless `FREECHER_REFRAME_ALLOW_MODEL_DOWNLOAD=false`
+
+To run fully offline, pre-place `face_detection_yunet_2023mar.onnx` in the models directory.
+
+`--scorer`-style selection also exists for detectors via `FREECHER_REFRAME_DETECTOR`:
+`auto` (YuNet, then legacy), `yunet`, `haar`, `center`.
+
+Haar/HOG remain only as a legacy fallback. They are **not** a production baseline, and on
+`opencv-python-headless` 5.x neither `CascadeClassifier` nor `HOGDescriptor` exists at all - which
+previously made detection silently return nothing on every frame. A detector that cannot work now
+reports `detector_operational: false` and logs an error instead of looking like an empty scene.
+
+### Tracking vs render fallbacks
+
+These are independent and are reported separately:
+
+| Field | Meaning |
+| --- | --- |
+| `render_fallback_used` | the dynamic crop render failed, so a static crop was rendered instead |
+| `render_failure_reason` | why, if it did |
+| `tracking_mode` | `subject` / `mixed` / `dominant_region` / `center` |
+| `tracking_fallback_rate` | fraction of analyzed frames framed by a tracking fallback |
+
+A clip can legitimately be framed entirely from the dominant-region fallback (no people on screen)
+and still be rendered perfectly by the dynamic crop driver: `render_fallback_used=false` with
+`tracking_fallback_rate=1.0`.
+
+Per-short detection diagnostics: `analyzed_frames`, `frames_with_face`, `frames_with_person`,
+`detection_coverage`, `tracking_coverage`, `track_count`, `active_subject_switches`,
+`dominant_fallback_rate`, `center_fallback_rate`.
+
+Crop motion is reported twice: `peak_crop_velocity` includes scene-cut re-anchors, which are
+deliberately allowed to jump, while `peak_velocity_non_scene_cut` is the number that must respect
+the configured velocity limit.
+
 ### Dynamic crop delivery
 
 FFmpeg's expression evaluator caps a single expression at roughly one hundred parsed nodes
