@@ -36,6 +36,39 @@ def simplify_trajectory_points(
     return simplified
 
 
+def fit_points_to_expression_budget(
+    points: List[CropPoint],
+    max_points: int,
+) -> tuple[List[CropPoint], bool]:
+    """Thin a trajectory until it fits a keyframe budget, returning (points, was_reduced).
+
+    FFmpeg caps a single expression at roughly one hundred parsed nodes, so the expression-based
+    crop driver cannot carry an arbitrary number of keyframes. Simplification tolerance is raised
+    until the point count fits; if geometry alone cannot get there, points are decimated evenly so
+    the overall shape of the camera move is preserved rather than its head or tail being cut off.
+
+    This only applies to the fallback driver - `sendcmd` carries every keyframe untouched.
+    """
+    if len(points) <= max_points:
+        return list(points), False
+
+    for tolerance in (2.0, 4.0, 8.0, 16.0, 32.0, 64.0):
+        candidate = simplify_trajectory_points(points, tolerance_px=tolerance, axis="x")
+        candidate = simplify_trajectory_points(candidate, tolerance_px=tolerance, axis="y")
+        if len(candidate) <= max_points:
+            return candidate, True
+
+    step = len(points) / float(max_points - 1)
+    decimated = [points[min(len(points) - 1, int(round(i * step)))] for i in range(max_points - 1)]
+    decimated.append(points[-1])
+
+    deduped: List[CropPoint] = []
+    for point in decimated:
+        if not deduped or point.time > deduped[-1].time:
+            deduped.append(point)
+    return deduped, True
+
+
 def build_ffmpeg_crop_expression(
     trajectory: CropTrajectory,
     axis: str = "x",

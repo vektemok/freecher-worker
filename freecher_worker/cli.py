@@ -1707,82 +1707,128 @@ def _render_shorts_cli(
         raise typer.Exit(code=1)
 
     table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-    table.add_column("File", width=14)
-    table.add_column("Candidate", style="dim", width=13)
-    table.add_column("Candidate Window", width=18)
-    table.add_column("Offsets", width=17)
-    table.add_column("Source Range", width=18)
-    table.add_column("Dur", width=8, justify="right")
-    table.add_column("Reframe", width=9)
-    table.add_column("Switches", width=9, justify="right")
-    table.add_column("Enc", width=10)
-    table.add_column("Valid", width=7)
+    table.add_column("#", width=3, justify="right")
+    table.add_column("Candidate", style="dim", width=11)
+    table.add_column("Status", width=9)
+    table.add_column("Cand Dur", width=9, justify="right")
+    table.add_column("Final Dur", width=10, justify="right")
+    table.add_column("Source Range", width=17)
+    table.add_column("Driver", width=11)
+    table.add_column("Enc", width=9)
+    table.add_column("File")
 
-    for item in manifest.shorts:
-        reframe = item.reframe
+    status_style = {"success": "green", "fallback": "yellow", "failed": "red"}
+    by_candidate = {s.candidate_id: s for s in manifest.shorts}
+
+    for result in manifest.results:
+        item = by_candidate.get(result.candidate_id)
+        colour = status_style.get(result.status, "white")
         table.add_row(
-            item.file,
-            item.candidate_id,
-            f"{_format_timestamp(item.source_start_sec)}-{_format_timestamp(item.source_end_sec)}",
-            f"{item.short_start_offset_sec:.1f}s-{item.short_end_offset_sec:.1f}s",
-            f"{_format_timestamp(item.short_source_start_sec)}-{_format_timestamp(item.short_source_end_sec)}",
-            f"{item.duration_sec:.1f}s",
-            item.reframing_mode,
-            str(reframe.dominant_subject_switches) if reframe else "-",
-            item.encoder,
-            "[green]OK[/green]" if (item.validation and item.validation.valid) else "[red]FAIL[/red]",
+            str(result.index if result.index is not None else "-"),
+            result.candidate_id,
+            f"[{colour}]{result.status.upper()}[/{colour}]",
+            f"{item.candidate_duration_sec:.1f}s" if item else "-",
+            f"{item.duration_sec:.1f}s" if item else "-",
+            (
+                f"{_format_timestamp(item.short_source_start_sec)}-"
+                f"{_format_timestamp(item.short_source_end_sec)}"
+            ) if item else "-",
+            item.crop_driver if item else "-",
+            item.encoder if item else "-",
+            result.file or (result.reason or "")[:40],
         )
 
     console.print(table)
+    console.print(
+        f"\n[bold]Batch:[/bold] {manifest.success_count} success, "
+        f"{manifest.fallback_count} fallback, {manifest.failure_count} failed "
+        f"(of {manifest.requested} requested)\n"
+    )
 
-    for item in manifest.shorts:
+    for result in manifest.results:
+        if result.status == "failed":
+            console.print(Panel(
+                f"[red]{result.reason or 'unknown failure'}[/red]",
+                title=f"FAILED - {result.candidate_id}",
+                border_style="red",
+            ))
+            continue
+
+        item = by_candidate[result.candidate_id]
         reframe = item.reframe
         subclip = item.subclip
         lines = [
-            f"[bold]Candidate duration:[/bold] {item.candidate_duration_sec:.2f}s "
-            f"-> [bold]final duration:[/bold] {item.duration_sec:.2f}s",
-            f"[bold]Selected source range:[/bold] {item.short_source_start_sec:.2f}s - {item.short_source_end_sec:.2f}s",
+            f"[bold]model_rank:[/bold] {item.model_rank if item.model_rank is not None else '-'}"
+            f"   [bold]model_score:[/bold] "
+            f"{f'{item.model_score:.1f}' if item.model_score is not None else '-'}",
+            f"[bold]candidate_duration:[/bold] {item.candidate_duration_sec:.2f}s"
+            f"   [bold]final_duration:[/bold] {item.duration_sec:.2f}s",
+            f"[bold]source_range:[/bold] {item.short_source_start_sec:.2f}s - "
+            f"{item.short_source_end_sec:.2f}s"
+            f"   [bold]offsets:[/bold] {item.short_start_offset_sec:.2f}s - "
+            f"{item.short_end_offset_sec:.2f}s",
         ]
         if subclip:
-            lines.append(f"[bold]Selection:[/bold] {subclip.reason}")
+            lines.append(f"[bold]selection:[/bold] {subclip.reason}")
             lines.append(
-                f"[bold]Signal source:[/bold] {subclip.signal_source}  "
-                f"[bold]windows evaluated:[/bold] {subclip.evaluated_windows}  "
-                f"[bold]score:[/bold] {subclip.score:.1f}"
+                f"[bold]signal:[/bold] {subclip.signal_source}"
+                f"   [bold]windows:[/bold] {subclip.evaluated_windows}"
+                f"   [bold]score:[/bold] {subclip.score:.1f}"
             )
         if item.advisory_interpretation:
-            lines.append(f"[bold]Advisory region:[/bold] {item.advisory_interpretation} - {item.advisory_reason}")
+            lines.append(f"[bold]advisory_region:[/bold] {item.advisory_interpretation}")
         if reframe:
+            lines.append("")
             lines.append(
-                f"[bold]Subjects:[/bold] max {reframe.max_simultaneous_subjects} simultaneous, "
-                f"{reframe.unique_tracks} tracks, {reframe.detected_subjects_total} detections over "
-                f"{reframe.sampled_frames} sampled frames"
+                f"[bold]detections:[/bold] {reframe.detected_subjects_total}"
+                f"   [bold]detection_coverage:[/bold] {reframe.detection_coverage:.0%}"
+                f"   [bold]track_count:[/bold] {reframe.unique_tracks}"
+                f"   [bold]tracking_coverage:[/bold] {reframe.tracking_coverage:.0%}"
             )
             lines.append(
-                f"[bold]Dominant switches:[/bold] {reframe.dominant_subject_switches}  "
-                f"[bold]dual-subject frames:[/bold] {reframe.dual_subject_frames}  "
-                f"[bold]scene cuts:[/bold] {reframe.scene_cuts}"
+                f"[bold]dominant_subject_switches:[/bold] {reframe.dominant_subject_switches}"
+                f"   [bold]dual_subject_frames:[/bold] {reframe.dual_subject_frames}"
+                f"   [bold]scene_cuts:[/bold] {reframe.scene_cuts}"
             )
             lines.append(
-                f"[bold]Crop trajectory:[/bold] range {reframe.trajectory.crop_x_range}px, "
-                f"mean {reframe.trajectory.mean_velocity_px_per_sec:.1f}px/s, "
-                f"peak {reframe.trajectory.max_velocity_px_per_sec:.1f}px/s, "
-                f"stationary {reframe.trajectory.stationary_ratio:.0%}"
+                f"[bold]fallback_previous:[/bold] {reframe.fallback_previous_frames}"
+                f"   [bold]fallback_dominant:[/bold] {reframe.fallback_dominant_frames}"
+                f"   [bold]fallback_center:[/bold] {reframe.fallback_center_frames}"
+                f"   [bold]fallback_rate:[/bold] {reframe.fallback_rate:.0%}"
             )
+            traj = reframe.trajectory
             lines.append(
-                f"[bold]Fallbacks:[/bold] previous={reframe.fallback_previous_frames}, "
-                f"dominant={reframe.fallback_dominant_frames}, center={reframe.fallback_center_frames}"
+                f"[bold]crop_x:[/bold] {traj.crop_x_min}-{traj.crop_x_max}"
+                f"   [bold]crop_y:[/bold] {traj.crop_y_min}-{traj.crop_y_max}"
+                f"   [bold]peak_crop_velocity:[/bold] {traj.max_velocity_px_per_sec:.1f}px/s"
             )
+        fallback_colour = "yellow" if item.reframing_fallback else "green"
+        lines.append("")
         lines.append(
-            f"[bold]Render:[/bold] {item.timings.get('render_seconds', 0.0):.1f}s "
-            f"(refinement {item.timings.get('subclip_refinement_seconds', 0.0):.2f}s, "
-            f"reframe analysis {item.timings.get('reframe_analysis_seconds', 0.0):.1f}s)"
+            f"[bold]crop_driver:[/bold] {item.crop_driver} "
+            f"({item.crop_keyframes}/{item.crop_keyframes_available} keyframes)"
+            f"   [bold]reframing_fallback:[/bold] "
+            f"[{fallback_colour}]{str(item.reframing_fallback).lower()}[/{fallback_colour}]"
+        )
+        if item.reframing_failure_reason:
+            lines.append(f"[bold]reframing_failure_reason:[/bold] [yellow]{item.reframing_failure_reason}[/yellow]")
+        lines.append(
+            f"[bold]render_time:[/bold] {item.timings.get('render_seconds', 0.0):.1f}s"
+            f"   [bold]reframe_analysis:[/bold] {item.timings.get('reframe_analysis_seconds', 0.0):.1f}s"
+            f"   [bold]refinement:[/bold] {item.timings.get('subclip_refinement_seconds', 0.0):.2f}s"
         )
         if item.debug_file:
-            lines.append(f"[bold]Debug overlay:[/bold] {item.debug_file}")
-        console.print(Panel("\n".join(lines), title=f"{item.file} ({item.candidate_id})", border_style="cyan"))
+            lines.append(f"[bold]debug_overlay:[/bold] {item.debug_file}")
 
-    console.print(f"\n[bold green]OK Produced {len(manifest.shorts)} vertical short(s).[/bold green]")
+        console.print(Panel(
+            "\n".join(lines),
+            title=f"{item.file} ({item.candidate_id})",
+            border_style="cyan" if not item.reframing_fallback else "yellow",
+        ))
+
+    produced = len(manifest.shorts)
+    colour = "green" if manifest.failure_count == 0 else "yellow"
+    console.print(f"\n[bold {colour}]Produced {produced} of {manifest.requested} vertical short(s).[/bold {colour}]")
     console.print(f"Output: [bold]{run_dir / 'shorts'}[/bold]")
     console.print(f"Manifest: [bold]{run_dir / 'shorts' / 'shorts_manifest.json'}[/bold]\n")
 

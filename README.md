@@ -92,6 +92,54 @@ scene cut is allowed to re-anchor instantly.
 Fallback ladder, so a valid 9:16 MP4 is always produced: last stable crop -> dominant visual
 region (column gradient energy) -> static center crop.
 
+### Dynamic crop delivery
+
+FFmpeg's expression evaluator caps a single expression at roughly one hundred parsed nodes
+(`av_expr_parse()` starts with `p.stack_index = 100`). A 31-second short sampled at 5 fps produces
+~155 crop keyframes, which exceeds that budget in either a nested `if()` chain or a flat sum, and
+`crop` then fails with `Failed to configure input pad ... Invalid argument`.
+
+The trajectory is therefore delivered with `sendcmd`: one short, independently parsed linear
+expression per keyframe interval. There is no practical keyframe limit and no loss of tracking
+resolution. Two fallbacks follow, in order:
+
+| Driver | When | Keyframes |
+| --- | --- | --- |
+| `sendcmd` | default | all of them |
+| `expression` | build has no `sendcmd` filter | thinned to 45, to stay under the node budget |
+| `static` | trajectory invalid, or a dynamic render fails | 1 |
+
+Before any render, the trajectory is validated and repaired: non-finite points are dropped,
+coordinates are clamped into `[0, source - crop]`, odd offsets are snapped to even (H.264 yuv420p),
+and non-monotonic timestamps are fixed. Geometry that cannot be repaired (crop larger than the
+source) drops straight to the static driver. The full report is logged before FFmpeg is invoked and
+stored in the short's metadata as `trajectory_report`.
+
+### Output files and failure handling
+
+Every short is rendered to `<name>.tmp.mp4`, validated with ffprobe, and only then moved into place
+with an atomic rename, so a failed render never leaves a zero-byte MP4 behind.
+
+Filenames always carry the candidate id, so a single-candidate render can never overwrite a batch
+result:
+
+```
+shorts/short_01_cand_010.mp4          # batch, ranked position 1
+shorts/short_cand_010.mp4             # single --candidate render
+shorts/short_01_cand_010.json
+shorts/short_01_cand_010_crop_trajectory.json
+shorts/short_01_cand_010_crop_commands.txt
+shorts/short_01_cand_010_debug.mp4    # --debug-overlay
+shorts/shorts_manifest.json
+```
+
+A render that writes over an output belonging to a *different* candidate is refused outright.
+
+One failing candidate never aborts a batch. A failed smart render is retried with a static center
+crop; if that also fails the candidate is recorded as failed and the batch continues. The manifest
+carries `success_count`, `fallback_count`, `failure_count` and a per-candidate `results` list with
+`status` (`success` / `fallback` / `failed`) and a reason.
+
 ### CLI
 
 ```bash

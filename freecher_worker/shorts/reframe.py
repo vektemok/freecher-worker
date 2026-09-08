@@ -19,6 +19,7 @@ Steps 4 and 5 are also the fallback ladder: the stage always yields a usable tra
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,7 @@ class ReframeDiagnostics(BaseModel):
     analysis_fps: float = 0.0
     sampled_frames: int = 0
     frames_with_detection: int = 0
+    frames_with_active_subject: int = 0
     detected_subjects_total: int = 0
     max_simultaneous_subjects: int = 0
     unique_tracks: int = 0
@@ -101,6 +103,28 @@ class ReframeDiagnostics(BaseModel):
     edge_clamped_frames: int = 0
     analysis_seconds: float = 0.0
     trajectory: TrajectoryStats = Field(default_factory=TrajectoryStats)
+
+    @property
+    def detection_coverage(self) -> float:
+        """Fraction of sampled frames in which the detector found at least one subject."""
+        return round(self.frames_with_detection / self.sampled_frames, 4) if self.sampled_frames else 0.0
+
+    @property
+    def tracking_coverage(self) -> float:
+        """Fraction of sampled frames framed from a tracked subject rather than a fallback."""
+        return (
+            round(self.frames_with_active_subject / self.sampled_frames, 4) if self.sampled_frames else 0.0
+        )
+
+    @property
+    def fallback_rate(self) -> float:
+        """Fraction of sampled frames that used any rung of the fallback ladder."""
+        used = (
+            self.fallback_previous_frames
+            + self.fallback_dominant_frames
+            + self.fallback_center_frames
+        )
+        return round(used / self.sampled_frames, 4) if self.sampled_frames else 0.0
 
 
 class DebugSample(BaseModel):
@@ -608,6 +632,7 @@ def _collect_observations(
                 target_y = (left.center_y + right.center_y) / 2.0 + crop_h * (0.5 - cfg.head_position_ratio)
                 target_y = min(max(target_y, crop_h / 2.0), source_height - crop_h / 2.0)
                 diagnostics.dual_subject_frames += 1
+                diagnostics.frames_with_active_subject += 1
                 observations.append(
                     _Observation(
                         t_rel,
@@ -631,6 +656,7 @@ def _collect_observations(
         )
         if edge_clamped:
             diagnostics.edge_clamped_frames += 1
+        diagnostics.frames_with_active_subject += 1
 
         observations.append(
             _Observation(
@@ -706,6 +732,12 @@ def _smooth(
                 else:
                     cur_y, vel_y = cur, vel
         prev_t = obs.time
+
+        if not (math.isfinite(cur_x) and math.isfinite(cur_y)):
+            # A non-finite target would poison every later sample; re-anchor at centre instead.
+            logger.warning(f"[reframe] Non-finite crop centre at t={obs.time:.2f}s; re-anchoring")
+            cur_x, cur_y = source_width / 2.0, source_height / 2.0
+            vel_x = vel_y = 0.0
 
         raw_x = int(round(cur_x - crop_w / 2.0))
         raw_y = int(round(cur_y - crop_h / 2.0))

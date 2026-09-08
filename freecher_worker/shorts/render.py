@@ -7,6 +7,7 @@ the output is always 9:16, 1080x1920, H.264 + AAC.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 from datetime import datetime
@@ -16,17 +17,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from freecher_worker.config import Settings, get_settings
-from freecher_worker.crop.expression import build_ffmpeg_crop_expression
 from freecher_worker.highlights.models import CandidateDocument, CandidateWindow, Highlight
 from freecher_worker.media.clipper import is_nvenc_available
 from freecher_worker.media.probe import probe_media
 from freecher_worker.rendering.audio import build_loudnorm_filter, measure_loudness
+from freecher_worker.rendering.renderer import is_ffmpeg_filter_supported
 from freecher_worker.rendering.validator import VideoValidationResult, validate_rendered_video
 from freecher_worker.transcription.models import Transcript
 from freecher_worker.utils.json_io import load_json, save_json
 
 from .reframe import (
     REFRAME_MODE_CENTER,
+    calculate_vertical_crop,
     REFRAME_MODE_SMART,
     ReframeConfig,
     ReframeDiagnostics,
@@ -45,6 +47,16 @@ from .refinement import (
 )
 from .signals import load_signal_curve
 from .timeframe import CandidateTimeframe, interpret_observed_region
+from .trajectory import (
+    CROP_DRIVER_SENDCMD,
+    CROP_DRIVER_STATIC,
+    CropDriverPlan,
+    TrajectoryReport,
+    TrajectoryValidationError,
+    plan_crop_driver,
+    static_center_driver,
+    validate_and_sanitize_trajectory,
+)
 
 logger = logging.getLogger("freecher_worker")
 
@@ -56,6 +68,10 @@ ASPECT_RATIO = "9:16"
 ENCODER_AUTO = "auto"
 ENCODER_X264 = "libx264"
 ENCODER_NVENC = "h264_nvenc"
+
+STATUS_SUCCESS = "success"
+STATUS_FALLBACK = "fallback"
+STATUS_FAILED = "failed"
 
 
 class ShortMetadata(BaseModel):
@@ -82,10 +98,20 @@ class ShortMetadata(BaseModel):
 
     # --- diagnostics -------------------------------------------------------
     pipeline_version: str = SHORTS_PIPELINE_VERSION
+    status: str = STATUS_SUCCESS
     rank: Optional[int] = None
-    index: int = 1
+    model_rank: Optional[int] = Field(default=None, description="Rank assigned by the ranking pipeline")
+    model_score: Optional[float] = Field(default=None, description="Score assigned by the ranking pipeline")
+    index: Optional[int] = 1
     file: str = ""
     debug_file: Optional[str] = None
+    crop_driver: str = Field(default=CROP_DRIVER_STATIC, description="sendcmd | expression | static")
+    crop_keyframes: int = 0
+    crop_keyframes_available: int = 0
+    crop_resolution_reduced: bool = False
+    trajectory_report: Optional[TrajectoryReport] = None
+    reframing_fallback: bool = Field(default=False, description="Dynamic reframing was abandoned")
+    reframing_failure_reason: Optional[str] = None
     encoder: str = ENCODER_X264
     encoder_fallback_used: bool = False
     audio_normalized: bool = False
@@ -96,6 +122,17 @@ class ShortMetadata(BaseModel):
     advisory_reason: Optional[str] = None
     timings: Dict[str, float] = Field(default_factory=dict)
     validation: Optional[VideoValidationResult] = None
+
+
+class ShortResult(BaseModel):
+    """Outcome for a single requested candidate, successful or not."""
+
+    index: Optional[int] = None
+    candidate_id: str
+    rank: Optional[int] = None
+    status: str = Field(description="success | fallback | failed")
+    file: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class ShortsManifest(BaseModel):
@@ -109,6 +146,10 @@ class ShortsManifest(BaseModel):
     height: int = 1920
     duration_mode: str = DURATION_MODE_AUTO
     requested: int = 0
+    success_count: int = 0
+    fallback_count: int = 0
+    failure_count: int = 0
+    results: List[ShortResult] = Field(default_factory=list)
     shorts: List[ShortMetadata] = Field(default_factory=list)
 
 
@@ -182,16 +223,58 @@ def _encoder_args(encoder: str, settings: Settings) -> List[str]:
     ]
 
 
-def build_vertical_filter(plan: ReframePlan, width: int, height: int) -> str:
-    """Build the video filter chain that turns the source into an exact 1080x1920 frame."""
-    traj = plan.trajectory
-    x_expr = build_ffmpeg_crop_expression(traj, axis="x", escape_for_filter=True)
-    y_expr = build_ffmpeg_crop_expression(traj, axis="y", escape_for_filter=True)
-    return (
-        f"crop={traj.crop_w}:{traj.crop_h}:{x_expr}:{y_expr},"
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},setsar=1"
+def escape_filtergraph_value(value: str) -> str:
+    """Escape a literal (such as a file path) for use inside a filtergraph argument."""
+    out = value.replace("\\", "\\\\")
+    for char in ("'", ":", ",", ";", "[", "]", "="):
+        out = out.replace(char, "\\" + char)
+    return out
+
+
+def build_vertical_filter(
+    driver: CropDriverPlan,
+    width: int,
+    height: int,
+    script_path: Optional[Path] = None,
+) -> str:
+    """Build the video filter chain that turns the source into an exact WIDTHxHEIGHT frame.
+
+    The final `scale`+`crop` pair guarantees the declared output size for any source aspect
+    ratio, so the produced file is always exactly 9:16 with no letterboxing.
+    """
+    parts: List[str] = []
+    if driver.driver == CROP_DRIVER_SENDCMD:
+        if script_path is None:
+            raise ValueError("sendcmd driver requires a command script path")
+        parts.append(f"sendcmd=f={escape_filtergraph_value(str(script_path))}")
+
+    parts.append(f"crop={driver.crop_w}:{driver.crop_h}:{driver.x_expr}:{driver.y_expr}")
+    parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase")
+    parts.append(f"crop={width}:{height}")
+    parts.append("setsar=1")
+    return ",".join(parts)
+
+
+def resolve_crop_driver(
+    plan: ReframePlan,
+    sendcmd_available: bool,
+) -> Tuple[CropDriverPlan, TrajectoryReport]:
+    """Validate the trajectory, log its geometry, and choose how to deliver it to FFmpeg."""
+    sanitized, report = validate_and_sanitize_trajectory(plan.trajectory)
+    logger.info(f"[crop-driver] trajectory {report.summary()}")
+    if report.non_finite_dropped or report.out_of_range_clamped or report.odd_coordinates_fixed:
+        logger.warning(
+            f"[crop-driver] trajectory needed repairs before rendering: "
+            f"{report.non_finite_dropped} non-finite dropped, "
+            f"{report.out_of_range_clamped} clamped, "
+            f"{report.odd_coordinates_fixed} snapped to even"
+        )
+    driver = plan_crop_driver(sanitized, sendcmd_available=sendcmd_available)
+    logger.info(
+        f"[crop-driver] using '{driver.driver}' with {driver.keyframes}/{driver.keyframes_available} "
+        f"keyframes: {driver.reason}"
     )
+    return driver, report
 
 
 def _run_ffmpeg(cmd: List[str], timeout: float = 1800.0) -> subprocess.CompletedProcess:
@@ -204,6 +287,45 @@ def _run_ffmpeg(cmd: List[str], timeout: float = 1800.0) -> subprocess.Completed
         timeout=timeout,
         check=False,
     )
+
+
+def short_stem(candidate_id: str, index: Optional[int] = None) -> str:
+    """Collision-safe output stem.
+
+    The candidate id is always part of the filename, so a single-candidate render can never
+    silently land on top of a batch result (and vice versa).
+    """
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in candidate_id)
+    return f"short_{index:02d}_{safe}" if index is not None else f"short_{safe}"
+
+
+def _guard_existing_output(output_path: Path, candidate_id: str) -> None:
+    """Refuse to overwrite an output that belongs to a different candidate."""
+    sidecar = output_path.with_suffix(".json")
+    if sidecar.is_file():
+        try:
+            owner = load_json(sidecar).get("candidate_id")
+        except Exception:
+            owner = None
+        if owner and owner != candidate_id:
+            raise FileExistsError(
+                f"{output_path.name} already belongs to candidate '{owner}'; refusing to overwrite "
+                f"it with '{candidate_id}'"
+            )
+    if output_path.exists():
+        logger.info(f"[shorts] Replacing existing {output_path.name} for {candidate_id}")
+
+
+def _cleanup(*paths: Optional[Path]) -> None:
+    """Remove partial artifacts so a failed render never leaves a zero-byte file behind."""
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:  # pragma: no cover - unlink failures are not worth aborting for
+            logger.warning(f"[shorts] Could not remove {path}: {exc}")
 
 
 def render_short(
@@ -219,15 +341,23 @@ def render_short(
     enable_audio_normalization: bool = True,
     encoder: str = ENCODER_AUTO,
     rank: Optional[int] = None,
-    index: int = 1,
+    model_score: Optional[float] = None,
+    index: Optional[int] = 1,
     debug_overlay: bool = False,
     trajectory_output: Optional[Path] = None,
 ) -> ShortMetadata:
-    """Produce one publication-ready 9:16 short from a ranked candidate window."""
+    """Produce one publication-ready 9:16 short from a ranked candidate.
+
+    The file is rendered to a temporary path and only moved into place after FFmpeg succeeds and
+    ffprobe confirms the result, so a failed render never leaves a zero-byte MP4 behind. If the
+    dynamic crop fails at the FFmpeg stage, the render is retried once with a static center crop
+    rather than losing the short entirely.
+    """
     cfg = settings or get_settings()
     timings: Dict[str, float] = {}
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    _guard_existing_output(output_path, timeframe.candidate_id)
 
     # ---------------------------------------------------------------- stage 1
     t0 = time.perf_counter()
@@ -288,17 +418,39 @@ def render_short(
         )
     timings["reframe_analysis_seconds"] = round(time.perf_counter() - t_reframe, 3)
 
+    reframing_fallback = not enable_smart_reframe
+    reframing_failure_reason: Optional[str] = None
+    trajectory_report: Optional[TrajectoryReport] = None
+
+    try:
+        driver, trajectory_report = resolve_crop_driver(
+            plan, sendcmd_available=is_ffmpeg_filter_supported("sendcmd")
+        )
+    except TrajectoryValidationError as exc:
+        logger.warning(
+            f"[shorts] Crop trajectory for {timeframe.candidate_id} is unusable ({exc}); "
+            f"falling back to a static center crop"
+        )
+        crop_w, crop_h = calculate_vertical_crop(info.width, info.height)
+        driver = static_center_driver(info.width, info.height, crop_w, crop_h)
+        reframing_fallback = True
+        reframing_failure_reason = f"trajectory validation failed: {exc}"
+
     if trajectory_output is not None:
         save_json(plan.trajectory, trajectory_output)
 
     debug_file: Optional[str] = None
-    if debug_overlay:
-        overlay_path = output_path.with_name(f"{output_path.stem}_debug.mp4")
+    if debug_overlay and plan.debug_samples:
+        overlay_tmp = output_path.with_name(f"{output_path.stem}_debug.tmp.mp4")
+        overlay_final = output_path.with_name(f"{output_path.stem}_debug.mp4")
         written = render_debug_overlay(
-            source_video, plan, selection.short_source_start_sec, overlay_path
+            source_video, plan, selection.short_source_start_sec, overlay_tmp
         )
-        if written is not None:
-            debug_file = written.name
+        if written is not None and written.is_file() and written.stat().st_size > 0:
+            os.replace(written, overlay_final)
+            debug_file = overlay_final.name
+        else:
+            _cleanup(overlay_tmp)
 
     # ---------------------------------------------------------------- stage 3
     audio_filter = "anull"
@@ -323,15 +475,20 @@ def render_short(
         timings["audio_analysis_seconds"] = round(time.perf_counter() - t_audio, 3)
 
     width, height = cfg.shorts_output_width, cfg.shorts_output_height
-    filter_complex = (
-        f"[0:v]{build_vertical_filter(plan, width, height)}[v];"
-        f"[0:a]{audio_filter}[a]"
-    )
+    tmp_output = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+    script_path: Optional[Path] = None
+    if driver.script:
+        script_path = output_path.with_name(f"{output_path.stem}_crop_commands.txt")
+        script_path.write_text(driver.script, encoding="utf-8")
 
     chosen_encoder = resolve_encoder(encoder if encoder != ENCODER_AUTO else cfg.shorts_encoder)
-    fallback_used = False
+    encoder_fallback = False
 
-    def _command(enc: str) -> List[str]:
+    def _command(active_driver: CropDriverPlan, enc: str, script: Optional[Path]) -> List[str]:
+        filter_complex = (
+            f"[0:v]{build_vertical_filter(active_driver, width, height, script)}[v];"
+            f"[0:a]{audio_filter}[a]"
+        )
         return [
             "ffmpeg",
             "-nostdin",
@@ -346,32 +503,59 @@ def render_short(
             "-c:a", "aac",
             "-b:a", "192k",
             "-movflags", "+faststart",
-            str(output_path),
+            str(tmp_output),
         ]
 
-    t_render = time.perf_counter()
-    result = _run_ffmpeg(_command(chosen_encoder))
-    if result.returncode != 0 and chosen_encoder != ENCODER_X264:
-        logger.warning(
-            f"[shorts] {chosen_encoder} encode failed; retrying with {ENCODER_X264}. "
-            f"FFmpeg said: {result.stderr.strip()[-400:]}"
+    def _attempt(active_driver: CropDriverPlan, enc: str, script: Optional[Path]):
+        _cleanup(tmp_output)
+        result = _run_ffmpeg(_command(active_driver, enc, script))
+        if result.returncode != 0:
+            _cleanup(tmp_output)
+            return None, result.stderr.strip()[-1500:]
+        validation = validate_rendered_video(
+            video_path=tmp_output,
+            expected_width=width,
+            expected_height=height,
+            expected_duration=selection.duration_sec,
+            strict=False,
         )
-        chosen_encoder = ENCODER_X264
-        fallback_used = True
-        result = _run_ffmpeg(_command(chosen_encoder))
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"FFmpeg failed to render short for {timeframe.candidate_id}: {result.stderr.strip()[-1500:]}"
-        )
-    timings["render_seconds"] = round(time.perf_counter() - t_render, 3)
+        if not validation.valid:
+            _cleanup(tmp_output)
+            return None, f"output failed validation: {validation.error_message}"
+        return validation, None
 
-    validation = validate_rendered_video(
-        video_path=output_path,
-        expected_width=width,
-        expected_height=height,
-        expected_duration=selection.duration_sec,
-        strict=False,
-    )
+    t_render = time.perf_counter()
+    try:
+        validation, error = _attempt(driver, chosen_encoder, script_path)
+
+        if error and chosen_encoder != ENCODER_X264:
+            logger.warning(f"[shorts] {chosen_encoder} encode failed; retrying with libx264: {error}")
+            chosen_encoder = ENCODER_X264
+            encoder_fallback = True
+            validation, error = _attempt(driver, chosen_encoder, script_path)
+
+        if error and driver.driver != CROP_DRIVER_STATIC:
+            logger.warning(
+                f"[shorts] Dynamic crop render failed for {timeframe.candidate_id} "
+                f"(driver={driver.driver}); retrying with a static center crop. FFmpeg said: {error}"
+            )
+            reframing_fallback = True
+            reframing_failure_reason = f"dynamic crop render failed ({driver.driver}): {error}"
+            driver = static_center_driver(info.width, info.height, driver.crop_w, driver.crop_h)
+            _cleanup(script_path)
+            script_path = None
+            validation, error = _attempt(driver, chosen_encoder, None)
+
+        if error:
+            raise RuntimeError(
+                f"FFmpeg failed to render short for {timeframe.candidate_id}: {error}"
+            )
+
+        os.replace(tmp_output, output_path)
+    except Exception:
+        _cleanup(tmp_output)
+        raise
+    timings["render_seconds"] = round(time.perf_counter() - t_render, 3)
 
     metadata = ShortMetadata(
         candidate_id=timeframe.candidate_id,
@@ -384,14 +568,24 @@ def render_short(
         duration_sec=selection.duration_sec,
         width=width,
         height=height,
-        reframing_mode=plan.mode if enable_smart_reframe else REFRAME_MODE_CENTER,
+        reframing_mode=REFRAME_MODE_CENTER if reframing_fallback else plan.mode,
         duration_mode=duration_mode,
+        status=STATUS_FALLBACK if (reframing_fallback and enable_smart_reframe) else STATUS_SUCCESS,
         rank=rank,
+        model_rank=rank,
+        model_score=model_score,
         index=index,
         file=output_path.name,
         debug_file=debug_file,
+        crop_driver=driver.driver,
+        crop_keyframes=driver.keyframes,
+        crop_keyframes_available=driver.keyframes_available,
+        crop_resolution_reduced=driver.resolution_reduced,
+        trajectory_report=trajectory_report,
+        reframing_fallback=reframing_fallback,
+        reframing_failure_reason=reframing_failure_reason,
         encoder=chosen_encoder,
-        encoder_fallback_used=fallback_used,
+        encoder_fallback_used=encoder_fallback,
         audio_normalized=audio_normalized,
         candidate_duration_sec=round(timeframe.duration_sec, 3),
         subclip=selection,
@@ -404,7 +598,8 @@ def render_short(
 
     logger.info(
         f"[shorts] Rendered {output_path.name}: {metadata.duration_sec:.2f}s "
-        f"{width}x{height} via {chosen_encoder}; subjects={plan.diagnostics.max_simultaneous_subjects}, "
+        f"{width}x{height} via {chosen_encoder}/{driver.driver}; "
+        f"subjects={plan.diagnostics.max_simultaneous_subjects}, "
         f"switches={plan.diagnostics.dominant_subject_switches}, "
         f"fallback={'yes' if plan.diagnostics.fallback_used else 'no'}, "
         f"render={timings.get('render_seconds', 0.0):.1f}s"
@@ -547,22 +742,46 @@ def render_shorts_for_run(
     debug_overlay: bool = False,
     output_subdir: str = "shorts",
 ) -> ShortsManifest:
-    """Render one or more 9:16 shorts from an existing run's ranked candidates."""
+    """Render one or more 9:16 shorts from an existing run's ranked candidates.
+
+    A candidate that cannot be rendered is retried with smart reframing disabled and, failing
+    that, recorded as failed. One bad candidate never aborts the rest of the batch.
+    """
     if duration_mode not in AVAILABLE_DURATION_MODES:
         raise ValueError(f"Unknown duration_mode '{duration_mode}'. Available: {AVAILABLE_DURATION_MODES}")
 
     cfg = settings or get_settings()
     context = load_run_context(Path(run_dir))
+    explicit = candidate_ids is not None
     targets = candidate_ids or select_ranked_candidates(context, top)
 
     out_dir = Path(run_dir) / output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     produced: List[ShortMetadata] = []
-    for index, candidate_id in enumerate(targets, start=1):
-        timeframe, rank = resolve_timeframe(context, candidate_id)
-        output_path = out_dir / f"short_{index:02d}.mp4"
-        metadata = render_short(
+    results: List[ShortResult] = []
+
+    for position, candidate_id in enumerate(targets, start=1):
+        # A single-candidate render is not part of a numbered batch, so it gets its own stem
+        # and can never land on top of a batch result.
+        index = None if (explicit and len(targets) == 1) else position
+        stem = short_stem(candidate_id, index)
+        output_path = out_dir / f"{stem}.mp4"
+
+        try:
+            timeframe, rank = resolve_timeframe(context, candidate_id)
+        except Exception as exc:
+            logger.error(f"[shorts] Skipping {candidate_id}: {exc}")
+            results.append(
+                ShortResult(index=index, candidate_id=candidate_id, status=STATUS_FAILED, reason=str(exc))
+            )
+            continue
+
+        score = next(
+            (h.score for h in context.highlights if h.candidate_id == candidate_id), None
+        )
+
+        common = dict(
             source_video=context.source_video,
             timeframe=timeframe,
             output_path=output_path,
@@ -571,16 +790,60 @@ def render_shorts_for_run(
             advisory_region=context.advisory_regions.get(candidate_id),
             duration_mode=duration_mode,
             settings=cfg,
-            enable_smart_reframe=enable_smart_reframe,
             enable_audio_normalization=enable_audio_normalization,
             encoder=encoder,
             rank=rank,
+            model_score=score,
             index=index,
-            debug_overlay=debug_overlay,
-            trajectory_output=out_dir / f"short_{index:02d}_crop_trajectory.json",
+            trajectory_output=out_dir / f"{stem}_crop_trajectory.json",
         )
-        save_json(metadata, out_dir / f"short_{index:02d}.json")
+
+        metadata: Optional[ShortMetadata] = None
+        failure_reason: Optional[str] = None
+        try:
+            metadata = render_short(
+                enable_smart_reframe=enable_smart_reframe,
+                debug_overlay=debug_overlay,
+                **common,
+            )
+        except Exception as exc:
+            failure_reason = str(exc)
+            logger.error(f"[shorts] Smart render failed for {candidate_id}: {exc}")
+            if enable_smart_reframe:
+                logger.info(f"[shorts] Retrying {candidate_id} with a static center crop")
+                try:
+                    metadata = render_short(
+                        enable_smart_reframe=False, debug_overlay=False, **common
+                    )
+                    metadata.status = STATUS_FALLBACK
+                    metadata.reframing_fallback = True
+                    metadata.reframing_failure_reason = failure_reason
+                except Exception as fallback_exc:
+                    failure_reason = f"{failure_reason} | static fallback also failed: {fallback_exc}"
+                    logger.error(f"[shorts] Static fallback failed for {candidate_id}: {fallback_exc}")
+
+        if metadata is None:
+            _cleanup(output_path.with_name(f"{output_path.stem}.tmp.mp4"))
+            results.append(
+                ShortResult(
+                    index=index, candidate_id=candidate_id, rank=rank,
+                    status=STATUS_FAILED, reason=failure_reason,
+                )
+            )
+            continue
+
+        save_json(metadata, out_dir / f"{stem}.json")
         produced.append(metadata)
+        results.append(
+            ShortResult(
+                index=index,
+                candidate_id=candidate_id,
+                rank=rank,
+                status=metadata.status,
+                file=metadata.file,
+                reason=metadata.reframing_failure_reason,
+            )
+        )
 
     manifest = ShortsManifest(
         source_video=str(context.source_video),
@@ -588,8 +851,15 @@ def render_shorts_for_run(
         height=cfg.shorts_output_height,
         duration_mode=duration_mode,
         requested=len(targets),
+        success_count=sum(1 for r in results if r.status == STATUS_SUCCESS),
+        fallback_count=sum(1 for r in results if r.status == STATUS_FALLBACK),
+        failure_count=sum(1 for r in results if r.status == STATUS_FAILED),
+        results=results,
         shorts=produced,
     )
     save_json(manifest, out_dir / "shorts_manifest.json")
-    logger.info(f"[shorts] Wrote {len(produced)} short(s) and manifest to {out_dir}")
+    logger.info(
+        f"[shorts] {manifest.success_count} succeeded, {manifest.fallback_count} used a fallback, "
+        f"{manifest.failure_count} failed. Manifest written to {out_dir / 'shorts_manifest.json'}"
+    )
     return manifest
