@@ -140,6 +140,61 @@ Haar/HOG remain only as a legacy fallback. They are **not** a production baselin
 previously made detection silently return nothing on every frame. A detector that cannot work now
 reports `detector_operational: false` and logs an error instead of looking like an empty scene.
 
+### Subject identity and track continuity
+
+Every layout decision downstream rests on one question: *is this the same person as a moment ago?*
+Getting that wrong does not look like a tracking bug. It looks like an empty room — a clip with
+72% detection coverage, 37 tracks and not one subject that lasts, which the planner can only read
+as "there is nobody to frame here".
+
+Four things keep a physical person on one track id:
+
+**Confirmation.** A new detection starts a *tentative* track. It becomes an identity only after
+`reframe_track_confirm_hits` sightings, and confirmed identities are matched against detections
+before any tentative track is allowed to compete. Real detectors emit single-frame ghosts, and
+without this a ghost that lands near a real subject can capture the detection, drag the identity
+away from the person, and leave the real face to start a new track on the next sample. Only
+confirmed identities are counted, reported, or handed to the layout planner.
+
+**Gap-aware re-attachment.** The elapsed time that governs how far a subject may have moved is
+the gap since *that track* was last seen, not the interval between the last two samples. A subject
+lost for a second is allowed to have moved for a second. Identity lifetime is
+`reframe_track_max_gap_sec` (default 1.6 s) and is expressed in seconds, so it means the same
+thing at any analysis frame rate.
+
+**Refusal to merge.** Recovery is bounded so it never becomes invention: a hard ceiling on the
+re-association distance (`reframe_track_max_reassociation_px`), a box-size ratio gate, and a tiny
+contrast-normalized appearance patch (16x16, CPU-only, no re-identification model and no GPU) that
+has to agree before an identity is allowed to survive a gap. Two people at opposite ends of the
+frame, a close facecam and a distant face, and two subjects crossing each other all stay distinct.
+
+**Scene awareness.** Across a cut the camera moved, not the subject, so motion prediction is
+discarded and a track that was already missing when the shot changed is dropped rather than
+carried into a scene it does not belong to. Disable with `FREECHER_REFRAME_TRACK_SCENE_CUT_RESET=false`.
+
+Persistence is judged **locally**: a subject continuously on screen for
+`layout_persistent_min_continuous_sec` (default 2 s) is a real subject regardless of how long the
+clip is. Requiring a fixed share of the whole clip erased anyone who was not present for most of
+it, which is how a busy 30-second scene reported zero persistent subjects.
+
+Every short carries a continuity report under `reframe.fragmentation`:
+
+| Field | Meaning |
+| --- | --- |
+| `identities` / `raw_candidates` | confirmed subjects vs every track id minted, ghosts included |
+| `fragmentation_ratio` | candidates per identity; `1.0` is perfect continuity |
+| `mean_lifetime_sec` / `median_lifetime_sec` / `longest_lifetime_sec` | how long identities survive |
+| `tracks_under_half_second` / `tracks_under_one_second` | how much of the population is churn |
+| `detections_total` / `detections_per_identity` | roughly, frames per person |
+| `reattachments` | identities recovered after a detection gap |
+| `discarded_tentative` | candidates that never earned an identity |
+| `warning` | set when plentiful detections still produced no stable identity |
+
+The layout plan adds `detections_per_persistent_identity` and a `fragmentation_warning` for the
+same failure one level up: many tracked subjects, none of them usable. A large
+`detections_per_persistent_identity` next to a small `persistent_track_count` means tracking, not
+the scene, is the problem.
+
 ### Tracking vs render fallbacks
 
 These are independent and are reported separately:

@@ -78,6 +78,16 @@ class LayoutConfig(BaseModel):
         default=0.20, ge=0.0, le=1.0, description="Minimum share of the clip a persistent track is visible for"
     )
     persistent_min_hits: int = Field(default=4, ge=1, description="Minimum detections behind a persistent track")
+    persistent_min_continuous_sec: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Unbroken presence that makes a subject meaningful regardless of clip length",
+    )
+    continuity_gap_tolerance_sec: float = Field(
+        default=0.6,
+        ge=0.0,
+        description="A dropout shorter than this does not break a run of continuous presence",
+    )
     significant_min_area_ratio: float = Field(
         default=0.0012, ge=0.0, description="Minimum mean box area as a fraction of the source frame"
     )
@@ -165,9 +175,14 @@ class TrackSummary(BaseModel):
     detection_confidence: float = 0.0
     mean_speaking_score: float = 0.0
     continuity_score: float = 0.0
+    longest_continuous_sec: float = Field(
+        default=0.0,
+        description="Longest unbroken stretch on screen, tolerating dropouts shorter than the gap tolerance",
+    )
     scene_ids: List[int] = Field(default_factory=list)
     persistent: bool = False
     significant: bool = False
+    persistence_reason: str = Field(default="", description="Which rule made this a real subject")
 
     @property
     def importance(self) -> float:
@@ -240,7 +255,16 @@ class LayoutPlan(BaseModel):
     dominant_track_id: Optional[int] = None
     mean_tracking_confidence: float = 0.0
     analysis_windows: int = 0
+    detections_per_persistent_identity: float = Field(
+        default=0.0,
+        description="Detections divided by persistent subjects; a large number here with a small "
+                    "persistent_track_count means tracking, not the scene, is the problem",
+    )
     fallback_reason: Optional[str] = None
+    fragmentation_warning: Optional[str] = Field(
+        default=None,
+        description="Set when the detector was firing but no subject survived long enough to use",
+    )
     tracks: List[TrackSummary] = Field(default_factory=list)
 
     def layout_at(self, time: float) -> str:
@@ -327,6 +351,29 @@ def can_fit_subjects_in_single_vertical_crop(
 # ---------------------------------------------------------------------------
 
 
+def _longest_continuous_run(
+    times: Sequence[float], frame_interval: float, gap_tolerance_sec: float
+) -> float:
+    """Longest unbroken presence, forgiving dropouts shorter than the tolerance.
+
+    A subject is not "gone and back" because the detector missed one frame of them, so a short
+    dropout extends the run rather than ending it.
+    """
+    if not times:
+        return 0.0
+    ordered = sorted(times)
+    step = frame_interval if frame_interval > 0 else 0.0
+    tolerance = gap_tolerance_sec + step + 1e-6
+
+    longest = step
+    start = ordered[0]
+    for previous, current in zip(ordered, ordered[1:]):
+        if (current - previous) > tolerance:
+            start = current
+        longest = max(longest, (current - start) + step)
+    return longest
+
+
 def summarize_tracks(
     frames: Sequence[FrameObservation],
     source_width: int,
@@ -401,11 +448,31 @@ def summarize_tracks(
             else 1.0,
             scene_ids=sorted(set(bucket["scenes"])),
         )
-        summary.persistent = (
+        summary.longest_continuous_sec = round(
+            _longest_continuous_run(times, frame_interval, cfg.continuity_gap_tolerance_sec), 3
+        )
+
+        # Persistence is local, not global. A person who holds the frame for three seconds of a
+        # thirty-second short is a real subject; demanding a fixed share of the whole clip made
+        # every subject in a long clip disappear, which is how a busy scene ended up reported as
+        # having no persistent subjects at all.
+        enough_detections = max(bucket["hits"]) >= cfg.persistent_min_hits
+        continuous = summary.longest_continuous_sec >= cfg.persistent_min_continuous_sec
+        overall = (
             summary.visible_duration >= cfg.persistent_min_visible_sec
             and summary.visibility_ratio >= cfg.persistent_min_visibility_ratio
-            and max(bucket["hits"]) >= cfg.persistent_min_hits
         )
+        summary.persistent = enough_detections and (continuous or overall)
+        if not summary.persistent:
+            summary.persistence_reason = "too brief to be a subject"
+        elif continuous:
+            summary.persistence_reason = (
+                f"continuously present for {summary.longest_continuous_sec:.1f}s"
+            )
+        else:
+            summary.persistence_reason = (
+                f"present for {summary.visibility_ratio:.0%} of the clip"
+            )
         summary.significant = summary.persistent and (area / frame_area) >= cfg.significant_min_area_ratio
         summaries.append(summary)
 
@@ -844,6 +911,8 @@ def build_layout_plan(
 
     detected = [f.mean_confidence for f in frames if f.detected]
     dominant = max(tracks, key=lambda t: (t.importance, -t.track_id), default=None)
+    detections = sum(len(f.tracks) for f in frames)
+    persistent = sum(1 for t in tracks if t.persistent)
 
     plan = LayoutPlan(
         mode_requested=mode,
@@ -853,13 +922,23 @@ def build_layout_plan(
         switch_count=max(0, len(segments) - 1),
         duration_by_mode=durations,
         track_count=len(tracks),
-        persistent_track_count=sum(1 for t in tracks if t.persistent),
+        persistent_track_count=persistent,
         significant_track_count=sum(1 for t in tracks if t.significant),
+        detections_per_persistent_identity=round(detections / persistent, 2) if persistent else 0.0,
         dominant_track_id=dominant.track_id if dominant else None,
         mean_tracking_confidence=round(sum(detected) / len(detected), 4) if detected else 0.0,
         analysis_windows=len(windows),
         tracks=tracks,
     )
+    # The failure this warning exists for: plenty of detections, no usable subject. Without it
+    # the plan is indistinguishable from a clip that genuinely has nobody in it.
+    if detections >= 10 and persistent == 0:
+        plan.fragmentation_warning = (
+            f"{detections} subject detections across {len(frames)} frames produced no persistent "
+            f"subject ({len(tracks)} tracks); every window will fall back to full_frame_context"
+        )
+        logger.warning(f"[layout] {plan.fragmentation_warning}")
+
     logger.info(
         f"[layout] {LAYOUT_VERSION}: {len(segments)} segment(s), {plan.switch_count} switch(es); "
         + ", ".join(f"{k}={v:.1f}s" for k, v in durations.items() if v > 0)

@@ -56,6 +56,9 @@ from .layout_render import (
     supports_named_filter_instances,
 )
 from .reframe import (
+    TRACK_CONFIRMED,
+    TRACK_TENTATIVE,
+    TrackFragmentationReport,
     FALLBACK_CENTER,
     FALLBACK_DOMINANT,
     FALLBACK_DUAL,
@@ -148,6 +151,9 @@ from .timeframe import (
 
 __all__ = [
     "AVAILABLE_LAYOUTS",
+    "TRACK_CONFIRMED",
+    "TRACK_TENTATIVE",
+    "TrackFragmentationReport",
     "AVAILABLE_LAYOUT_MODES",
     "AdaptiveRenderPlan",
     "FrameObservation",
