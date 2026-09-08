@@ -1,4 +1,4 @@
-"""Comparative reranking for contextual_reranker_v1.
+"""Comparative reranking for contextual_reranker_v1_1.
 
 Survivors are ordered by comparing them against each other, never by summing their
 observability numbers. The schedule is O(N log N):
@@ -23,6 +23,7 @@ from .models import (
     EDITORIAL_CLASS_ORDER,
     CandidateContextPackage,
     ComparisonResult,
+    CriticResult,
     EditorialAnalysis,
     ListwiseBatchResult,
 )
@@ -51,6 +52,8 @@ class ComparativeRanking:
     losses: Dict[str, int] = field(default_factory=dict)
     ties: Dict[str, int] = field(default_factory=dict)
     listwise_points: Dict[str, float] = field(default_factory=dict)
+    penalty_adjustments: Dict[str, float] = field(default_factory=dict)
+    adjusted_points: Dict[str, float] = field(default_factory=dict)
     head_to_head: Dict[str, Dict[str, str]] = field(default_factory=dict)
     comparisons: List[ComparisonResult] = field(default_factory=list)
     listwise_batches: List[ListwiseBatchResult] = field(default_factory=list)
@@ -319,6 +322,7 @@ def run_comparative_ranking(
     analyses: Dict[str, EditorialAnalysis],
     provider: Optional[ContextualProvider],
     cache: ContextualCache,
+    critic_results: Optional[Dict[str, CriticResult]] = None,
     mode: str = "full",
     listwise_batch_size: int = DEFAULT_LISTWISE_BATCH_SIZE,
     final_pairwise_top: int = DEFAULT_FINAL_PAIRWISE_TOP,
@@ -334,15 +338,24 @@ def run_comparative_ranking(
     ranking.losses = {cid: 0 for cid in ids}
     ranking.ties = {cid: 0 for cid in ids}
     ranking.listwise_points = {cid: 0.0 for cid in ids}
+    critic_results = critic_results or {}
+    ranking.penalty_adjustments = {
+        cid: (
+            analyses[cid].quality_penalty
+            + (critic_results[cid].penalty if cid in critic_results else 0.0)
+        )
+        / 100.0
+        for cid in ids
+    }
+    ranking.adjusted_points = {cid: ranking.penalty_adjustments[cid] for cid in ids}
     ranking.head_to_head = {cid: {} for cid in ids}
 
     if not ids:
         return ranking
-    if mode == "none" or len(ids) == 1:
-        ranking.ordered_ids = ids
-        return ranking
-
     seed_index = {cid: position for position, cid in enumerate(ids)}
+    if mode == "none" or len(ids) == 1:
+        ranking.ordered_ids = _final_order(ids, ranking, analyses, seed_index)
+        return ranking
 
     # --- Stage A: listwise batches -----------------------------------------------------
     if mode in ("full", "listwise"):
@@ -367,7 +380,7 @@ def run_comparative_ranking(
         standings = sorted(
             ids,
             key=lambda cid: (
-                -ranking.points[cid],
+                -(ranking.points[cid] + ranking.penalty_adjustments[cid]),
                 -ranking.listwise_points[cid],
                 seed_index[cid],
             ),
@@ -399,7 +412,7 @@ def run_comparative_ranking(
         standings = sorted(
             ids,
             key=lambda cid: (
-                -ranking.points[cid],
+                -(ranking.points[cid] + ranking.penalty_adjustments[cid]),
                 -ranking.listwise_points[cid],
                 seed_index[cid],
             ),
@@ -417,6 +430,9 @@ def run_comparative_ranking(
                 _apply_comparison(ranking, result)
 
     ranking.ordered_ids = _final_order(ids, ranking, analyses, seed_index)
+    ranking.adjusted_points = {
+        cid: ranking.points[cid] + ranking.penalty_adjustments[cid] for cid in ids
+    }
     return ranking
 
 
@@ -470,10 +486,11 @@ def _final_order(
     for cid in ids:
         tie_groups.setdefault(ranking.points[cid], []).append(cid)
 
-    def key(cid: str) -> Tuple[float, float, float, int, float, int]:
+    def key(cid: str) -> Tuple[float, float, float, float, int, float, int]:
         analysis = analyses.get(cid)
         group = tie_groups[ranking.points[cid]]
         return (
+            -(ranking.points[cid] + ranking.penalty_adjustments.get(cid, 0.0)),
             -ranking.points[cid],
             -_head_to_head_score(ranking, cid, group),
             -ranking.listwise_points[cid],

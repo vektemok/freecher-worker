@@ -1,4 +1,4 @@
-"""Data models for Contextual Highlight Intelligence / Reranker v3 (contextual_reranker_v1)."""
+"""Data models for Contextual Highlight Intelligence (contextual_reranker_v1_1)."""
 
 from __future__ import annotations
 
@@ -22,15 +22,22 @@ from .versions import (
     RERANKER_VERSION,
 )
 
-EditorialClass = Literal["REJECT", "WEAK", "GOOD", "STRONG"]
+EditorialClass = Literal["FATAL_REJECT", "REJECT", "WEAK", "MAYBE", "GOOD", "STRONG"]
 CriticDecision = Literal["KEEP", "REJECT", "NOT_RUN"]
 ComparisonWinner = Literal["A", "B", "TIE"]
 
 #: Ordering used whenever editorial classes need a deterministic total order.
-EDITORIAL_CLASS_ORDER: Dict[str, int] = {"STRONG": 3, "GOOD": 2, "WEAK": 1, "REJECT": 0}
+EDITORIAL_CLASS_ORDER: Dict[str, int] = {
+    "STRONG": 4,
+    "GOOD": 3,
+    "MAYBE": 2,
+    "WEAK": 1,
+    "REJECT": 0,  # accepted only when reading legacy responses
+    "FATAL_REJECT": 0,
+}
 
 #: Editorial classes that survive the reject filter and reach comparative ranking.
-SURVIVING_CLASSES = ("STRONG", "GOOD", "WEAK")
+SURVIVING_CLASSES = ("STRONG", "GOOD", "MAYBE", "WEAK")
 
 
 # --------------------------------------------------------------------------------------
@@ -232,6 +239,27 @@ class EditorialAnalysis(BaseModel):
     context_dependency: float = Field(default=0.0, ge=0.0, le=1.0)
     dead_air: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    # A source window need not already be a finished Short. These fields answer the
+    # more useful question: whether refinement can extract a worthwhile moment.
+    salvageable: bool = True
+    best_internal_moment_present: bool = False
+    needs_more_setup: bool = False
+    needs_boundary_refinement: bool = False
+    required_setup_seconds_estimate: float = Field(default=0.0, ge=0.0)
+    payoff_inside_candidate: bool = False
+    standalone_after_refinement_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    quality_penalty: float = Field(
+        default=0.0,
+        ge=-100.0,
+        le=0.0,
+        description="Soft editorial/context penalty; never a hard-filter threshold.",
+    )
+    fatal_reject_evidence: List[str] = Field(
+        default_factory=list,
+        description="Concrete evidence that the source window is fundamentally unusable.",
+    )
+    recovered_for_comparison: bool = False
+
     reason_to_watch: Optional[str] = None
     reason_to_skip: Optional[str] = None
     reject_reasons: List[str] = Field(default_factory=list)
@@ -263,12 +291,17 @@ class EditorialAnalysis(BaseModel):
 
 
 class CriticResult(BaseModel):
-    """Verdict of the strict false-positive critic pass."""
+    """Penalty-oriented result of the false-positive critic pass."""
 
     candidate_id: str
     decision: CriticDecision = "KEEP"
     reason: str = Field(default="")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    penalty: float = Field(default=0.0, ge=-100.0, le=0.0)
+    failure_modes: List[str] = Field(default_factory=list)
+    keep_for_comparison: bool = True
+    hard_reject: bool = False
+    fatal_evidence: List[str] = Field(default_factory=list)
     schema_version: str = Field(default=CRITIC_SCHEMA_VERSION)
     prompt_version: Optional[str] = None
     model: Optional[str] = None
@@ -378,11 +411,23 @@ class ContextualRerankItem(BaseModel):
     reject_reasons: List[str] = Field(default_factory=list)
     editorial_confidence: float = 0.0
     editorial_parse_failed: bool = False
+    salvageable: bool = True
+    best_internal_moment_present: bool = False
+    needs_more_setup: bool = False
+    needs_boundary_refinement: bool = False
+    required_setup_seconds_estimate: float = 0.0
+    payoff_inside_candidate: bool = False
+    standalone_after_refinement_probability: float = 0.0
+    editorial_penalty: float = 0.0
+    recovered_for_comparison: bool = False
 
     # Critic stage
     critic_result: CriticDecision = "NOT_RUN"
     critic_reason: Optional[str] = None
     critic_confidence: Optional[float] = None
+    critic_penalty: float = 0.0
+    critic_failure_modes: List[str] = Field(default_factory=list)
+    keep_for_comparison: bool = True
 
     # Comparative stage
     comparison_score: float = Field(default=0.0, description="Swiss tournament points")
@@ -390,6 +435,7 @@ class ContextualRerankItem(BaseModel):
     comparison_losses: int = 0
     comparison_ties: int = 0
     listwise_points: float = 0.0
+    adjusted_comparison_score: float = 0.0
     head_to_head: Dict[str, str] = Field(
         default_factory=dict, description="candidate_id -> WIN/LOSS/TIE from direct comparisons"
     )
@@ -416,6 +462,9 @@ class ContextualRerankDocument(BaseModel):
     retrieval_candidate_count: int = 0
     survivor_count: int = 0
     rejected_count: int = 0
+    comparative_pool_count: int = 0
+    recovered_for_comparison_count: int = 0
+    rejection_distribution_warning: Optional[str] = None
 
     global_context_ref: str = ""
     global_context_file: Optional[str] = None

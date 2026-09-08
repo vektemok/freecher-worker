@@ -33,6 +33,7 @@ from freecher_worker.contextual import (
     parse_critic_response,
     parse_editorial_response,
     parse_json_object,
+    recover_pathological_rejection_distribution,
     run_comparative_ranking,
     run_pairwise_comparison,
     seed_order,
@@ -200,6 +201,8 @@ class FakeProvider(ContextualProvider):
                     "reason_to_watch": None,
                     "reason_to_skip": "Ordinary conversation with no payoff.",
                     "reject_reasons": ["ordinary conversation", "no payoff"],
+                    "salvageable": False,
+                    "fatal_reject_evidence": ["no understandable event or meaningful content"],
                     "confidence": 0.8,
                 }
             index = int(cid.split("_")[-1])
@@ -561,13 +564,15 @@ def test_reject_result_parses_correctly():
             "reason_to_watch": None,
             "reason_to_skip": "Nothing happens.",
             "reject_reasons": ["ordinary conversation", "no payoff"],
+            "salvageable": False,
+            "fatal_reject_evidence": ["no understandable event or meaningful content"],
             "confidence": 0.9,
         },
         "cand_006",
         "m",
         "p",
     )
-    assert analysis.editorial_class == "REJECT"
+    assert analysis.editorial_class == "FATAL_REJECT"
     assert analysis.reject_reasons == ["ordinary conversation", "no payoff"]
     assert analysis.reason_to_watch is None
     assert analysis.confidence == pytest.approx(0.9)
@@ -672,8 +677,9 @@ def test_rejected_candidates_rank_below_every_survivor(tmp_path):
     assert all(item.status == "ranked" for item in top_k), "no rejected candidate may enter Top-K"
     assert all(item.score >= 45.0 for item in top_k)
 
-    critic_rejected = [r for r in rerank_doc.rejected if r.candidate_id == "cand_009"]
-    assert critic_rejected and critic_rejected[0].status == "rejected_critic"
+    critic_demoted = [r for r in rerank_doc.results if r.candidate_id == "cand_009"]
+    assert critic_demoted and critic_demoted[0].critic_penalty == pytest.approx(-30.0)
+    assert critic_demoted[0].keep_for_comparison
 
 
 def test_comparative_winner_is_deterministic_with_cached_responses(tmp_path):
@@ -990,14 +996,16 @@ def test_critic_can_be_disabled(tmp_path):
     assert "cand_002" in {r.candidate_id for r in rerank_doc.results}
 
 
-def test_all_rejected_by_critic_restores_strongest_candidates(tmp_path):
+def test_legacy_binary_critic_rejects_become_penalties(tmp_path):
     run_dir = build_run(tmp_path)
     all_ids = {f"cand_{i:03d}" for i in range(1, CANDIDATE_COUNT + 1)}
     reranker = ContextualReranker(provider=FakeProvider(critic_reject_ids=all_ids))
     _, rerank_doc = reranker.rerank_run(run_dir)
 
-    assert rerank_doc.results, "the ranking must never be empty"
-    assert reranker.warnings and "restored" in reranker.warnings[0]
+    assert len(rerank_doc.results) == CANDIDATE_COUNT
+    assert not rerank_doc.rejected
+    assert all(item.critic_penalty == pytest.approx(-30.0) for item in rerank_doc.results)
+    assert all(item.keep_for_comparison for item in rerank_doc.results)
 
 
 def test_human_labels_never_reach_the_provider(tmp_path):
@@ -1063,7 +1071,7 @@ def test_editorial_metrics_report_reject_and_strong_precision(tmp_path):
     metrics = compute_editorial_metrics(eval_doc, pred_doc)
     assert metrics.reject_precision == pytest.approx(1.0)
     assert metrics.strong_precision == pytest.approx(1.0)
-    assert metrics.class_distribution["REJECT"] == 2
+    assert metrics.class_distribution["FATAL_REJECT"] == 2
     assert metrics.class_distribution["STRONG"] == 5
     assert metrics.mean_human_by_class["STRONG"] == pytest.approx(4.0)
 
@@ -1073,3 +1081,170 @@ def test_editorial_metrics_reject_mismatched_candidate_set():
     pred_doc = ScorerPredictionDocument(candidate_set_id="b", scorer="s", scorer_version="v")
     with pytest.raises(ValueError, match="Candidate set ID mismatch"):
         compute_editorial_metrics(eval_doc, pred_doc)
+
+
+# ----------------------------------------------------------------------------------
+# v1.1 catastrophic-false-negative regressions (generic, no benchmark ids)
+# ----------------------------------------------------------------------------------
+
+
+def _editorial(payload: Dict[str, Any], candidate_id: str = "synthetic") -> EditorialAnalysis:
+    return parse_editorial_response(payload, candidate_id, "fake-model", "v1.1-test")
+
+
+def test_fragmented_transcript_with_visual_payoff_is_not_fatal():
+    analysis = _editorial(
+        {
+            "editorial_class": "FATAL_REJECT",
+            "reason_to_watch": "A visible reveal triggers an immediate shocked reaction.",
+            "salvageable": True,
+            "best_internal_moment_present": True,
+            "payoff_inside_candidate": True,
+            "visual_interest": 0.9,
+            "reject_reasons": ["fragmented transcript"],
+            "fatal_reject_evidence": ["ASR grammar is fragmented"],
+            "confidence": 0.8,
+        }
+    )
+    assert analysis.editorial_class == "WEAK"
+    assert analysis.salvageable and analysis.payoff_inside_candidate
+
+
+def test_ordinary_conversation_with_punchline_remains_comparable():
+    analysis = _editorial(
+        {
+            "editorial_class": "MAYBE",
+            "reason_to_watch": "An ordinary exchange turns into a clear punchline and reaction.",
+            "salvageable": True,
+            "best_internal_moment_present": True,
+            "payoff_inside_candidate": True,
+        }
+    )
+    assert analysis.editorial_class == "MAYBE"
+    assert analysis.editorial_class in ("STRONG", "GOOD", "MAYBE", "WEAK")
+
+
+def test_missing_setup_with_payoff_is_penalized_not_rejected():
+    analysis = _editorial(
+        {
+            "editorial_class": "MAYBE",
+            "reason_to_watch": "A reveal inside the window causes a strong reaction.",
+            "salvageable": True,
+            "best_internal_moment_present": True,
+            "needs_more_setup": True,
+            "required_setup_seconds_estimate": 7,
+            "payoff_inside_candidate": True,
+            "quality_penalty": -20,
+        }
+    )
+    assert analysis.editorial_class == "MAYBE"
+    assert analysis.needs_more_setup
+    assert analysis.required_setup_seconds_estimate == pytest.approx(7.0)
+    assert analysis.quality_penalty == pytest.approx(-20.0)
+
+
+def test_high_context_dependency_with_nearby_setup_is_salvageable():
+    analysis = _editorial(
+        {
+            "editorial_class": "MAYBE",
+            "reason_to_watch": "A running premise resolves with a visible reaction.",
+            "context_dependency": 0.9,
+            "salvageable": True,
+            "needs_more_setup": True,
+            "required_setup_seconds_estimate": 5,
+            "payoff_inside_candidate": True,
+            "standalone_after_refinement_probability": 0.82,
+        }
+    )
+    assert analysis.editorial_class != "FATAL_REJECT"
+    assert analysis.standalone_after_refinement_probability == pytest.approx(0.82)
+
+
+def test_ordinary_conversation_without_payoff_can_remain_weak():
+    analysis = _editorial(
+        {
+            "editorial_class": "WEAK",
+            "reason_to_watch": None,
+            "reason_to_skip": "Nothing changes and no payoff occurs.",
+            "salvageable": False,
+            "payoff_inside_candidate": False,
+        }
+    )
+    assert analysis.editorial_class == "WEAK"
+    assert analysis.quality_penalty <= -25.0
+
+
+def test_pathological_rejection_distribution_recovers_comparative_pool():
+    ids = [f"generic_{index:02d}" for index in range(32)]
+    analyses = {
+        cid: EditorialAnalysis(
+            candidate_id=cid,
+            editorial_class="FATAL_REJECT" if index < 31 else "GOOD",
+            salvageable=index % 3 == 0,
+            best_internal_moment_present=index % 5 == 0,
+            payoff_inside_candidate=index % 7 == 0,
+            confidence=0.7,
+            scroll_stop=index / 32,
+        )
+        for index, cid in enumerate(ids)
+    }
+    survivors, warning = recover_pathological_rejection_distribution(ids, analyses)
+    assert len(survivors) == 8
+    assert warning and warning.startswith("rejection_distribution_warning")
+    assert sum(a.recovered_for_comparison for a in analyses.values()) == 7
+
+
+def test_messy_transcript_alone_cannot_eliminate_strong_internal_moment():
+    analysis = _editorial(
+        {
+            "editorial_class": "FATAL_REJECT",
+            "reason_to_watch": "A strong reaction follows an observable visual event.",
+            "salvageable": True,
+            "best_internal_moment_present": True,
+            "payoff_inside_candidate": True,
+            "reject_reasons": ["transcript is messy"],
+            "fatal_reject_evidence": [],
+            "confidence": 0.95,
+        }
+    )
+    assert analysis.editorial_class == "WEAK"
+
+
+def test_listwise_and_pairwise_run_for_recovered_meaningful_pool(tmp_path):
+    ids = [f"pool_{index}" for index in range(8)]
+    analyses = {
+        cid: EditorialAnalysis(candidate_id=cid, editorial_class="MAYBE", scroll_stop=0.5)
+        for cid in ids
+    }
+    ranking = run_comparative_ranking(ids, {}, analyses, None, make_cache(tmp_path), mode="full")
+    assert ranking.listwise_batches
+    assert ranking.comparisons
+    assert set(ranking.ordered_ids) == set(ids)
+
+
+def test_critic_binary_reject_demotes_and_explicit_fatal_contract_is_required():
+    demotion = parse_critic_response(
+        {"decision": "REJECT", "reason": "ordinary conversation", "confidence": 0.95},
+        "c",
+        "m",
+        "p",
+    )
+    assert demotion.decision == "KEEP"
+    assert demotion.keep_for_comparison
+    assert demotion.penalty == pytest.approx(-30.0)
+
+    fatal = parse_critic_response(
+        {
+            "penalty": -100,
+            "failure_modes": ["technical corruption"],
+            "keep_for_comparison": False,
+            "hard_reject": True,
+            "fatal_evidence": ["video frames cannot be decoded"],
+            "confidence": 0.95,
+        },
+        "c",
+        "m",
+        "p",
+    )
+    assert fatal.decision == "REJECT"
+    assert fatal.hard_reject and not fatal.keep_for_comparison

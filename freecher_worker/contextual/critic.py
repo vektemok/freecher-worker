@@ -1,7 +1,8 @@
-"""False-positive critic pass for contextual_reranker_v1.
+"""Penalty-oriented critic pass for the contextual reranker.
 
-The critic sees only the surviving candidates and looks exclusively for reasons to cut
-them. It never sees human ratings, model scores, or upstream ranks.
+The critic normally demotes questionable candidates without deleting them. A hard
+rejection requires an explicit unusability claim, concrete fatal evidence, and high
+confidence.
 """
 
 from __future__ import annotations
@@ -11,12 +12,69 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .cache import ContextualCache
 from .candidate_context import render_candidate_prompt
-from .models import CandidateContextPackage, CriticResult, EditorialAnalysis, GlobalContext
+from .models import CandidateContextPackage, CriticResult, GlobalContext
 from .prompts import get_stage_prompt
 from .provider import ContextualProvider, ContextualProviderError
 from .versions import CRITIC_SCHEMA_VERSION
 
 logger = logging.getLogger("freecher_worker")
+
+HARD_REJECT_CONFIDENCE = 0.85
+
+
+def _coerce_penalty(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number > 0:
+        number = -number
+    return max(-100.0, min(0.0, number))
+
+
+def _string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()][:8]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes", "1"):
+            return True
+        if lowered in ("false", "no", "0"):
+            return False
+    return default
+
+
+def _has_strong_fatal_evidence(failure_modes: List[str], fatal_evidence: List[str]) -> bool:
+    evidence = " ".join([*failure_modes, *fatal_evidence]).lower()
+    direct_patterns = (
+        "dead air",
+        "duplicate",
+        "near-duplicate",
+        "technical corruption",
+        "cannot be decoded",
+        "no meaningful content",
+        "no understandable event",
+        "no useful event",
+    )
+    if any(pattern in evidence for pattern in direct_patterns):
+        return True
+    if "payoff" in evidence and "outside" in evidence and (
+        "no useful" in evidence or "nothing" in evidence
+    ):
+        return True
+    return ("severe" in evidence or "unintelligible" in evidence) and (
+        "transcript" in evidence or "asr" in evidence
+    ) and ("no visual" in evidence or "no useful visual" in evidence)
 
 
 def parse_critic_response(
@@ -27,15 +85,6 @@ def parse_critic_response(
 ) -> CriticResult:
     """Turn a raw critic JSON object into a validated CriticResult."""
     raw = str(parsed.get("decision") or "").strip().upper()
-    if raw in ("KEEP", "REJECT"):
-        decision = raw
-    elif raw in ("YES", "TRUE", "PUBLISH"):
-        decision = "KEEP"
-    elif raw in ("NO", "FALSE", "CUT", "DROP"):
-        decision = "REJECT"
-    else:
-        # An unreadable verdict must not silently cut a candidate.
-        decision = "KEEP"
 
     try:
         confidence = float(parsed.get("confidence", 0.0))
@@ -43,14 +92,48 @@ def parse_critic_response(
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence / 100.0 if confidence > 1.0 else confidence))
 
+    failure_modes = _string_list(parsed.get("failure_modes"))
+    fatal_evidence = _string_list(
+        parsed.get("fatal_evidence", parsed.get("fatal_reject_evidence"))
+    )
+    explicit_hard_reject = _coerce_bool(
+        parsed.get("hard_reject", parsed.get("fatal_reject", False))
+    )
+    requested_keep = _coerce_bool(parsed.get("keep_for_comparison", True), default=True)
+
+    # Legacy binary REJECT is translated into a demotion. Only the v1.1 three-part
+    # contract can delete: explicit hard flag + evidence + high confidence.
+    hard_reject = (
+        explicit_hard_reject
+        and not bool(requested_keep)
+        and _has_strong_fatal_evidence(failure_modes, fatal_evidence)
+        and confidence >= HARD_REJECT_CONFIDENCE
+    )
+    decision = "REJECT" if hard_reject else "KEEP"
+    default_penalty = -30.0 if raw in ("REJECT", "NO", "FALSE", "CUT", "DROP") else 0.0
+    penalty = _coerce_penalty(
+        parsed.get("penalty", parsed.get("critic_penalty", default_penalty)),
+        default=default_penalty,
+    )
+
+    recognized = raw in ("", "KEEP", "REJECT", "YES", "TRUE", "PUBLISH", "NO", "FALSE", "CUT", "DROP")
+    new_contract_present = any(
+        key in parsed for key in ("penalty", "critic_penalty", "failure_modes", "keep_for_comparison")
+    )
+
     return CriticResult(
         candidate_id=candidate_id,
         decision=decision,  # type: ignore[arg-type]
         reason=str(parsed.get("reason") or "").strip(),
         confidence=confidence,
+        penalty=penalty,
+        failure_modes=failure_modes,
+        keep_for_comparison=not hard_reject,
+        hard_reject=hard_reject,
+        fatal_evidence=fatal_evidence,
         prompt_version=prompt_version,
         model=model,
-        parse_failed=raw not in ("KEEP", "REJECT"),
+        parse_failed=not recognized or (not raw and not new_contract_present),
     )
 
 
@@ -84,6 +167,8 @@ def criticize_candidate(
             decision="KEEP",
             reason="Critic skipped: no provider configured.",
             confidence=0.0,
+            penalty=0.0,
+            keep_for_comparison=True,
             prompt_version=prompt_version,
             model=model,
             parse_failed=True,
@@ -100,6 +185,8 @@ def criticize_candidate(
             decision="KEEP",
             reason="Critic unavailable; candidate retained.",
             confidence=0.0,
+            penalty=0.0,
+            keep_for_comparison=True,
             prompt_version=prompt_version,
             model=model,
             parse_failed=True,
@@ -134,41 +221,6 @@ def run_critic_pass(
             continue
         verdict = criticize_candidate(package, global_context, provider, cache)
         verdicts[cid] = verdict
-        if verdict.decision == "KEEP":
+        if verdict.keep_for_comparison:
             kept.append(cid)
     return kept, verdicts
-
-
-def guard_against_empty_survivors(
-    kept: Sequence[str],
-    survivors: Sequence[str],
-    analyses: Dict[str, EditorialAnalysis],
-) -> Tuple[List[str], Optional[str]]:
-    """Keep the pipeline usable if the critic rejects everything.
-
-    Returns (final ids, warning). The strongest editorial candidates are restored so a
-    run never produces an empty ranking, and the caller reports why.
-    """
-    if kept:
-        return list(kept), None
-    if not survivors:
-        return [], None
-
-    from .models import EDITORIAL_CLASS_ORDER
-
-    ordered = sorted(
-        survivors,
-        key=lambda cid: (
-            -EDITORIAL_CLASS_ORDER.get(
-                analyses[cid].editorial_class if cid in analyses else "WEAK", 0
-            ),
-            -(analyses[cid].scroll_stop if cid in analyses else 0.0),
-            cid,
-        ),
-    )
-    restored = ordered[: min(3, len(ordered))]
-    warning = (
-        f"Critic rejected all {len(survivors)} survivors; restored the "
-        f"{len(restored)} strongest editorial candidates so the ranking is not empty."
-    )
-    return restored, warning

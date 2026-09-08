@@ -1,4 +1,4 @@
-"""Freecher Contextual Highlight Intelligence (contextual_reranker_v1).
+"""Freecher Contextual Highlight Intelligence (contextual_reranker_v1_1).
 
 A bounded reranking layer that runs after retrieval and multimodal evidence and before
 the final Top-K selection. It does not replace multimodal_v1_1; it consumes its output
@@ -58,6 +58,7 @@ from .editorial import (
     apply_reason_gate,
     is_vague_reason,
     parse_editorial_response,
+    recover_pathological_rejection_distribution,
     survives_reject_filter,
 )
 from .models import (
@@ -128,6 +129,7 @@ from .versions import (
     REGRESSION_DATASET_VERSION,
     RERANKER_VERSION,
     SCORER_VERSION_CONTEXTUAL_V1,
+    SCORER_VERSION_CONTEXTUAL_V1_1,
 )
 
 __all__ = [
@@ -193,6 +195,7 @@ __all__ = [
     "RegressionDataset",
     "RetrievalProvenance",
     "SCORER_VERSION_CONTEXTUAL_V1",
+    "SCORER_VERSION_CONTEXTUAL_V1_1",
     "SURVIVING_CLASSES",
     "TranscriptWindow",
     "analyze_candidate",
@@ -224,6 +227,7 @@ __all__ = [
     "load_source_activity_profile",
     "parse_critic_response",
     "parse_editorial_response",
+    "recover_pathological_rejection_distribution",
     "parse_json_object",
     "parse_timestamp",
     "read_manifest_source",

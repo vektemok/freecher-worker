@@ -1,4 +1,4 @@
-"""Editorial-decision metrics for contextual_reranker_v1.
+"""Editorial-decision metrics for contextual_reranker_v1_1.
 
 These complement the existing ranking metrics: instead of asking "is the order good?",
 they ask "were the REJECT and STRONG decisions themselves correct?". Human labels are
@@ -133,7 +133,7 @@ def compute_editorial_metrics(
     if not class_distribution:
         messages.append(
             "No editorial_class fields found; this prediction document was not produced by "
-            "contextual_reranker_v1."
+            "contextual_reranker_v1_1."
         )
     if reject_total and not reject_labeled:
         messages.append("No REJECT decision has a human label; RejectPrecision is undefined.")

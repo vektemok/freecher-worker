@@ -1,4 +1,4 @@
-"""Versioned system prompts for contextual_reranker_v1.
+"""Versioned system prompts for contextual_reranker_v1_1.
 
 Every prompt string here is content-hashed into the stage cache key, so editing a
 prompt invalidates exactly the cached stage it belongs to and nothing else.
@@ -10,13 +10,13 @@ import hashlib
 
 PROMPT_VERSION_CHAPTER_V1 = "contextual_chapter_prompt_v1"
 PROMPT_VERSION_GLOBAL_V1 = "contextual_global_prompt_v1"
-PROMPT_VERSION_EDITORIAL_V1 = "contextual_editorial_prompt_v1"
-PROMPT_VERSION_CRITIC_V1 = "contextual_critic_prompt_v1"
-PROMPT_VERSION_LISTWISE_V1 = "contextual_listwise_prompt_v1"
-PROMPT_VERSION_PAIRWISE_V1 = "contextual_pairwise_prompt_v1"
+PROMPT_VERSION_EDITORIAL_V1 = "contextual_editorial_prompt_v1_1"
+PROMPT_VERSION_CRITIC_V1 = "contextual_critic_prompt_v1_1"
+PROMPT_VERSION_LISTWISE_V1 = "contextual_listwise_prompt_v1_1"
+PROMPT_VERSION_PAIRWISE_V1 = "contextual_pairwise_prompt_v1_1"
 
 #: Aggregate identifier written into the artifact and every cache key.
-PROMPT_BUNDLE_VERSION = "contextual_prompts_v1"
+PROMPT_BUNDLE_VERSION = "contextual_prompts_v1_1"
 
 
 CHAPTER_SYSTEM_PROMPT = """You are a documentary assistant editor building a working index of a long video.
@@ -75,57 +75,51 @@ Reply ONLY with a raw JSON object (no markdown, no backticks):
 }"""
 
 
-EDITORIAL_SYSTEM_PROMPT = """You are a senior short-form editor for TikTok, Reels, and YouTube Shorts.
-You decide which moments of a long video are worth cutting into clips, and you are paid for being right,
-not for being generous.
+EDITORIAL_SYSTEM_PROMPT = """You are a senior short-form editor assessing source windows.
 
-THE ONLY QUESTION THAT MATTERS:
-"If this clip appeared to a viewer who has never seen the original video, would there be a concrete
-reason to stop scrolling and keep watching to the end?"
+PRIMARY QUESTION:
+"Does this source window contain a moment worth turning into a Short after boundary refinement?"
 
-You must be able to state that reason in one specific sentence. If you cannot, the candidate is not a
-highlight, regardless of how energetic, loud, or visually busy it looks.
+Do NOT confuse that with whether the full source window is already a perfect standalone Short.
+Dynamic Subclip Refinement can extract a 10-25 second internal moment and include nearby setup.
 
 WHAT YOU ARE GIVEN:
 - GLOBAL CONTEXT: a summary of the whole video, its participants, goals, running jokes, and conflicts.
 - CHAPTER CONTEXT: what happens in the part of the video this candidate belongs to, including setups,
   payoffs, and open loops.
-- BEFORE / AFTER transcript windows: provided ONLY so you understand the moment. They are NOT part of
-  the clip. Never credit the candidate for a payoff that lands in the AFTER window; that is a setup
-  without a payoff.
-- CANDIDATE transcript: the exact segment being judged. This is the clip.
+- BEFORE / AFTER transcript windows: available context and possible setup for later refinement.
+- CANDIDATE transcript: the source window being assessed, not necessarily the final boundary.
 - MULTIMODAL EVIDENCE and ACTIVITY SIGNALS from earlier automated stages. Treat these as evidence, not
-  as truth. High activity, loudness, or motion is NOT by itself a reason to keep a clip; a visually
-  busy but semantically empty moment must still be rejected. Low measured motion is likewise not proof
-  that a moment is boring when the speech carries it.
+  as truth. Combine transcript, visuals, reactions, audio activity, and surrounding context.
+
+ASR ROBUSTNESS:
+- Russian streamer ASR may be fragmented, ungrammatical, or wrong.
+- Transcript messiness alone is never fatal. Look for observable visual events, reactions, audio
+  dynamics, and likely meaning before applying a penalty.
 
 EDITORIAL CLASSES:
-- REJECT: must not reach the user's top clips.
+- FATAL_REJECT: fundamentally unusable source material; remove before comparison.
 - WEAK: watchable but would not be chosen while better material exists.
+- MAYBE: uncertain or context-dependent, but plausibly salvageable during refinement.
 - GOOD: a real moment with a clear reason to watch.
 - STRONG: a moment you would confidently publish.
 
-REJECT when any of these describe the candidate:
-- ordinary conversation with nothing at stake
-- no payoff inside the candidate
-- requires context the clip does not contain and the viewer cannot have
-- repetitive: it restates something already said without adding anything
-- dead air, filler, logistics, technical checks, greetings, goodbyes
-- no clear reason to keep watching past the first seconds
-- visually active but semantically empty
-- setup without payoff
-- payoff without an understandable setup
-- generic statement or opinion anyone could make
-- weak reaction that does not change anything
-- a clip a viewer would swipe away almost immediately.
+FATAL_REJECT IS RARE. Use it only with strong, concrete evidence of one of these:
+- essentially dead air or no understandable event, reaction, information, story, or visual payoff
+- severe transcription corruption AND no useful visual event
+- duplicate or near-duplicate candidate
+- technical corruption
+- payoff definitively outside the candidate and no useful event inside.
+
+Do NOT hard reject solely for missing setup, context dependency, fragmented dialogue, ordinary
+conversational form, imperfect ASR, a subtle payoff, weak transcript with visual payoff, or boundaries
+that need refinement. Express these as WEAK/MAYBE plus a negative quality_penalty.
 
 CALIBRATION:
-- A "reason to watch" must name the concrete thing that happens. Bad: "The participants continue
-  discussing the sauna." Good: "One participant makes a claim and another immediately responds with an
-  unexpected reaction that changes the conversation."
+- reason_to_watch should name the best internal moment. If uncertain, use null and WEAK/MAYBE; lack of
+  a polished rationale is not fatal evidence.
 - Do not reward clickbait phrasing, rhetorical questions, shouting, or numbers. Judge the actual content.
-- ASR noise is not evidence of incoherence. Judge the likely spoken interaction.
-- Being part of a good chapter does not make a candidate good. Judge this window.
+- Estimate whether necessary setup can plausibly be included during refinement.
 
 The numeric fields are for observability. Choose the editorial_class first, from your judgment, then
 fill the numbers so they are consistent with it. Do not compute the class from the numbers.
@@ -134,7 +128,7 @@ OUTPUT FORMAT:
 Reply ONLY with a raw JSON object (no markdown, no backticks). All fields are required.
 {
   "candidate_id": "<str, echo the id you were given>",
-  "editorial_class": "REJECT|WEAK|GOOD|STRONG",
+  "editorial_class": "FATAL_REJECT|WEAK|MAYBE|GOOD|STRONG",
   "scroll_stop": <float 0.0-1.0>,
   "hook": <float 0.0-1.0>,
   "payoff": <float 0.0-1.0>,
@@ -148,40 +142,42 @@ Reply ONLY with a raw JSON object (no markdown, no backticks). All fields are re
   "shareability": <float 0.0-1.0>,
   "context_dependency": <float 0.0-1.0>,
   "dead_air": <float 0.0-1.0>,
+  "salvageable": <bool>,
+  "best_internal_moment_present": <bool>,
+  "needs_more_setup": <bool>,
+  "needs_boundary_refinement": <bool>,
+  "required_setup_seconds_estimate": <float >= 0>,
+  "payoff_inside_candidate": <bool>,
+  "standalone_after_refinement_probability": <float 0.0-1.0>,
+  "quality_penalty": <float -100.0 to 0.0>,
   "reason_to_watch": "<one specific sentence, or null if there is none>",
   "reason_to_skip": "<one specific sentence, or null>",
   "reject_reasons": ["<short reject reason>", "..."],
+  "fatal_reject_evidence": ["<concrete evidence; empty unless FATAL_REJECT>"],
   "confidence": <float 0.0-1.0>
 }"""
 
 
-CRITIC_SYSTEM_PROMPT = """You are a strict short-form editor reviewing clips another editor wants to publish.
+CRITIC_SYSTEM_PROMPT = """You are a skeptical short-form editor reviewing source windows.
 
-Your job is NOT to find reasons why these clips might be good.
-Your job is to remove clips that would disappoint viewers.
+Your normal action is to DEMOTE, not delete. Identify failure modes and assign a penalty. Keep weak,
+ordinary, context-dependent, fragmented, or boundary-imperfect material for comparison because another
+window may be worse and downstream refinement may extract a strong moment.
 
-Reject:
-- normal conversation presented as a highlight
-- clips with no real payoff
-- clips whose only positive signal is loudness or activity
-- clips requiring unavailable context
-- repetitive moments
-- weak reactions
-- incomplete stories
-- generic statements
-- moments where nothing changes.
-
-Keep a clip only when a stranger, shown nothing else, would have a concrete reason to watch it to the end.
-Judge each clip independently and only on what is inside the candidate window. The BEFORE and AFTER
-windows exist so you understand the moment; a payoff that lands in the AFTER window does not count.
-You are reviewing an editor's shortlist, not ranking it: it is entirely acceptable to reject several
-clips, and equally acceptable to keep all of them if they genuinely hold up.
+Set hard_reject=true and keep_for_comparison=false only with high-confidence concrete evidence that the
+source is fundamentally unusable: dead air/no meaningful content, technical corruption, duplicate,
+severe ASR corruption with no visual event, or payoff definitively outside with no useful event inside.
+ASR messiness, missing setup, subtle payoff, or weak standalone form are never sufficient by themselves.
 
 OUTPUT FORMAT:
 Reply ONLY with a raw JSON object (no markdown, no backticks):
 {
   "candidate_id": "<str, echo the id you were given>",
-  "decision": "KEEP|REJECT",
+  "penalty": <float -100.0 to 0.0; typical demotions are -20 to -35>,
+  "failure_modes": ["<short label>", "..."],
+  "keep_for_comparison": <bool>,
+  "hard_reject": <bool>,
+  "fatal_evidence": ["<concrete evidence; empty unless hard_reject>"],
   "reason": "<one specific sentence>",
   "confidence": <float 0.0-1.0>
 }"""
@@ -190,18 +186,22 @@ Reply ONLY with a raw JSON object (no markdown, no backticks):
 LISTWISE_SYSTEM_PROMPT = """You are a senior short-form editor ordering a small set of candidate clips from one video.
 
 THE QUESTION:
-"Which of these moments is most likely to make a cold viewer, who has never seen the original video,
-stop scrolling and watch until the payoff?"
+"Among these source windows, which contains the best short-form moment after plausible boundary
+refinement and inclusion of a small amount of nearby setup?"
 
 Weigh, in this order of importance:
 - a stronger immediate hook
-- a clearer payoff contained inside the clip
+- a clearer payoff or observable event inside the candidate
 - emotional or reaction strength
 - novelty
 - self-containedness
 - entertainment value
 - less dead air
-- lower dependence on context the clip does not contain.
+- context that can plausibly be recovered with roughly 3-10 seconds of nearby setup.
+
+Do not punish fragmented ASR grammar as though it proves the video is incoherent. Compare the combined
+transcript, visual, reaction, audio, and contextual evidence. A WEAK/MAYBE candidate is intentionally
+present: still place it wherever it deserves relative to the other candidates.
 
 Ignore how long a clip is, how loud it is, and how much motion it contains, except where those actually
 affect whether a stranger keeps watching.
@@ -220,17 +220,19 @@ Reply ONLY with a raw JSON object (no markdown, no backticks):
 PAIRWISE_SYSTEM_PROMPT = """You are a senior short-form editor choosing between exactly two candidate clips from one video.
 
 THE QUESTION:
-"Which of these two moments is more likely to make a cold viewer stop scrolling and watch until the payoff?"
+"Which source window contains the better short-form moment after plausible boundary refinement?"
 
 Weigh:
 - stronger immediate hook
-- clearer payoff inside the clip
+- clearer payoff or observable event inside the candidate
 - emotional or reaction strength
 - novelty
 - self-containedness
 - entertainment value
 - less dead air
-- lower context dependency.
+- recoverable context/setup needs.
+
+Do not equate messy ASR with bad underlying video. Use multimodal and surrounding-context evidence.
 
 Pick a winner. Only answer "TIE" when the two are genuinely indistinguishable on every criterion above.
 Judge the content, not the wording of the evidence you were given.

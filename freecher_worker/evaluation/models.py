@@ -116,16 +116,30 @@ class ScorerPredictionItem(BaseModel):
     package_hash: Optional[str] = Field(default=None, description="Deterministic package content hash")
     request_hash: Optional[str] = Field(default=None, description="Deterministic API request cache hash")
 
-    # Contextual reranker (contextual_reranker_v1) observability fields.
+    # Contextual reranker (contextual_reranker_v1_1) observability fields.
     # Every field is optional, so documents written by earlier scorers stay valid.
     status: Optional[str] = Field(default=None, description="ranked | rejected_editorial | rejected_critic")
-    editorial_class: Optional[str] = Field(default=None, description="REJECT | WEAK | GOOD | STRONG")
+    editorial_class: Optional[str] = Field(
+        default=None, description="FATAL_REJECT | WEAK | MAYBE | GOOD | STRONG"
+    )
     scroll_stop: Optional[float] = Field(default=None, description="Likelihood a cold viewer stops scrolling [0,1]")
     reason_to_watch: Optional[str] = Field(default=None, description="Concrete reason a stranger keeps watching")
     reason_to_skip: Optional[str] = Field(default=None, description="Concrete reason a stranger swipes away")
     reject_reasons: Optional[List[str]] = Field(default=None, description="Why the candidate was rejected")
     critic_result: Optional[str] = Field(default=None, description="KEEP | REJECT | NOT_RUN")
     critic_reason: Optional[str] = Field(default=None, description="Critic justification")
+    salvageable: Optional[bool] = None
+    best_internal_moment_present: Optional[bool] = None
+    needs_more_setup: Optional[bool] = None
+    needs_boundary_refinement: Optional[bool] = None
+    required_setup_seconds_estimate: Optional[float] = None
+    payoff_inside_candidate: Optional[bool] = None
+    standalone_after_refinement_probability: Optional[float] = None
+    editorial_penalty: Optional[float] = None
+    critic_penalty: Optional[float] = None
+    critic_failure_modes: Optional[List[str]] = None
+    keep_for_comparison: Optional[bool] = None
+    recovered_for_comparison: Optional[bool] = None
     comparison_score: Optional[float] = Field(default=None, description="Comparative tournament points")
     previous_rank: Optional[int] = Field(default=None, description="Rank in the input scorer before reranking")
     previous_score: Optional[float] = Field(default=None, description="Score in the input scorer before reranking")
@@ -168,6 +182,9 @@ class ScorerPredictionDocument(BaseModel):
     retrieval_candidate_count: Optional[int] = Field(default=None, description="Candidates entering the reranker")
     survivor_count: Optional[int] = Field(default=None, description="Candidates surviving the reject filter and critic")
     rejected_count: Optional[int] = Field(default=None, description="Candidates removed by the reject filter or critic")
+    comparative_pool_count: Optional[int] = None
+    recovered_for_comparison_count: Optional[int] = None
+    rejection_distribution_warning: Optional[str] = None
     global_context_ref: Optional[str] = Field(default=None, description="Hash of the global context used")
     reasoning_effort: Optional[str] = Field(default=None, description="Reasoning effort requested from the model")
     usage: Optional[Dict[str, Any]] = Field(default=None, description="API call and token accounting")

@@ -643,7 +643,7 @@ Generates `evaluation.json` with candidate highlights and blank human feedback f
 ]
 ```
 
-## Contextual Highlight Intelligence (`contextual_reranker_v1`)
+## Contextual Highlight Intelligence (`contextual_reranker_v1_1`)
 
 A bounded reranking layer that runs **after** retrieval and multimodal evidence and
 **before** the final Top-K selection. It does not replace `multimodal_v1_1`; it consumes
@@ -652,8 +652,9 @@ its output as evidence.
 ```
 existing ASR -> candidates -> heuristic / highlight_v2_1 retrieval -> multimodal_v1_1 evidence
    -> GLOBAL + CHAPTER CONTEXT
-   -> CONTEXTUAL REJECT FILTER
-   -> FALSE-POSITIVE CRITIC
+   -> SALVAGE-AWARE EDITORIAL ASSESSMENT
+   -> FATAL-QUALITY FILTER + SOFT PENALTIES
+   -> PENALTY-ORIENTED CRITIC
    -> COMPARATIVE RERANKER
    -> Top highlights -> existing Dynamic Subclip Refinement -> existing renderer
 ```
@@ -674,14 +675,15 @@ video's context, then forces an editorial decision rather than a score.
    the chapter summaries alone.
 3. **Candidate context package** — per candidate: global context, its chapter context,
    a 75 s BEFORE window, the candidate, a 25 s AFTER window, multimodal evidence, and
-   cheap activity-derived reaction signals. **BEFORE/AFTER are for understanding only and
-   are never added to the clip.**
-4. **Editorial classification** — the model returns `REJECT | WEAK | GOOD | STRONG` plus a
-   concrete `reason_to_watch`. A candidate whose reason is missing or merely describes
-   continuation ("the participants continue discussing the sauna") is demoted to REJECT.
-5. **False-positive critic** — a separate strict pass over survivors that only looks for
-   reasons to cut. It never sees human ratings, model scores, or upstream ranks.
-6. **Comparative reranking** — survivors are ordered by comparing them against each other,
+   cheap activity-derived reaction signals. BEFORE/AFTER provide understanding and setup
+   options; later refinement, not the reranker, chooses final clip boundaries.
+4. **Editorial assessment** — the model returns `FATAL_REJECT`, `WEAK`, `MAYBE`, `GOOD`,
+   or `STRONG`, plus explicit salvageability/setup/boundary fields and a soft quality penalty.
+   Missing setup, messy ASR, context dependency, and imperfect boundaries do not delete a
+   candidate. Only strongly evidenced, fundamentally unusable material is fatal.
+5. **Critic** — a separate pass primarily emits a penalty, confidence, failure modes, and
+   `keep_for_comparison`. Hard rejection requires explicit fatal evidence and high confidence.
+6. **Comparative reranking** — every non-fatal candidate is ordered against the others,
    not by summing numbers: listwise batches, then a Swiss tournament, then round-robin
    across the top group. For 16 survivors that is ~39 comparisons instead of the 120 a
    full pairwise matrix needs.
@@ -713,11 +715,11 @@ python -m freecher_worker export-blind-diagnostic runs/benchmark_02 \
 # Ranking metrics plus RejectPrecision / StrongPrecision
 python -m freecher_worker evaluate-contextual \
   runs/benchmark_02/evaluation.json \
-  runs/benchmark_02/scores/contextual_reranker_v1.json
+  runs/benchmark_02/scores/contextual_reranker_v1_1.json
 
 # Known hard cases (strong positives, false positives, false negatives)
 python -m freecher_worker regression-check regression_dataset.json \
-  runs/benchmark_02/scores/contextual_reranker_v1.json
+  runs/benchmark_02/scores/contextual_reranker_v1_1.json
 ```
 
 `inspect-moment` prints `NO CANDIDATE COVERAGE` when no candidate window contains the
@@ -730,8 +732,8 @@ scores) next to `_DO_NOT_OPEN_mapping.json`. Both are reproducible from `--seed`
 
 | Path | Contents |
 | --- | --- |
-| `scores/contextual_reranker_v1.json` | Scorer artifact; survivors ranked first, then rejected candidates with reasons |
-| `contextual/contextual_reranker_v1_run.json` | Full record: comparisons, listwise batches, usage |
+| `scores/contextual_reranker_v1_1.json` | Scorer artifact; comparative pool ranked first, then fatal rejects with reasons |
+| `contextual/contextual_reranker_v1_1_run.json` | Full record: salvageability, penalties, comparisons, diagnostics, and usage |
 | `contextual/global_context_v1.json` | Whole-video understanding |
 | `contextual/chapter_context_v1.json` | Chapter summaries, setups, payoffs, open loops |
 | `contextual/candidate_context_v1.json` | Per-candidate context packages |

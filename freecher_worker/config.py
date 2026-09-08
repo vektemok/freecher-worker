@@ -86,7 +86,7 @@ class Settings(BaseSettings):
         description="Reasoning effort for reasoning models (none|low|medium|high|xhigh|max)",
     )
 
-    # Contextual Highlight Intelligence / Reranker v3 (contextual_reranker_v1)
+    # Contextual Highlight Intelligence (contextual_reranker_v1_1)
     contextual_base_url: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices(

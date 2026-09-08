@@ -82,7 +82,7 @@ def test_inspect_moment_reports_contextual_rejection(tmp_path):
 
     inspection = inspect_moment(run_dir, 120.0)
     assert inspection.contextual_status == "rejected_editorial"
-    assert inspection.editorial_class == "REJECT"
+    assert inspection.editorial_class == "FATAL_REJECT"
     assert "ordinary conversation" in inspection.reject_reasons
     assert "rejected by the contextual reranker" in inspection.message
 

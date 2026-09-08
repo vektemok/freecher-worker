@@ -2006,10 +2006,10 @@ def contextual_rerank_command(
         None,
         "--output",
         "-o",
-        help="Custom destination for the scorer artifact (default: <run>/scores/contextual_reranker_v1.json)",
+        help="Custom destination for the scorer artifact (default: <run>/scores/contextual_reranker_v1_1.json)",
     ),
 ) -> None:
-    """Rerank an existing candidate set with Contextual Highlight Intelligence (contextual_reranker_v1)."""
+    """Rerank an existing candidate set with Contextual Highlight Intelligence v1.1."""
     try:
         resolved_dir = _resolve_run_path(run_dir)
     except FileNotFoundError as exc:
@@ -2322,7 +2322,7 @@ def evaluate_contextual_command(
     ),
     scores_file: Path = typer.Argument(
         ...,
-        help="Path to a contextual_reranker_v1 prediction JSON",
+        help="Path to a contextual_reranker_v1_1 prediction JSON",
         exists=True,
         file_okay=True,
         readable=True,
@@ -2590,4 +2590,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

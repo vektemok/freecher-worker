@@ -1,4 +1,4 @@
-"""Orchestrator for Contextual Highlight Intelligence (contextual_reranker_v1).
+"""Orchestrator for Contextual Highlight Intelligence (contextual_reranker_v1_1).
 
 Sits between the existing retrieval/multimodal stages and the final Top-K selection.
 Never modifies an upstream scorer, and never sees human labels.
@@ -37,8 +37,8 @@ from .comparative import (
     run_comparative_ranking,
 )
 from .context import build_source_context
-from .critic import guard_against_empty_survivors, run_critic_pass
-from .editorial import analyze_candidate, survives_reject_filter
+from .critic import run_critic_pass
+from .editorial import analyze_candidate, recover_pathological_rejection_distribution
 from .models import (
     CandidateContextPackage,
     ContextualRerankDocument,
@@ -351,26 +351,26 @@ class ContextualReranker:
             context_dir / "candidate_context_v1.json",
         )
 
-        # 3. Editorial classification + reject filter.
+        # 3. Salvage-aware editorial assessment. Only fatal-quality windows disappear.
         analyses: Dict[str, EditorialAnalysis] = {}
-        survivors: List[str] = []
         for cid in retrieval_ids:
             analysis = analyze_candidate(packages[cid], global_context, self.provider, cache)
             analyses[cid] = analysis
-            if survives_reject_filter(analysis):
-                survivors.append(cid)
+
+        survivors, rejection_distribution_warning = recover_pathological_rejection_distribution(
+            retrieval_ids, analyses
+        )
+        if rejection_distribution_warning:
+            self.warnings.append(rejection_distribution_warning)
+            logger.warning(f"[contextual-rerank] {rejection_distribution_warning}")
         logger.info(
             f"[contextual-rerank] Reject filter kept {len(survivors)}/{len(retrieval_ids)} candidates."
         )
 
-        # 4. False-positive critic.
+        # 4. Penalty-oriented critic. Deletion requires explicit, strongly evidenced fatality.
         kept, critic_verdicts = run_critic_pass(
             survivors, packages, global_context, self.provider, cache, enabled=self.critic_enabled
         )
-        kept, critic_warning = guard_against_empty_survivors(kept, survivors, analyses)
-        if critic_warning:
-            self.warnings.append(critic_warning)
-            logger.warning(f"[contextual-rerank] {critic_warning}")
         logger.info(f"[contextual-rerank] Critic kept {len(kept)}/{len(survivors)} candidates.")
 
         # 5. Comparative ranking over survivors only.
@@ -380,6 +380,7 @@ class ContextualReranker:
             analyses=analyses,
             provider=self.provider,
             cache=cache,
+            critic_results=critic_verdicts,
             mode=self.comparison_mode,
             listwise_batch_size=self.listwise_batch_size,
             final_pairwise_top=self.final_pairwise_top,
@@ -402,6 +403,7 @@ class ContextualReranker:
             critic_verdicts=critic_verdicts,
             ranking=ranking,
             provenance=provenance,
+            rejection_distribution_warning=rejection_distribution_warning,
         )
 
         pred_doc = self._build_prediction_document(rerank_doc, cand_map)
@@ -432,6 +434,7 @@ class ContextualReranker:
         critic_verdicts: Dict[str, CriticResult],
         ranking: ComparativeRanking,
         provenance: Dict[str, RetrievalProvenance],
+        rejection_distribution_warning: Optional[str],
     ) -> ContextualRerankDocument:
         """Assemble the full contextual record, survivors first then rejected."""
         survivor_count = len(ordered_ids)
@@ -466,10 +469,33 @@ class ContextualReranker:
                 reject_reasons=list(analysis.reject_reasons) if analysis else [],
                 editorial_confidence=analysis.confidence if analysis else 0.0,
                 editorial_parse_failed=analysis.parse_failed if analysis else False,
+                salvageable=analysis.salvageable if analysis else True,
+                best_internal_moment_present=(
+                    analysis.best_internal_moment_present if analysis else False
+                ),
+                needs_more_setup=analysis.needs_more_setup if analysis else False,
+                needs_boundary_refinement=(
+                    analysis.needs_boundary_refinement if analysis else False
+                ),
+                required_setup_seconds_estimate=(
+                    analysis.required_setup_seconds_estimate if analysis else 0.0
+                ),
+                payoff_inside_candidate=analysis.payoff_inside_candidate if analysis else False,
+                standalone_after_refinement_probability=(
+                    analysis.standalone_after_refinement_probability if analysis else 0.0
+                ),
+                editorial_penalty=analysis.quality_penalty if analysis else 0.0,
+                recovered_for_comparison=(
+                    analysis.recovered_for_comparison if analysis else False
+                ),
                 critic_result=verdict.decision if verdict else "NOT_RUN",
                 critic_reason=verdict.reason if verdict else None,
                 critic_confidence=verdict.confidence if verdict else None,
+                critic_penalty=verdict.penalty if verdict else 0.0,
+                critic_failure_modes=list(verdict.failure_modes) if verdict else [],
+                keep_for_comparison=verdict.keep_for_comparison if verdict else True,
                 comparison_score=round(ranking.points.get(cid, 0.0), 3),
+                adjusted_comparison_score=round(ranking.adjusted_points.get(cid, 0.0), 3),
                 comparison_wins=ranking.wins.get(cid, 0),
                 comparison_losses=ranking.losses.get(cid, 0),
                 comparison_ties=ranking.ties.get(cid, 0),
@@ -545,6 +571,11 @@ class ContextualReranker:
             retrieval_candidate_count=len(retrieval_ids),
             survivor_count=survivor_count,
             rejected_count=len(rejected_items),
+            comparative_pool_count=survivor_count,
+            recovered_for_comparison_count=sum(
+                1 for analysis in analyses.values() if analysis.recovered_for_comparison
+            ),
+            rejection_distribution_warning=rejection_distribution_warning,
             global_context_ref=global_context.context_hash,
             global_context_file=str(global_file.relative_to(run_dir)),
             chapter_context_file=str(chapter_file.relative_to(run_dir)),
@@ -600,6 +631,20 @@ class ContextualReranker:
                     reject_reasons=record.reject_reasons or None,
                     critic_result=record.critic_result,
                     critic_reason=record.critic_reason,
+                    salvageable=record.salvageable,
+                    best_internal_moment_present=record.best_internal_moment_present,
+                    needs_more_setup=record.needs_more_setup,
+                    needs_boundary_refinement=record.needs_boundary_refinement,
+                    required_setup_seconds_estimate=record.required_setup_seconds_estimate,
+                    payoff_inside_candidate=record.payoff_inside_candidate,
+                    standalone_after_refinement_probability=(
+                        record.standalone_after_refinement_probability
+                    ),
+                    editorial_penalty=record.editorial_penalty,
+                    critic_penalty=record.critic_penalty,
+                    critic_failure_modes=record.critic_failure_modes or None,
+                    keep_for_comparison=record.keep_for_comparison,
+                    recovered_for_comparison=record.recovered_for_comparison,
                     comparison_score=record.comparison_score,
                     previous_rank=record.previous_rank,
                     previous_score=record.previous_score,
@@ -634,6 +679,9 @@ class ContextualReranker:
             retrieval_candidate_count=rerank_doc.retrieval_candidate_count,
             survivor_count=rerank_doc.survivor_count,
             rejected_count=rerank_doc.rejected_count,
+            comparative_pool_count=rerank_doc.comparative_pool_count,
+            recovered_for_comparison_count=rerank_doc.recovered_for_comparison_count,
+            rejection_distribution_warning=rerank_doc.rejection_distribution_warning,
             global_context_ref=rerank_doc.global_context_ref,
             reasoning_effort=rerank_doc.reasoning_effort,
             temperature=rerank_doc.temperature,
