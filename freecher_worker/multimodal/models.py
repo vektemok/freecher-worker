@@ -51,6 +51,67 @@ class ExtractedFrame(BaseModel):
     source_type: str = Field(default="uniform", description="Extraction strategy ('uniform' or 'scene_change')")
 
 
+class SourceTemporalActivityPoint(BaseModel):
+    """1-second binned source-wide activity observation."""
+
+    absolute_timestamp: float = Field(description="Timestamp in seconds from video start")
+    audio_energy: float = Field(description="Normalized RMS audio energy [0, 1]")
+    audio_delta: float = Field(description="Normalized frame-to-frame RMS delta [0, 1]")
+    speech_activity: float = Field(description="Fraction of active speech windows [0, 1]")
+    visual_motion: float = Field(description="Normalized frame-to-frame visual motion [0, 1]")
+    scene_change: bool = Field(description="Whether a visual scene change was detected")
+    combined_activity: float = Field(description="Deterministic weighted combined activity score [0, 1]")
+
+
+class SourceTemporalActivityProfile(BaseModel):
+    """Cached whole-source temporal activity profile computed in a single pass."""
+
+    source_fingerprint: str
+    formula_version: str = "activity_v1_1_formula_v1"
+    bin_size_seconds: float = 1.0
+    duration_seconds: float
+    timeline: List[SourceTemporalActivityPoint] = Field(default_factory=list)
+
+
+class ActivityPoint(BaseModel):
+    """Candidate-relative 1-second activity curve point."""
+
+    offset: float = Field(description="Timestamp in seconds relative to candidate start")
+    absolute_timestamp: float = Field(description="Absolute timestamp in seconds in source video")
+    audio_energy: float = Field(description="Normalized audio energy [0, 1]")
+    audio_delta: float = Field(description="Normalized audio energy delta [0, 1]")
+    speech_activity: float = Field(description="Speech activity ratio [0, 1]")
+    visual_motion: float = Field(description="Visual motion difference [0, 1]")
+    scene_change: bool = Field(description="Whether a scene cut occurred in this bin")
+    combined_activity: float = Field(description="Combined activity signal [0, 1]")
+
+
+class ActivityCurveSummary(BaseModel):
+    """Summarized candidate-local activity curve and top activity peaks."""
+
+    curve: List[ActivityPoint] = Field(default_factory=list)
+    top_audio_peaks: List[float] = Field(default_factory=list)
+    top_motion_peaks: List[float] = Field(default_factory=list)
+    top_combined_activity_peaks: List[float] = Field(default_factory=list)
+
+
+class TemporalBurst(BaseModel):
+    """A localized ~2-second temporal burst with aligned visual frames and transcript."""
+
+    burst_index: int = Field(description="Burst sequence index (1 or 2)")
+    center_offset: float = Field(description="Center offset in seconds relative to candidate start")
+    start_offset: float = Field(description="Burst start offset in seconds relative to candidate start")
+    end_offset: float = Field(description="Burst end offset in seconds relative to candidate start")
+    selection_reason: str = Field(description="Provenance reason (e.g. combined_activity_peak, audio_delta_peak)")
+    combined_activity: float = Field(description="Combined activity score at burst center")
+    activity_rank: int = Field(description="Activity rank among candidate peaks (1=strongest)")
+    transcript: str = Field(default="", description="Spoken transcript aligned to [start_offset - 0.75s, end_offset + 0.75s]")
+    frames: List[ExtractedFrame] = Field(default_factory=list, description="Extracted frames covering the ~2s burst")
+    audio_energy_mean: float = Field(default=0.0, description="Mean audio energy during burst")
+    motion_mean: float = Field(default=0.0, description="Mean visual motion during burst")
+    has_scene_change: bool = Field(default=False, description="Whether burst contains a scene cut")
+
+
 class MultimodalCandidatePackage(BaseModel):
     """Self-contained multimodal evidence package for an individual candidate highlight window."""
 
@@ -75,12 +136,24 @@ class MultimodalCandidatePackage(BaseModel):
         description="True if fewer than 4 frames could be decoded",
     )
 
+    package_version: str = Field(default="multimodal_package_v1", description="Package schema version")
+    temporal_bursts: Optional[List[TemporalBurst]] = Field(
+        default=None,
+        description="Localized 2-second activity bursts with aligned transcript (v1.1)",
+    )
+    activity_curve: Optional[ActivityCurveSummary] = Field(
+        default=None,
+        description="Candidate-local 1-second activity curve (v1.1)",
+    )
+
 
 class ObservedRegion(BaseModel):
     """Advisory sub-region identified by multimodal model as the strongest span."""
 
     start_offset: float = Field(description="Start offset in seconds relative to candidate start")
     end_offset: float = Field(description="End offset in seconds relative to candidate start")
+    confidence: Optional[float] = Field(default=None, description="Confidence in best observed region [0, 1]")
+    reason: Optional[str] = Field(default=None, description="Reason why this span was selected")
 
 
 class ObservedEvidenceItem(BaseModel):
@@ -129,6 +202,17 @@ class MultimodalModelResult(BaseModel):
     quality_score: float = Field(ge=0, le=100, description="Overall candidate short-form quality rating 0-100")
 
 
+class ShortlistItem(BaseModel):
+    """Detailed metadata for a candidate in the retrieval shortlist."""
+
+    candidate_id: str
+    heuristic_rank: Optional[int] = Field(default=None, description="1-based rank in heuristic retrieval, or null if absent")
+    llm_rank: Optional[int] = Field(default=None, description="1-based rank in LLM retrieval, or null if absent")
+    best_rank: int = Field(description="Minimum rank among retrieval sources")
+    sum_rank: int = Field(description="Sum of source ranks (using top_k + 1 for absent sources)")
+    retrieval_sources: List[str] = Field(default_factory=list, description="Retrieval sources that nominated this candidate")
+
+
 class ShortlistDocument(BaseModel):
     """Deterministic candidate shortlist metadata for multimodal reranking."""
 
@@ -139,6 +223,7 @@ class ShortlistDocument(BaseModel):
     max_candidates: int
     candidate_ids: List[str]
     total_unique: int
+    items: Optional[List[ShortlistItem]] = Field(default=None, description="Detailed shortlist items (v1.1)")
 
 
 class MultimodalUsage(BaseModel):

@@ -12,7 +12,11 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .models import MultimodalCandidatePackage, MultimodalModelResult, MultimodalUsage
-from .provider import MultimodalProvider, PROMPT_VERSION_MULTIMODAL_V1
+from .provider import (
+    MultimodalProvider,
+    PROMPT_VERSION_MULTIMODAL_V1,
+    PROMPT_VERSION_MULTIMODAL_V1_1,
+)
 
 logger = logging.getLogger("freecher_worker")
 
@@ -68,7 +72,83 @@ Respond ONLY with a valid JSON object matching this schema (no markdown, no back
   "missing_setup": <bool>,
   "insufficient_visual_evidence": <bool>,
   "confidence": <float 0.0-1.0>,
-  "best_observed_region": {"start_offset": <float>, "end_offset": <float>} or null,
+  "best_observed_region": {"start_offset": <float>, "end_offset": <float>, "confidence": <float>, "reason": "<str>"} or null,
+  "evidence": [{"timestamp_offset": <float>, "description": "<str>"}],
+  "reason": "<1-2 concise sentences explaining editorial judgment>",
+  "quality_score": <float 0-100>
+}"""
+
+SYSTEM_PROMPT_MULTIMODAL_V1_1 = """You are an expert multimodal short-form video editor and streamer highlight evaluator (TikTok, Reels, Shorts).
+Your goal is to evaluate whether a candidate video segment from a stream or recording works as an engaging, high-retention short-form clip.
+
+CORE JUDGMENT:
+"Which moments in this candidate contain an actual change in state that can hold a stranger's attention?"
+Valid changes include:
+- person reacts (expression, facial change, shock, joy, disbelief)
+- someone starts laughing, giggling, or chuckling
+- voice becomes excited, angry, amazed, or surprised
+- physical action or gameplay play begins / pays off
+- awkward pause or comedic deadpan reaction
+- argument, competition, or interpersonal tension develops
+- visual situation changes markedly
+- punchline lands
+- surprising statement receives a noticeable reaction
+- impressive action occurs
+- conversational energy sharply increases.
+
+CRITICAL PRINCIPLES:
+- DO NOT REQUIRE VISUAL SPECTACLE. A strong streamer highlight may be carried mainly by delivery, timing, spoken humor, interpersonal reaction, tension, or absurd dialogue.
+- Static-looking frames alone are NOT sufficient evidence that the moment is boring.
+- Likewise, motion alone is NOT sufficient evidence that the moment is good.
+- Judge the ALIGNMENT between: speech, temporal activity, visual progression, reaction, and payoff.
+
+YOU ARE PROVIDED:
+1. Candidate spoken transcript and exact timestamps.
+2. Surrounding speech context (up to 45s before and after).
+3. Locally computed audio and visual signal metrics, and activity curve summary.
+4. GLOBAL CONTEXT: 4 uniform frames across candidate duration (10%, 35%, 65%, 90%).
+5. TEMPORAL BURSTS (2 strongest candidate activity regions, ~2 seconds each):
+   - Aligned spoken transcript for that burst.
+   - Local audio/motion signals and selection provenance.
+   - 4 sequential frames covering temporal progression across that ~2-second window.
+
+TEMPORAL REGION OUTPUT:
+Identify the single strongest temporal span in the candidate:
+"best_observed_region": {
+  "start_offset": <float>,
+  "end_offset": <float>,
+  "confidence": <float 0.0-1.0>,
+  "reason": "<str>"
+}
+If you genuinely cannot identify any noteworthy region, set "best_observed_region": null. Do NOT invent a region if no standout moment exists.
+
+OUTPUT FORMAT:
+Respond ONLY with a valid JSON object matching this schema (no markdown, no backticks):
+{
+  "candidate_id": "<str>",
+  "observable_event": <bool>,
+  "visual_payoff": <bool>,
+  "visual_event": <float 0-100>,
+  "reaction": <float 0-100>,
+  "emotion": <float 0-100>,
+  "humor": <float 0-100>,
+  "surprise": <float 0-100>,
+  "energy": <float 0-100>,
+  "standalone": <float 0-100>,
+  "retention": <float 0-100>,
+  "shareability": <float 0-100>,
+  "boringness": <float 0-100>,
+  "context_dependency": <float 0-100>,
+  "outside_payoff": <bool>,
+  "missing_setup": <bool>,
+  "insufficient_visual_evidence": <bool>,
+  "confidence": <float 0.0-1.0>,
+  "best_observed_region": {
+    "start_offset": <float>,
+    "end_offset": <float>,
+    "confidence": <float 0.0-1.0>,
+    "reason": "<str>"
+  } or null,
   "evidence": [{"timestamp_offset": <float>, "description": "<str>"}],
   "reason": "<1-2 concise sentences explaining editorial judgment>",
   "quality_score": <float 0-100>
@@ -89,6 +169,7 @@ class OpenAIMultimodalProvider(MultimodalProvider):
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         model: str = "gpt-4o-mini",
+        prompt_version: Optional[str] = None,
         timeout_seconds: float = 45.0,
         max_retries: int = 3,
         temperature: float = 0.1,
@@ -100,7 +181,7 @@ class OpenAIMultimodalProvider(MultimodalProvider):
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(1, max_retries)
         self.temperature = temperature
-        self.prompt_version = PROMPT_VERSION_MULTIMODAL_V1
+        self.prompt_version = prompt_version or PROMPT_VERSION_MULTIMODAL_V1
         self.usage = MultimodalUsage()
 
     def get_usage(self) -> MultimodalUsage:
@@ -109,17 +190,21 @@ class OpenAIMultimodalProvider(MultimodalProvider):
     def _estimate_cost(self, in_tokens: int, out_tokens: int) -> float:
         """Estimate informational cost in USD."""
         if "gpt-4o-mini" in self.model:
-            # $0.150 per 1M input, $0.600 per 1M output
             return round((in_tokens * 0.150 / 1_000_000) + (out_tokens * 0.600 / 1_000_000), 6)
         if "gpt-4o" in self.model:
-            # $2.50 per 1M input, $10.00 per 1M output
             return round((in_tokens * 2.50 / 1_000_000) + (out_tokens * 10.00 / 1_000_000), 6)
         return 0.0
 
     def score_candidate(self, package: MultimodalCandidatePackage) -> MultimodalModelResult:
-        """Send candidate package with sparse visual frames to OpenAI multimodal endpoint."""
+        """Send candidate package with multimodal visual and temporal evidence to model endpoint."""
         if not self.api_key:
             raise RuntimeError("API key is not configured for OpenAIMultimodalProvider.")
+
+        is_v1_1 = (
+            self.prompt_version == PROMPT_VERSION_MULTIMODAL_V1_1
+            or package.package_version == "multimodal_package_v1_1"
+        )
+        system_prompt = SYSTEM_PROMPT_MULTIMODAL_V1_1 if is_v1_1 else SYSTEM_PROMPT_MULTIMODAL_V1
 
         # Build text summary part
         pct_str = (
@@ -148,34 +233,93 @@ class OpenAIMultimodalProvider(MultimodalProvider):
             "--- PREVIOUS CONTEXT (up to 45s before candidate) ---",
             package.previous_context if package.previous_context else "[None - start of video or silence]",
             "",
-            "--- CANDIDATE TRANSCRIPT (segment to evaluate) ---",
+            "--- CANDIDATE TRANSCRIPT (full segment to evaluate) ---",
             f'"{package.candidate_transcript}"',
             "",
             "--- NEXT CONTEXT (up to 45s after candidate) ---",
             package.next_context if package.next_context else "[None - end of video or silence]",
-            "",
-            f"--- SPARSE EXTRACTED FRAMES ({len(package.frames)} frames) ---",
         ]
+
+        if is_v1_1 and package.activity_curve:
+            text_content_lines.extend([
+                "",
+                "--- LOCAL ACTIVITY SUMMARY ---",
+                f"Top Audio Peaks (offsets): {', '.join(f'+{p:.1f}s' for p in package.activity_curve.top_audio_peaks)}",
+                f"Top Motion Peaks (offsets): {', '.join(f'+{p:.1f}s' for p in package.activity_curve.top_motion_peaks)}",
+                f"Top Combined Activity Peaks: {', '.join(f'+{p:.1f}s' for p in package.activity_curve.top_combined_activity_peaks)}",
+            ])
 
         content_blocks: List[Dict[str, Any]] = [
             {"type": "text", "text": "\n".join(text_content_lines)}
         ]
 
-        # Append sparse frames with candidate-relative timestamp markers
-        for idx, frame in enumerate(package.frames, start=1):
-            if Path(frame.image_path).is_file():
-                b64 = _encode_image_b64(frame.image_path)
-                content_blocks.append({
-                    "type": "text",
-                    "text": f"Frame {idx:02d} @ +{frame.timestamp_offset:.2f}s ({frame.source_type}):",
-                })
-                content_blocks.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{b64}",
-                        "detail": "low",
-                    },
-                })
+        if is_v1_1 and package.temporal_bursts:
+            # 1. Global context frames
+            global_frames = [f for f in package.frames if f.source_type == "global"]
+            if not global_frames:
+                global_frames = package.frames[:4]
+
+            content_blocks.append({
+                "type": "text",
+                "text": f"\n--- GLOBAL CONTEXT ({len(global_frames)} frames across candidate) ---",
+            })
+            for idx, frame in enumerate(global_frames, start=1):
+                if Path(frame.image_path).is_file():
+                    b64 = _encode_image_b64(frame.image_path)
+                    content_blocks.append({
+                        "type": "text",
+                        "text": f"Global Frame {idx} @ +{frame.timestamp_offset:.2f}s:",
+                    })
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+                    })
+
+            # 2. Temporal Bursts
+            for burst in package.temporal_bursts:
+                speech_text = f'"{burst.transcript}"' if burst.transcript else "[Silence / No speech detected]"
+                burst_header = [
+                    f"\n--- TEMPORAL BURST #{burst.burst_index} (Center: +{burst.center_offset:.2f}s, Window: +{burst.start_offset:.2f}s -> +{burst.end_offset:.2f}s) ---",
+                    f"Selection Reason: {burst.selection_reason} (Combined Activity: {burst.combined_activity:.2f}, Rank: {burst.activity_rank})",
+                    f"Aligned Spoken Speech during burst: {speech_text}",
+                    f"Burst Signals: audio_energy={burst.audio_energy_mean:.2f}, motion={burst.motion_mean:.2f}, scene_change={burst.has_scene_change}",
+                    f"Sequential Frames across this ~2-second burst:",
+                ]
+                content_blocks.append({"type": "text", "text": "\n".join(burst_header)})
+
+                burst_frames = burst.frames if burst.frames else [f for f in package.frames if f.source_type == f"burst_{burst.burst_index}"]
+                for idx, frame in enumerate(burst_frames, start=1):
+                    if Path(frame.image_path).is_file():
+                        b64 = _encode_image_b64(frame.image_path)
+                        content_blocks.append({
+                            "type": "text",
+                            "text": f"Burst #{burst.burst_index} Frame {idx} @ +{frame.timestamp_offset:.2f}s:",
+                        })
+                        content_blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+                        })
+
+        else:
+            # Standard v1 frame presentation
+            content_blocks.append({
+                "type": "text",
+                "text": f"\n--- SPARSE EXTRACTED FRAMES ({len(package.frames)} frames) ---",
+            })
+            for idx, frame in enumerate(package.frames, start=1):
+                if Path(frame.image_path).is_file():
+                    b64 = _encode_image_b64(frame.image_path)
+                    content_blocks.append({
+                        "type": "text",
+                        "text": f"Frame {idx:02d} @ +{frame.timestamp_offset:.2f}s ({frame.source_type}):",
+                    })
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "low",
+                        },
+                    })
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -185,7 +329,7 @@ class OpenAIMultimodalProvider(MultimodalProvider):
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT_MULTIMODAL_V1},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content_blocks},
             ],
             "temperature": self.temperature,

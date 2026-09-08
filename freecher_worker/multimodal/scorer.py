@@ -22,16 +22,19 @@ from freecher_worker.transcription.models import Transcript
 TranscriptDocument = Transcript
 from freecher_worker.utils.json_io import load_json, save_json
 
+from .activity import compute_source_temporal_activity_profile
 from .audio_features import compute_source_audio_profile
 from .models import MultimodalCandidatePackage, MultimodalModelResult
-from .package import build_multimodal_package
-from .provider import MultimodalProvider
+from .package import PACKAGE_VERSION_V1, PACKAGE_VERSION_V1_1, build_multimodal_package
+from .provider import MultimodalProvider, PROMPT_VERSION_MULTIMODAL_V1_1
 from .shortlist import generate_shortlist
 
 logger = logging.getLogger("freecher_worker")
 
 SCORER_VERSION_MULTIMODAL_V1 = "multimodal_v1"
+SCORER_VERSION_MULTIMODAL_V1_1 = "multimodal_v1_1"
 FORMULA_VERSION_MULTIMODAL_V1 = "multimodal_v1_formula_v1"
+FORMULA_VERSION_MULTIMODAL_V1_1 = "multimodal_v1_1_formula_v1"
 
 
 def compute_api_request_hash(
@@ -49,7 +52,7 @@ def multimodal_v1_formula_v1(
     result: MultimodalModelResult,
     package: MultimodalCandidatePackage,
 ) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
-    """Versioned scoring formula for Multimodal Highlight Reranker v1.
+    """Versioned scoring formula for Multimodal Highlight Reranker v1 and v1.1.
 
     Args:
         result: Evaluated result from multimodal provider.
@@ -112,11 +115,14 @@ def multimodal_v1_formula_v1(
     return final_score, subscores, diagnostics
 
 
+multimodal_v1_1_formula_v1 = multimodal_v1_formula_v1
+
+
 def resolve_source_video_path(
     run_dir: Path | str,
     source_video_override: Optional[Path | str] = None,
 ) -> Path:
-    """Locate the source video file for a run directory.
+    """Resolve the source video file for a run directory.
 
     Resolution order:
     1. Explicit override (CLI --source-video / API argument)
@@ -243,26 +249,34 @@ class MultimodalReranker:
     def __init__(
         self,
         provider: MultimodalProvider,
-        heuristic_top_k: int = 12,
-        llm_top_k: int = 12,
-        max_candidates: int = 20,
+        scorer_version: str = SCORER_VERSION_MULTIMODAL_V1,
+        heuristic_top_k: Optional[int] = None,
+        llm_top_k: Optional[int] = None,
+        max_candidates: Optional[int] = None,
         allow_missing_llm: bool = False,
         force_rescore: bool = False,
         force_repackage: bool = False,
         source_video: Optional[Path | str] = None,
     ) -> None:
         self.provider = provider
-        self.heuristic_top_k = heuristic_top_k
-        self.llm_top_k = llm_top_k
-        self.max_candidates = max_candidates
+        self.scorer_version = scorer_version
+        is_v1_1 = scorer_version == SCORER_VERSION_MULTIMODAL_V1_1
+
+        self.heuristic_top_k = heuristic_top_k if heuristic_top_k is not None else (20 if is_v1_1 else 12)
+        self.llm_top_k = llm_top_k if llm_top_k is not None else (20 if is_v1_1 else 12)
+        self.max_candidates = max_candidates if max_candidates is not None else (32 if is_v1_1 else 20)
         self.allow_missing_llm = allow_missing_llm
         self.force_rescore = force_rescore
         self.force_repackage = force_repackage
         self.source_video_override = source_video
 
-        self.scorer_version = SCORER_VERSION_MULTIMODAL_V1
         self.prompt_version = provider.prompt_version
-        self.score_formula_version = FORMULA_VERSION_MULTIMODAL_V1
+        self.score_formula_version = (
+            FORMULA_VERSION_MULTIMODAL_V1_1 if is_v1_1 else FORMULA_VERSION_MULTIMODAL_V1
+        )
+        self.package_version = (
+            PACKAGE_VERSION_V1_1 if is_v1_1 else PACKAGE_VERSION_V1
+        )
 
     def rerank_run(
         self,
@@ -270,10 +284,8 @@ class MultimodalReranker:
         output_file: Optional[Path | str] = None,
         source_video_override: Optional[Path | str] = None,
     ) -> ScorerPredictionDocument:
-        """Execute multimodal reranking on the run directory.
-
-        Produces scores/multimodal_v1.json.
-        """
+        """Execute multimodal reranking on the run directory."""
+        is_v1_1 = self.scorer_version == SCORER_VERSION_MULTIMODAL_V1_1
         r_dir = Path(run_dir).resolve()
         cand_file = r_dir / "candidates.json"
         if not cand_file.is_file():
@@ -328,16 +340,32 @@ class MultimodalReranker:
             cache_file=audio_cache_file,
         )
 
-        # 5. Deterministic shortlist generation
+        # 5. Source-wide temporal activity profile for v1.1 (cached once)
+        source_activity_profile = None
+        if is_v1_1:
+            activity_cache_file = (
+                r_dir / "multimodal" / "cache" / "source_temporal_activity_profile_v1_1.json"
+            )
+            source_activity_profile = compute_source_temporal_activity_profile(
+                wav_path=wav_path,
+                video_path=video_path,
+                source_fingerprint=source_fingerprint,
+                cache_file=activity_cache_file,
+                decoder_name=codec,
+            )
+
+        # 6. Deterministic shortlist generation
+        shortlist_ver = "v1_1" if is_v1_1 else "v1"
         shortlist = generate_shortlist(
             run_dir=r_dir,
             heuristic_top_k=self.heuristic_top_k,
             llm_top_k=self.llm_top_k,
             max_candidates=self.max_candidates,
             allow_missing_llm=self.allow_missing_llm,
+            shortlist_version=shortlist_ver,
         )
 
-        # 6. Evaluate each candidate in shortlist
+        # 7. Evaluate each candidate in shortlist
         prediction_items: List[ScorerPredictionItem] = []
         api_cache_dir = r_dir / "multimodal" / "api_cache"
         api_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +392,8 @@ class MultimodalReranker:
                 candidate_set_id=cand_doc.candidate_set_id,
                 run_dir=r_dir,
                 source_audio_profile=source_profile,
+                source_activity_profile=source_activity_profile,
+                package_version=self.package_version,
                 force_rebuild=self.force_repackage,
             )
 
@@ -402,6 +432,15 @@ class MultimodalReranker:
                 ),
             }
 
+            best_reg_dict = (
+                model_result.best_observed_region.model_dump()
+                if model_result.best_observed_region
+                else None
+            )
+            evidence_dicts = [ev.model_dump() for ev in model_result.evidence] if model_result.evidence else []
+            audio_feat_dict = package.audio_features.model_dump() if package.audio_features else None
+            visual_feat_dict = package.visual_features.model_dump() if package.visual_features else None
+
             pred_item = ScorerPredictionItem(
                 candidate_id=cid,
                 rank=1,  # Ranks will be assigned after sorting
@@ -418,10 +457,27 @@ class MultimodalReranker:
                 actual_model=self.provider.model,
                 fallback_used=False,
                 fallback_reason=None,
+                # Structured observability fields
+                observable_event=model_result.observable_event,
+                visual_payoff=model_result.visual_payoff,
+                outside_payoff=model_result.outside_payoff,
+                missing_setup=model_result.missing_setup,
+                insufficient_visual_evidence=(
+                    package.insufficient_visual_evidence or model_result.insufficient_visual_evidence
+                ),
+                confidence=model_result.confidence,
+                best_observed_region=best_reg_dict,
+                evidence=evidence_dicts,
+                audio_features=audio_feat_dict,
+                visual_features=visual_feat_dict,
+                frame_count=len(package.frames),
+                actual_decoder=package.visual_features.decoder_used,
+                package_hash=package.package_hash,
+                request_hash=req_hash,
             )
             prediction_items.append(pred_item)
 
-        # 7. Sort predictions deterministically: score desc, candidate.start asc
+        # 8. Sort predictions deterministically: score desc, candidate.start asc
         def _sort_key(item: ScorerPredictionItem) -> Tuple[float, float]:
             cand = cand_map.get(item.candidate_id)
             c_start = cand.start if cand else 0.0
@@ -429,13 +485,29 @@ class MultimodalReranker:
 
         prediction_items.sort(key=_sort_key)
 
-        # 8. Assign 1-based ranks
+        # 9. Assign 1-based ranks
         for idx, item in enumerate(prediction_items, start=1):
             item.rank = idx
 
-        # 9. Compute score distribution diagnostics
+        # 10. Compute score distribution diagnostics
         scores_list = [p.score for p in prediction_items]
         dist_diagnostics = compute_score_distribution(scores_list)
+
+        # Diagnostic warning if unique scores / scored candidates < 0.60
+        if len(prediction_items) > 0:
+            uniq_count = dist_diagnostics.unique_score_count_rounded
+            total_count = len(prediction_items)
+            uniq_ratio = uniq_count / float(total_count)
+            if uniq_ratio < 0.60:
+                res_msg = (
+                    f"Low score resolution warning: unique score ratio "
+                    f"{uniq_count}/{total_count} ({uniq_ratio:.1%}) < 60%"
+                )
+                logger.warning(f"[multimodal-diagnostics] {res_msg}")
+                if dist_diagnostics.warning:
+                    dist_diagnostics.warning += f"; {res_msg}"
+                else:
+                    dist_diagnostics.warning = res_msg
 
         pred_doc = ScorerPredictionDocument(
             candidate_set_id=cand_doc.candidate_set_id,
@@ -450,13 +522,14 @@ class MultimodalReranker:
             distribution_diagnostics=dist_diagnostics,
         )
 
-        # 10. Persist predictions to scores/multimodal_v1.json
-        target_output = Path(output_file) if output_file else (r_dir / "scores" / "multimodal_v1.json")
+        # 11. Persist predictions to scores/multimodal_v1_1.json (or scores/multimodal_v1.json)
+        default_output_name = "multimodal_v1_1.json" if is_v1_1 else "multimodal_v1.json"
+        target_output = Path(output_file) if output_file else (r_dir / "scores" / default_output_name)
         target_output.parent.mkdir(parents=True, exist_ok=True)
         save_json(pred_doc, target_output)
         logger.info(f"[multimodal-rerank] Saved predictions to {target_output}")
 
-        # 11. Persist detailed reranking run record
+        # 12. Persist detailed reranking run record
         usage = self.provider.get_usage()
         rerank_run_doc = {
             "candidate_set_id": cand_doc.candidate_set_id,
@@ -469,7 +542,8 @@ class MultimodalReranker:
             "scored_candidates_count": len(prediction_items),
             "usage": usage.model_dump(),
         }
-        rerank_record_file = r_dir / "multimodal" / "rerank_v1.json"
+        default_record_name = "rerank_v1_1.json" if is_v1_1 else "rerank_v1.json"
+        rerank_record_file = r_dir / "multimodal" / default_record_name
         save_json(rerank_run_doc, rerank_record_file)
 
         return pred_doc

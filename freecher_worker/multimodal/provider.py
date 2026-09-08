@@ -8,6 +8,7 @@ from typing import Optional
 from .models import MultimodalCandidatePackage, MultimodalModelResult, MultimodalUsage
 
 PROMPT_VERSION_MULTIMODAL_V1 = "multimodal_v1_prompt_v1"
+PROMPT_VERSION_MULTIMODAL_V1_1 = "multimodal_v1_1_prompt_v1"
 
 
 class MultimodalProvider(ABC):

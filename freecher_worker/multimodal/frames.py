@@ -111,6 +111,57 @@ def compute_frame_sample_timestamps(
     return samples[:max_total_frames]
 
 
+UNIFORM_FRACTIONS_V1_1 = (0.10, 0.35, 0.65, 0.90)
+
+
+def compute_v1_1_sample_timestamps(
+    candidate_start: float,
+    candidate_duration: float,
+    burst_1_center: float,
+    burst_2_center: float,
+    max_total_frames: int = MAX_TOTAL_FRAMES,
+) -> List[Tuple[float, float, str]]:
+    """Compute relative and absolute timestamps for v1.1 hybrid sampling.
+
+    Structure:
+    - 4 global uniform frames (10%, 35%, 65%, 90%)
+    - 4 frames for burst 1: [t1 - 0.75, t1 - 0.25, t1 + 0.25, t1 + 0.75]
+    - 4 frames for burst 2: [t2 - 0.75, t2 - 0.25, t2 + 0.25, t2 + 0.75]
+    Total <= 12 frames.
+    """
+    import numpy as np
+
+    dur = max(0.5, candidate_duration)
+    samples: List[Tuple[float, float, str]] = []
+    seen_offsets: List[float] = []
+
+    def _add_sample(off: float, stype: str):
+        clamped_off = round(float(np.clip(off, 0.05, max(0.05, dur - 0.05))), 3)
+        if any(abs(clamped_off - existing) < 0.1 for existing in seen_offsets):
+            return
+        if len(samples) >= max_total_frames:
+            return
+        abs_ts = round(candidate_start + clamped_off, 3)
+        samples.append((clamped_off, abs_ts, stype))
+        seen_offsets.append(clamped_off)
+
+    # 1. 4 Global frames
+    for frac in UNIFORM_FRACTIONS_V1_1:
+        _add_sample(round(dur * frac, 3), "global")
+
+    # 2. Burst 1 frames (4 frames around t1)
+    burst_offsets = (-0.75, -0.25, 0.25, 0.75)
+    for b_off in burst_offsets:
+        _add_sample(burst_1_center + b_off, "burst_1")
+
+    # 3. Burst 2 frames (4 frames around t2)
+    for b_off in burst_offsets:
+        _add_sample(burst_2_center + b_off, "burst_2")
+
+    samples.sort(key=lambda s: s[0])
+    return samples[:max_total_frames]
+
+
 def extract_candidate_frames(
     source_video_path: Path | str,
     candidate: CandidateWindow,
@@ -119,6 +170,7 @@ def extract_candidate_frames(
     scene_change_offsets: Optional[List[float]] = None,
     max_long_edge: int = DEFAULT_MAX_LONG_EDGE,
     max_total_frames: int = MAX_TOTAL_FRAMES,
+    sample_plan: Optional[List[Tuple[float, float, str]]] = None,
 ) -> Tuple[List[ExtractedFrame], str, int, int]:
     """Extract downscaled JPEG frames for a candidate using software FFmpeg decoding.
 
@@ -136,13 +188,14 @@ def extract_candidate_frames(
     media_info = probe_media(src)
     decoder_name, decoder_desc = probe_software_decoder(media_info.video_codec)
 
-    sample_plan = compute_frame_sample_timestamps(
-        candidate_start=candidate.start,
-        candidate_duration=candidate.duration,
-        uniform_fractions=uniform_fractions,
-        scene_change_offsets=scene_change_offsets,
-        max_total_frames=max_total_frames,
-    )
+    if sample_plan is None:
+        sample_plan = compute_frame_sample_timestamps(
+            candidate_start=candidate.start,
+            candidate_duration=candidate.duration,
+            uniform_fractions=uniform_fractions,
+            scene_change_offsets=scene_change_offsets,
+            max_total_frames=max_total_frames,
+        )
 
     requested_count = len(sample_plan)
     extracted: List[ExtractedFrame] = []

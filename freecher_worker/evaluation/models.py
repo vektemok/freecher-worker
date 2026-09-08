@@ -97,6 +97,22 @@ class ScorerPredictionItem(BaseModel):
     raw_negative_dimensions: Optional[Dict[str, float]] = Field(default=None, description="Raw negative dimension scores 0-100")
     flags: Optional[Dict[str, bool]] = Field(default=None, description="Categorical flags (setup_only, transitional, outside_payoff)")
 
+    # Multimodal structured observability fields
+    observable_event: Optional[bool] = Field(default=None, description="Whether a clear visual/audio event was observed")
+    visual_payoff: Optional[bool] = Field(default=None, description="Whether visual payoff/climax occurred")
+    outside_payoff: Optional[bool] = Field(default=None, description="Whether payoff occurred outside candidate window")
+    missing_setup: Optional[bool] = Field(default=None, description="Whether candidate began after setup already occurred")
+    insufficient_visual_evidence: Optional[bool] = Field(default=None, description="Whether visual evidence was insufficient")
+    confidence: Optional[float] = Field(default=None, description="Model self-assessed confidence [0, 1]")
+    best_observed_region: Optional[Dict[str, Any]] = Field(default=None, description="Advisory region dictionary (start_offset, end_offset, confidence, reason)")
+    evidence: Optional[List[Dict[str, Any]]] = Field(default=None, description="Structured visual/audio evidence observations")
+    audio_features: Optional[Dict[str, Any]] = Field(default=None, description="Candidate audio feature metrics")
+    visual_features: Optional[Dict[str, Any]] = Field(default=None, description="Candidate visual feature metrics")
+    frame_count: Optional[int] = Field(default=None, description="Number of extracted frames evaluated")
+    actual_decoder: Optional[str] = Field(default=None, description="FFmpeg video decoder used")
+    package_hash: Optional[str] = Field(default=None, description="Deterministic package content hash")
+    request_hash: Optional[str] = Field(default=None, description="Deterministic API request cache hash")
+
 
 class ScorerPredictionDocument(BaseModel):
     """Container for predictions produced by a scorer on a frozen candidate set."""

@@ -46,6 +46,10 @@ from freecher_worker.rendering import (
 from freecher_worker.multimodal import (
     MultimodalReranker,
     OpenAIMultimodalProvider,
+    PROMPT_VERSION_MULTIMODAL_V1,
+    PROMPT_VERSION_MULTIMODAL_V1_1,
+    SCORER_VERSION_MULTIMODAL_V1,
+    SCORER_VERSION_MULTIMODAL_V1_1,
     generate_shortlist,
 )
 from freecher_worker.transcription.models import Transcript
@@ -870,27 +874,32 @@ def multimodal_score_command(
         None,
         "--output",
         "-o",
-        help="Custom output path for predictions JSON (default: scores/multimodal_v1.json)",
+        help="Custom output path for predictions JSON (default: scores/multimodal_v1_1.json or scores/multimodal_v1.json)",
+    ),
+    scorer_version: str = typer.Option(
+        SCORER_VERSION_MULTIMODAL_V1_1,
+        "--scorer-version",
+        help=f"Scorer version to run ({SCORER_VERSION_MULTIMODAL_V1_1} or {SCORER_VERSION_MULTIMODAL_V1})",
     ),
     model: Optional[str] = typer.Option(
         None,
         "--model",
         help="Vision-capable model name (e.g. gpt-4o-mini, gpt-4o)",
     ),
-    heuristic_top_k: int = typer.Option(
-        12,
+    heuristic_top_k: Optional[int] = typer.Option(
+        None,
         "--heuristic-top-k",
-        help="Number of candidates taken from heuristic_v1 for shortlist",
+        help="Number of candidates taken from heuristic_v1 for shortlist (default: 20 for v1.1, 12 for v1)",
     ),
-    llm_top_k: int = typer.Option(
-        12,
+    llm_top_k: Optional[int] = typer.Option(
+        None,
         "--llm-top-k",
-        help="Number of candidates taken from highlight_v2_1 for shortlist",
+        help="Number of candidates taken from highlight_v2_1 for shortlist (default: 20 for v1.1, 12 for v1)",
     ),
-    max_candidates: int = typer.Option(
-        20,
+    max_candidates: Optional[int] = typer.Option(
+        None,
         "--max-candidates",
-        help="Maximum capacity of candidate shortlist",
+        help="Maximum capacity of candidate shortlist (default: 32 for v1.1, 20 for v1)",
     ),
     allow_missing_llm: bool = typer.Option(
         False,
@@ -914,19 +923,26 @@ def multimodal_score_command(
         help="Path to source video file if moved or not found in manifest/media.json",
     ),
 ) -> None:
-    """Run Multimodal Highlight Reranker v1 on a deterministic candidate shortlist."""
+    """Run Multimodal Highlight Reranker (v1.1 default or v1) on a deterministic candidate shortlist."""
     resolved_dir = run_dir.resolve()
     settings = get_settings()
     actual_model = model or settings.multimodal_model or "gpt-4o-mini"
+
+    is_v1_1 = scorer_version == SCORER_VERSION_MULTIMODAL_V1_1
+    prompt_ver = (
+        PROMPT_VERSION_MULTIMODAL_V1_1 if is_v1_1 else PROMPT_VERSION_MULTIMODAL_V1
+    )
 
     provider = OpenAIMultimodalProvider(
         base_url=settings.multimodal_base_url,
         api_key=settings.multimodal_api_key,
         model=actual_model,
+        prompt_version=prompt_ver,
     )
 
     reranker = MultimodalReranker(
         provider=provider,
+        scorer_version=scorer_version,
         heuristic_top_k=heuristic_top_k,
         llm_top_k=llm_top_k,
         max_candidates=max_candidates,
@@ -936,14 +952,14 @@ def multimodal_score_command(
         source_video=source_video,
     )
 
-    console.print(f"Executing [bold]multimodal_v1[/bold] reranker on {resolved_dir}...")
+    console.print(f"Executing [bold]{scorer_version}[/bold] reranker on {resolved_dir}...")
     pred_doc = reranker.rerank_run(
         resolved_dir,
         output_file=output,
         source_video_override=source_video,
     )
 
-    target_path = output or (resolved_dir / "scores" / "multimodal_v1.json")
+    target_path = output or (resolved_dir / "scores" / f"{scorer_version}.json")
     console.print(f"[bold green]Multimodal predictions saved to:[/bold green] {target_path}")
     console.print(f"Candidate Set ID: {pred_doc.candidate_set_id}")
     console.print(f"Shortlist candidates evaluated: {len(pred_doc.predictions)}")
@@ -1043,17 +1059,34 @@ def evaluate_command(
     console.print(f"\n[bold cyan]=== Evaluation Report: {metrics.scorer} (v{metrics.scorer_version}) ===[/bold cyan]")
     console.print(f"Candidate Set ID: [bold]{metrics.candidate_set_id}[/bold]")
     console.print(f"Coverage:         [bold]{metrics.labeled_candidates}/{metrics.total_candidates}[/bold] candidates labeled")
-    if metrics.scored_candidates is not None and metrics.candidate_coverage_ratio is not None:
-        console.print(
-            f"Scored Pool:      [bold]{metrics.scored_candidates}/{metrics.total_candidates}[/bold] "
-            f"({metrics.candidate_coverage_ratio:.1%} coverage)"
+    is_reranker = (
+        metrics.candidate_coverage_ratio is not None
+        and metrics.candidate_coverage_ratio < 1.0
+    )
+
+    if is_reranker:
+        console.print("\n[bold yellow]─── RETRIEVAL / SHORTLIST QUALITY ───[/bold yellow]")
+        retrieval_table = Table(box=box.SIMPLE)
+        retrieval_table.add_column("Retrieval Metric", style="cyan")
+        retrieval_table.add_column("Value", style="bold")
+        retrieval_table.add_row(
+            "Shortlist Coverage",
+            f"{metrics.scored_candidates}/{metrics.total_candidates} ({metrics.candidate_coverage_ratio:.1%})",
         )
-        if metrics.perfect_candidate_recall_in_shortlist is not None and metrics.candidate_coverage_ratio < 1.0:
-            console.print(
-                f"Shortlist Recall: Perfect={metrics.perfect_candidate_recall_in_shortlist:.1%}, "
-                f"Publishable={metrics.publishable_candidate_recall_in_shortlist:.1%}"
+        if metrics.perfect_candidate_recall_in_shortlist is not None:
+            retrieval_table.add_row(
+                "Shortlist Perfect Recall",
+                f"{metrics.perfect_candidate_recall_in_shortlist:.1%}",
             )
-    console.print()
+        if metrics.publishable_candidate_recall_in_shortlist is not None:
+            retrieval_table.add_row(
+                "Shortlist Publishable Recall",
+                f"{metrics.publishable_candidate_recall_in_shortlist:.1%}",
+            )
+        console.print(retrieval_table)
+        console.print("[bold magenta]─── RERANKING QUALITY WITHIN SHORTLIST ───[/bold magenta]")
+    else:
+        console.print()
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim", width=22)
@@ -1172,6 +1205,44 @@ def compare_scorers_command(
     console.print(f"Candidate Set ID: [bold]{eval_doc.candidate_set_id}[/bold]")
     console.print(f"Coverage:         [bold]{eval_doc.labeled_candidates}/{eval_doc.total_candidates}[/bold] candidates labeled\n")
 
+    has_reranker = any(
+        (m.candidate_coverage_ratio is not None and m.candidate_coverage_ratio < 1.0)
+        or (m.perfect_candidate_recall_in_shortlist is not None)
+        for m in all_metrics
+    )
+
+    if has_reranker:
+        console.print("[bold yellow]─── RETRIEVAL / SHORTLIST QUALITY ───[/bold yellow]")
+        retrieval_table = Table(show_header=True, header_style="bold yellow", box=box.SIMPLE)
+        retrieval_table.add_column("Retrieval Metric", style="dim", width=26)
+        for m in all_metrics:
+            retrieval_table.add_column(f"{m.scorer}\n({m.scorer_version})", justify="right", width=18)
+
+        cov_row = [
+            f"{m.scored_candidates or m.total_candidates}/{m.total_candidates} ({m.candidate_coverage_ratio or 1.0:.0%})"
+            for m in all_metrics
+        ]
+        retrieval_table.add_row("Scored Pool / Coverage", *cov_row)
+
+        perf_rec_row = [
+            f"{m.perfect_candidate_recall_in_shortlist:.1%}"
+            if m.perfect_candidate_recall_in_shortlist is not None
+            else "100.0%"
+            for m in all_metrics
+        ]
+        retrieval_table.add_row("Shortlist Perfect Recall", *perf_rec_row)
+
+        pub_rec_row = [
+            f"{m.publishable_candidate_recall_in_shortlist:.1%}"
+            if m.publishable_candidate_recall_in_shortlist is not None
+            else "100.0%"
+            for m in all_metrics
+        ]
+        retrieval_table.add_row("Shortlist Publish Recall", *pub_rec_row)
+
+        console.print(retrieval_table)
+        console.print("\n[bold magenta]─── RERANKING / OVERALL RANKING QUALITY ───[/bold magenta]")
+
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim", width=22)
     for m in all_metrics:
@@ -1203,29 +1274,6 @@ def compare_scorers_command(
             else:
                 rec_row.append("N/A")
         table.add_row(f"Recall @ {kv}", *rec_row)
-
-    # Scored coverage and shortlist retrieval quality rows (User Refinement #6)
-    cov_row = [
-        f"{m.scored_candidates or m.total_candidates}/{m.total_candidates} ({m.candidate_coverage_ratio or 1.0:.0%})"
-        for m in all_metrics
-    ]
-    table.add_row("Scored Coverage", *cov_row)
-
-    perf_rec_row = [
-        f"{m.perfect_candidate_recall_in_shortlist:.1%}"
-        if m.perfect_candidate_recall_in_shortlist is not None
-        else "100.0%"
-        for m in all_metrics
-    ]
-    table.add_row("Shortlist Perfect Rec", *perf_rec_row)
-
-    pub_rec_row = [
-        f"{m.publishable_candidate_recall_in_shortlist:.1%}"
-        if m.publishable_candidate_recall_in_shortlist is not None
-        else "100.0%"
-        for m in all_metrics
-    ]
-    table.add_row("Shortlist Publish Rec", *pub_rec_row)
 
     console.print(table)
     console.print()
