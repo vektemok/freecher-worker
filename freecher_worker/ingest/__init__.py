@@ -12,6 +12,7 @@ from freecher_worker.ingest.audio import (
     TeeReader,
     build_audio_command,
     duration_mismatch,
+    duration_tolerance_seconds,
     probe_audio_file,
 )
 from freecher_worker.ingest.models import (
@@ -84,6 +85,7 @@ __all__ = [
     "build_stream_command",
     "derive_audio_key",
     "duration_mismatch",
+    "duration_tolerance_seconds",
     "ingest_to_r2",
     "object_exists",
     "open_source_stream",

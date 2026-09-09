@@ -24,6 +24,7 @@ from freecher_worker.ingest import (
     build_audio_command,
     derive_audio_key,
     duration_mismatch,
+    duration_tolerance_seconds,
     ingest_to_r2,
     probe_audio_file,
 )
@@ -257,7 +258,7 @@ def test_audio_command_carries_configured_settings():
     ("source", "audio", "complains"),
     [
         (3600.0, 3600.0, False),
-        (3600.0, 3599.0, False),      # inside the 1% band
+        (3600.0, 3599.0, False),      # 1s of drift on an hour is tolerated
         (3600.0, 3000.0, True),       # truncated
         (10.0, 11.5, False),          # inside the 2s floor
         (10.0, 20.0, True),
@@ -268,6 +269,68 @@ def test_audio_command_carries_configured_settings():
 )
 def test_duration_mismatch_flags_only_a_real_drift(source, audio, complains):
     assert (duration_mismatch(source, audio) is not None) is complains
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # Below ~33 minutes the floor governs: a proportional tolerance would
+        # be meaninglessly small here.
+        (5.0, 2.0),
+        (60.0, 2.0),
+        (600.0, 2.0),
+        (2000.0, 2.0),          # the floor and the ratio meet
+        (3600.0, 3.6),          # one hour, inside the band
+        (5000.0, 5.0),          # the ratio reaches the ceiling
+        (6817.0, 5.0),          # the 1:53:37 VOD this was tightened for
+        (7200.0, 5.0),          # two hours
+        (43200.0, 5.0),         # a twelve-hour stream is still 5s
+    ],
+)
+def test_tolerance_stays_between_two_and_five_seconds(source, expected):
+    assert duration_tolerance_seconds(source) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("source", [1.0, 60.0, 3600.0, 6817.0, 7200.0, 86400.0])
+def test_tolerance_is_bounded_however_long_the_source_runs(source):
+    # The property that matters: a transcription timestamp can never be more
+    # than five seconds out, whatever the length of the VOD.
+    assert 2.0 <= duration_tolerance_seconds(source) <= 5.0
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "tolerance"),
+    [
+        ("short", 60.0, 2.0),
+        ("one hour", 3600.0, 3.6),
+        ("two hours", 7200.0, 5.0),
+    ],
+)
+@pytest.mark.parametrize("direction", [1, -1])
+def test_drift_is_accepted_up_to_the_boundary_and_refused_past_it(
+    label, source, tolerance, direction
+):
+    # Exactly on the boundary is still aligned, in either direction.
+    assert duration_mismatch(source, source + direction * tolerance) is None
+    # A hair past it is not.
+    assert duration_mismatch(source, source + direction * (tolerance + 0.05)) is not None
+
+
+def test_a_minute_of_drift_on_a_long_vod_is_refused():
+    # The regression this policy exists for: under a flat 1% a 1:53:37 source
+    # waved through 68s of skew, which is a minute of misplaced subtitles.
+    source = 6817.0
+    assert duration_mismatch(source, source - 60.0) is not None
+    assert duration_mismatch(source, source - 10.0) is not None
+    # ... while a genuinely aligned artifact still passes.
+    assert duration_mismatch(source, source - 1.5) is None
+
+
+def test_the_complaint_names_the_drift_and_the_tolerance():
+    message = duration_mismatch(7200.0, 7100.0)
+    assert message is not None
+    assert "100.0s off" in message
+    assert "tolerance 5.0s" in message
 
 
 # --------------------------------------------------------------------------

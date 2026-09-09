@@ -35,8 +35,15 @@ DEFAULT_AUDIO_BITRATE = "64k"
 
 # ffmpeg exits 0 even after "Error during demuxing" or a truncated input, so
 # the length of the result is the only trustworthy completeness check.
-DURATION_TOLERANCE_SECONDS = 2.0
-DURATION_TOLERANCE_RATIO = 0.01
+#
+# The tolerance is bounded in absolute terms, not proportional: transcription
+# timestamps have to line up with the source frame for frame, and a drift that
+# matters is the same size whether the VOD runs ten minutes or three hours. A
+# plain percentage would grow with the source and wave through more than a
+# minute of skew on a two-hour stream.
+MIN_DURATION_TOLERANCE_SECONDS = 2.0
+MAX_DURATION_TOLERANCE_SECONDS = 5.0
+DURATION_TOLERANCE_RATIO = 0.001
 
 # How far the audio branch may fall behind the uploader before the reader is
 # made to wait for it. Bounds memory; the tee never drops a byte.
@@ -200,6 +207,19 @@ def probe_audio_file(
     }
 
 
+def duration_tolerance_seconds(source_seconds: float) -> float:
+    """The drift allowed between the artifact and the source, in seconds.
+
+    Scales with the source only between the two bounds, so it is 2s for
+    anything under ~33 minutes, rises to at most 5s, and stays there however
+    long the VOD runs.
+    """
+    return max(
+        MIN_DURATION_TOLERANCE_SECONDS,
+        min(MAX_DURATION_TOLERANCE_SECONDS, source_seconds * DURATION_TOLERANCE_RATIO),
+    )
+
+
 def duration_mismatch(
     source_seconds: Optional[float],
     audio_seconds: Optional[float],
@@ -209,7 +229,7 @@ def duration_mismatch(
         return None
     if audio_seconds is None:
         return "the extracted audio has no readable duration"
-    tolerance = max(DURATION_TOLERANCE_SECONDS, source_seconds * DURATION_TOLERANCE_RATIO)
+    tolerance = duration_tolerance_seconds(source_seconds)
     drift = abs(audio_seconds - source_seconds)
     if drift <= tolerance:
         return None

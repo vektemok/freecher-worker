@@ -728,7 +728,12 @@ decision. Two details that are easy to get wrong here:
   something that does not span the whole source, the source video still lands and the failure
   is reported as a warning through `IngestResult.audio_error`. ffmpeg exits `0` even after a
   demux fault or a truncated input, so the artifact's *duration* is checked against the source
-  (tolerance: 1%, floor 2s) rather than trusting the exit code.
+  rather than trusting the exit code. The tolerance is bounded in absolute terms — `max(2s,
+  min(5s, duration × 0.001))`, so 2s under ~33 minutes, at most 5s however long the VOD runs.
+  A transcription timestamp has to line up frame for frame, and a drift that matters is the
+  same size on a three-hour stream as on a ten-minute one; a flat percentage would have waved
+  through 68s of skew on a 1:53:37 VOD. Measured drift through the remux path is a constant
+  0.0106s (AAC frame quantization) and does not grow with length.
 - **Idempotent.** An audio artifact that is already in place is left untouched rather than
   re-encoded and re-uploaded; `--overwrite` replaces both objects.
 
