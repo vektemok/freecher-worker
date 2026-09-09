@@ -24,6 +24,15 @@ from freecher_worker.highlights.models import (
     Highlight,
     compute_candidate_set_id,
 )
+from freecher_worker.evaluation.audio_preview import (
+    AudioPreviewError,
+    AudioPreviewer,
+    ensure_audio_artifact,
+)
+from freecher_worker.evaluation.human_dimensions import (
+    HumanDimensionSummary,
+    summarize_human_dimensions,
+)
 from freecher_worker.evaluation.models import (
     BlindEvaluationDocument,
     BlindEvaluationItem,
@@ -33,7 +42,12 @@ from freecher_worker.evaluation.models import (
     DisagreementReport,
 )
 from freecher_worker.evaluation.metrics import compute_evaluation_metrics
-from freecher_worker.evaluation.annotator import run_terminal_annotator, preview_clip
+from freecher_worker.evaluation.annotator import (
+    collect_candidate_ids,
+    preview_clip,
+    run_dimension_backfill,
+    run_terminal_annotator,
+)
 from freecher_worker.evaluation.disagreements import extract_disagreements
 from freecher_worker.scoring.heuristic import HeuristicScorer
 from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
@@ -570,6 +584,62 @@ def label_eval_command(
         "--all",
         help="Re-label all candidates from start, ignoring existing human scores",
     ),
+    source_id: Optional[str] = typer.Option(
+        None,
+        "--source-id",
+        help=(
+            "Fetch processing/{source_id}/audio.m4a once and enable [a] audio playback "
+            "of each candidate's exact range. The source video is never downloaded."
+        ),
+    ),
+    bucket: Optional[str] = typer.Option(None, "--bucket", help="R2 bucket (default: R2_BUCKET)"),
+    audio_cache: Optional[Path] = typer.Option(
+        None,
+        "--audio-cache",
+        help="Directory for the cached audio artifact (default: ~/.cache/freecher-worker/audio)",
+    ),
+    refresh_audio: bool = typer.Option(
+        False, "--refresh-audio", help="Re-download the audio artifact even if it is cached"
+    ),
+    dimensions: bool = typer.Option(
+        True,
+        "--dimensions/--no-dimensions",
+        help="Ask for hook/standalone/payoff/value/context and bad start/end after each score",
+    ),
+    stats: bool = typer.Option(
+        False,
+        "--stats",
+        help="Print the label summary and exit without annotating",
+    ),
+    dimensions_only: bool = typer.Option(
+        False,
+        "--dimensions-only",
+        help=(
+            "Pass 2: revisit candidates that already have a canonical label and record only "
+            "the structured dimensions. human_score, publishable and notes are never touched."
+        ),
+    ),
+    candidates: Optional[str] = typer.Option(
+        None,
+        "--candidates",
+        help=(
+            "Restrict --dimensions-only to these candidate ids: a comma-separated list, "
+            "or a path to a JSON array of ids"
+        ),
+    ),
+    redo_dimensions: bool = typer.Option(
+        False,
+        "--redo-dimensions",
+        help="With --dimensions-only, also revisit candidates whose dimensions are already recorded",
+    ),
+    show_canonical_label: bool = typer.Option(
+        False,
+        "--show-canonical-label",
+        help=(
+            "With --dimensions-only, display the pass-1 human_score/publishable/notes. "
+            "Hidden by default so they do not anchor the dimension answers."
+        ),
+    ),
 ) -> None:
     """Interactive terminal annotation workflow for blind evaluation."""
     data = load_json(eval_file)
@@ -599,18 +669,168 @@ def label_eval_command(
         console.print(f"[bold red]Error:[/bold red] Unrecognized evaluation format in {eval_file}")
         raise typer.Exit(code=1)
 
+    if stats:
+        _print_dimension_summary(summarize_human_dimensions(eval_doc))
+        return
+
     video_path = video
     if video_path is None and eval_doc.source_video:
         cand_v = Path(eval_doc.source_video)
+        # An R2-backed run records an s3:// URI here, which is not a local file.
         if cand_v.is_file():
             video_path = cand_v
 
-    run_terminal_annotator(
-        eval_doc=eval_doc,
-        eval_file_path=eval_file,
-        video_path=video_path,
-        re_label_all=all_items,
+    previewer = None
+    if source_id:
+        cfg = get_settings()
+        resolved_bucket = bucket or cfg.r2_bucket
+        if not resolved_bucket:
+            console.print(
+                "[bold red]R2 bucket is not configured.[/bold red] Set R2_BUCKET in .env or pass --bucket."
+            )
+            raise typer.Exit(code=1)
+        try:
+            client = build_r2_client(
+                endpoint_url=cfg.r2_endpoint or "",
+                access_key_id=cfg.r2_access_key_id or "",
+                secret_access_key=cfg.r2_secret_access_key or "",
+            )
+        except R2ConfigurationError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(code=1)
+
+        console.print(f"[dim]Fetching audio artifact for {escape(source_id)}...[/dim]")
+        try:
+            cached = ensure_audio_artifact(
+                client,
+                resolved_bucket,
+                source_id,
+                cache_dir=audio_cache,
+                force=refresh_audio,
+            )
+        except AudioPreviewError as exc:
+            console.print(f"[bold red]Audio preview unavailable:[/bold red] {exc}")
+            raise typer.Exit(code=1)
+
+        origin = "cached" if cached.reused else "downloaded"
+        console.print(
+            f"[green]Audio {origin}:[/green] {cached.path} "
+            f"[dim]({cached.megabytes:.1f} MB)[/dim]"
+        )
+        previewer = AudioPreviewer(cached)
+        if not previewer.available:
+            console.print(
+                "[yellow]Warning:[/yellow] ffplay was not found, so [a] will not play anything. "
+                "Install ffmpeg to enable audio preview."
+            )
+
+    selected_ids = None
+    if candidates:
+        if not dimensions_only:
+            console.print("[bold red]--candidates only applies with --dimensions-only.[/bold red]")
+            raise typer.Exit(code=1)
+        try:
+            selected_ids = collect_candidate_ids(candidates)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            console.print(f"[bold red]Could not read the candidate selection:[/bold red] {exc}")
+            raise typer.Exit(code=1)
+        known = {item.candidate_id for item in eval_doc.items}
+        unknown = selected_ids - known
+        if unknown:
+            console.print(
+                f"[yellow]Warning:[/yellow] {len(unknown)} selected id(s) are not in this "
+                f"evaluation set, e.g. {sorted(unknown)[:3]}"
+            )
+        selected_ids &= known
+        console.print(f"[dim]Selection: {len(selected_ids)} candidate(s).[/dim]")
+
+    try:
+        if dimensions_only:
+            run_dimension_backfill(
+                eval_doc=eval_doc,
+                eval_file_path=eval_file,
+                candidate_ids=selected_ids,
+                previewer=previewer,
+                include_complete=redo_dimensions,
+                show_canonical_label=show_canonical_label,
+            )
+        else:
+            run_terminal_annotator(
+                eval_doc=eval_doc,
+                eval_file_path=eval_file,
+                video_path=video_path,
+                re_label_all=all_items,
+                previewer=previewer,
+                capture_dimensions=dimensions,
+            )
+    finally:
+        if previewer is not None:
+            previewer.stop()
+
+    _print_dimension_summary(summarize_human_dimensions(eval_doc))
+
+
+def _print_dimension_summary(summary: "HumanDimensionSummary") -> None:
+    """Render the label summary. Describes the labels only, never a scorer."""
+    console.print()
+    header = Table(title="Human label summary", box=box.SIMPLE)
+    header.add_column("Field", style="cyan")
+    header.add_column("Value", style="white")
+    header.add_row("Candidate set", summary.candidate_set_id)
+    header.add_row(
+        "Labeled",
+        f"{summary.labeled_candidates}/{summary.total_candidates}"
+        + ("  [green](complete)[/green]" if summary.is_complete else "  [yellow](partial)[/yellow]"),
     )
+    if summary.labeled_candidates:
+        header.add_row(
+            "Tiers",
+            f"strong (>=3) {summary.strong_count} · borderline (2) {summary.borderline_count} · "
+            f"reject (<=1) {summary.reject_count}",
+        )
+        header.add_row("Mean human_score", f"{summary.human_score_mean:.2f}")
+        publishable_rate = summary.rate(summary.publishable_count)
+        header.add_row(
+            "Publishable",
+            f"{summary.publishable_count} ({publishable_rate:.1%})" if publishable_rate is not None else "-",
+        )
+    console.print(header)
+
+    if not summary.dimension_labeled_candidates:
+        console.print("[dim]No structured dimensions recorded yet.[/dim]\n")
+        return
+
+    table = Table(title="Dimensions", box=box.SIMPLE)
+    table.add_column("Dimension", style="cyan")
+    table.add_column("n", justify="right")
+    table.add_column("Mean", justify="right")
+    table.add_column("Median", justify="right")
+    table.add_column("0", justify="right")
+    table.add_column("1", justify="right")
+    table.add_column("2", justify="right")
+    table.add_column("3", justify="right")
+    table.add_column("4", justify="right")
+    for dimension in summary.dimensions:
+        label = dimension.field.replace("_", " ")
+        if dimension.lower_is_better:
+            label += " [dim](lower better)[/dim]"
+        table.add_row(
+            label,
+            str(dimension.labeled),
+            f"{dimension.mean:.2f}" if dimension.mean is not None else "-",
+            f"{dimension.median:.1f}" if dimension.median is not None else "-",
+            *[str(dimension.histogram.get(bucket, 0)) for bucket in range(5)],
+        )
+    console.print(table)
+
+    if summary.boundary_labeled:
+        start_rate = summary.rate(summary.bad_start_count, summary.boundary_labeled)
+        end_rate = summary.rate(summary.bad_end_count, summary.boundary_labeled)
+        console.print(
+            f"Boundaries: bad start {summary.bad_start_count}/{summary.boundary_labeled} "
+            f"({start_rate:.1%}) · bad end {summary.bad_end_count}/{summary.boundary_labeled} "
+            f"({end_rate:.1%})\n"
+        )
 
 
 @app.command("preview-candidate")

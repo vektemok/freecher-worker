@@ -18,6 +18,11 @@ class BlindEvaluationItem(BaseModel):
     segment_ids: list[int] = Field(default_factory=list, description="Transcript segment IDs")
 
     # Human annotations (MUST be empty during initial blind export)
+    #
+    # human_score stays the canonical relevance label every ranking metric
+    # reads. The component dimensions below are recorded alongside it and are
+    # never combined into it: a rater's overall judgement is the label, not an
+    # average of its parts.
     human_score: Optional[Union[int, float]] = Field(
         default=None,
         ge=0.0,
@@ -33,6 +38,48 @@ class BlindEvaluationItem(BaseModel):
         description="Free text commentary explaining the rating",
     )
 
+    # Structured dimensions. All optional, so a document labeled before these
+    # existed stays valid and every existing metric keeps working untouched.
+    hook_score: Optional[Union[int, float]] = Field(
+        default=None, ge=0.0, le=4.0,
+        description="How strongly the opening seconds capture attention (0=none, 4=irresistible)",
+    )
+    standalone_score: Optional[Union[int, float]] = Field(
+        default=None, ge=0.0, le=4.0,
+        description="How well it makes sense alone (0=incomprehensible, 4=fully self-contained)",
+    )
+    payoff_score: Optional[Union[int, float]] = Field(
+        default=None, ge=0.0, le=4.0,
+        description="Whether the setup resolves inside the window (0=none, 4=complete payoff)",
+    )
+    value_score: Optional[Union[int, float]] = Field(
+        default=None, ge=0.0, le=4.0,
+        description="Emotional, surprising or informative value (0=flat, 4=striking)",
+    )
+    context_dependency: Optional[Union[int, float]] = Field(
+        default=None, ge=0.0, le=4.0,
+        description="Reliance on prior context: 0=none required, 4=strongly dependent. Lower is better.",
+    )
+    bad_start: Optional[bool] = Field(
+        default=None,
+        description="True when the window opens mid-sentence or mid-thought",
+    )
+    bad_end: Optional[bool] = Field(
+        default=None,
+        description="True when the window cuts off before the thought completes",
+    )
+
+    @property
+    def has_dimensions(self) -> bool:
+        """True once any structured dimension has been recorded."""
+        return any(
+            value is not None
+            for value in (
+                self.hook_score, self.standalone_score, self.payoff_score,
+                self.value_score, self.context_dependency, self.bad_start, self.bad_end,
+            )
+        )
+
 
 class BlindEvaluationDocument(BaseModel):
     """A collection of candidate windows prepared for blind human evaluation."""
@@ -42,8 +89,16 @@ class BlindEvaluationDocument(BaseModel):
     source_video: Optional[str] = Field(default=None, description="Path or name of source video")
     total_candidates: int = Field(description="Total number of candidates in this set")
     labeled_candidates: int = Field(default=0, description="Number of candidates labeled so far")
+    dimension_labeled_candidates: int = Field(
+        default=0, description="Number of candidates carrying the structured dimensions"
+    )
     seed: Optional[int] = Field(default=None, description="Random seed used to shuffle items")
     items: list[BlindEvaluationItem] = Field(default_factory=list, description="List of candidates to evaluate")
+
+    def update_dimension_count(self) -> int:
+        """Recalculate how many candidates carry the structured dimensions."""
+        self.dimension_labeled_candidates = sum(1 for item in self.items if item.has_dimensions)
+        return self.dimension_labeled_candidates
 
     def update_labeled_count(self) -> int:
         """Recalculate and update the count of labeled candidates."""
