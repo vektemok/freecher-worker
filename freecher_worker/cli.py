@@ -6,6 +6,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +14,7 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.markup import escape
 from rich.table import Table
 
 from freecher_worker.config import Settings, get_settings
@@ -36,6 +38,18 @@ from freecher_worker.evaluation.disagreements import extract_disagreements
 from freecher_worker.scoring.heuristic import HeuristicScorer
 from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
 from freecher_worker.media.clipper import is_nvenc_available
+from freecher_worker.ingest import (
+    AVAILABLE_QUALITY_MODES,
+    R2ConfigurationError,
+    UploadProgress,
+    VideoInfo,
+    build_format_selector,
+    build_r2_client,
+    ingest_to_r2,
+    probe_source,
+    render_key,
+    resolve_remux,
+)
 from freecher_worker.pipeline.processor import Manifest, run_pipeline
 from freecher_worker.rendering import (
     AVAILABLE_PRESETS,
@@ -2582,6 +2596,235 @@ def doctor_command() -> None:
 
     console.print(table)
     console.print()
+
+
+@app.command("ingest")
+def ingest_command(
+    url: str = typer.Argument(
+        ...,
+        help="Video URL on any site yt-dlp supports (YouTube, Twitch, Vimeo, RuTube, VK, ...)",
+    ),
+    key: Optional[str] = typer.Option(
+        None,
+        "--key",
+        help="Explicit R2 object key (default: the FREECHER_INGEST_KEY_TEMPLATE pattern)",
+    ),
+    project_id: Optional[str] = typer.Option(
+        None,
+        "--project-id",
+        help="Project id substituted into {project_id} in the key template",
+    ),
+    bucket: Optional[str] = typer.Option(None, "--bucket", help="R2 bucket (default: R2_BUCKET)"),
+    quality: Optional[str] = typer.Option(
+        None,
+        "--quality",
+        "-q",
+        help="'best' (bestvideo+bestaudio muxed on the fly) or 'progressive' (single pre-muxed stream)",
+    ),
+    max_height: Optional[int] = typer.Option(
+        None,
+        "--max-height",
+        help="Cap the source height in pixels (e.g. 1080)",
+    ),
+    part_size_mb: Optional[int] = typer.Option(
+        None,
+        "--part-size",
+        help="Multipart chunk size in MiB (minimum 5, default 16)",
+    ),
+    concurrency: Optional[int] = typer.Option(
+        None,
+        "--concurrency",
+        help="Parts uploaded to R2 in parallel (default 4)",
+    ),
+    cookies_from_browser: Optional[str] = typer.Option(
+        None,
+        "--cookies-from-browser",
+        help="Pass through to yt-dlp when the site demands a signed-in session (e.g. 'chrome')",
+    ),
+    cookies_file: Optional[Path] = typer.Option(
+        None,
+        "--cookies",
+        help="Netscape cookies.txt file passed to yt-dlp",
+    ),
+    remux: Optional[bool] = typer.Option(
+        None,
+        "--remux/--no-remux",
+        help="Force or forbid the ffmpeg pass (default: decided from the probed source)",
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace the object if the key already exists",
+    ),
+    no_probe: bool = typer.Option(
+        False,
+        "--no-probe",
+        help="Skip the metadata probe (an explicit --key is then required)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Resolve metadata and print the plan without transferring anything",
+    ),
+) -> None:
+    """Stream a video from any yt-dlp source straight into R2, staging nothing on disk."""
+    cfg = get_settings()
+
+    resolved_bucket = bucket or cfg.r2_bucket
+    resolved_quality = quality or cfg.ingest_quality
+    resolved_part_size = (part_size_mb or cfg.ingest_part_size_mb) * 1024 * 1024
+    resolved_concurrency = concurrency or cfg.ingest_concurrency
+    resolved_max_height = max_height if max_height is not None else cfg.ingest_max_height
+
+    if resolved_quality not in AVAILABLE_QUALITY_MODES:
+        console.print(
+            f"[bold red]Unknown quality '{resolved_quality}'.[/bold red] "
+            f"Available: {', '.join(AVAILABLE_QUALITY_MODES)}"
+        )
+        sys.exit(1)
+    if no_probe and not key:
+        console.print("[bold red]--no-probe requires an explicit --key.[/bold red]")
+        sys.exit(1)
+    if not resolved_bucket:
+        console.print(
+            "[bold red]R2 bucket is not configured.[/bold red] "
+            "Set R2_BUCKET in .env or pass --bucket."
+        )
+        sys.exit(1)
+
+    if dry_run:
+        try:
+            video = probe_source(
+                url,
+                format_selector=build_format_selector(resolved_quality, resolved_max_height),
+                cookies_from_browser=cookies_from_browser,
+                cookies_file=str(cookies_file) if cookies_file else None,
+            )
+        except Exception as exc:
+            console.print(f"[bold red]Probe failed:[/bold red] {exc}")
+            sys.exit(1)
+        planned_key = key or render_key(cfg.ingest_key_template, video, project_id)
+        console.print(
+            _ingest_plan_panel(
+                video,
+                resolved_bucket,
+                planned_key,
+                resolved_quality,
+                resolved_max_height,
+                resolve_remux(resolved_quality, video, remux),
+            )
+        )
+        console.print("[dim]Dry run: nothing was transferred.[/dim]")
+        return
+
+    try:
+        client = build_r2_client(
+            endpoint_url=cfg.r2_endpoint or "",
+            access_key_id=cfg.r2_access_key_id or "",
+            secret_access_key=cfg.r2_secret_access_key or "",
+        )
+    except R2ConfigurationError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        sys.exit(1)
+
+    progress_state = {"last_report": 0.0}
+
+    def report_video(video: "VideoInfo") -> None:
+        planned_key = key or render_key(cfg.ingest_key_template, video, project_id)
+        console.print(
+            _ingest_plan_panel(
+                video,
+                resolved_bucket,
+                planned_key,
+                resolved_quality,
+                resolved_max_height,
+                resolve_remux(resolved_quality, video, remux),
+            )
+        )
+
+    def report_progress(progress: "UploadProgress") -> None:
+        now = time.monotonic()
+        if now - progress_state["last_report"] < 1.0 and progress.part_number > 1:
+            return
+        progress_state["last_report"] = now
+        percent = progress.percent
+        share = f" ({percent:.1f}%)" if percent is not None else ""
+        console.print(
+            f"[dim]part {progress.part_number:>4}[/dim]  "
+            f"{progress.uploaded_bytes / 1024 / 1024:8.1f} MB{share}  "
+            f"[cyan]{progress.megabytes_per_second:.1f} MB/s[/cyan]"
+        )
+
+    try:
+        result = ingest_to_r2(
+            url,
+            client=client,
+            bucket=resolved_bucket,
+            key=key,
+            key_template=cfg.ingest_key_template,
+            project_id=project_id,
+            quality=resolved_quality,
+            max_height=resolved_max_height,
+            remux=remux,
+            part_size=resolved_part_size,
+            concurrency=resolved_concurrency,
+            probe=not no_probe,
+            overwrite=overwrite,
+            public_base_url=cfg.r2_public_base_url,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=str(cookies_file) if cookies_file else None,
+            on_progress=report_progress,
+            on_video_info=report_video,
+        )
+    except Exception as exc:
+        console.print(f"\n[bold red]Ingest failed:[/bold red] {exc}")
+        sys.exit(1)
+
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+
+    table = Table(title="Ingest complete", box=box.SIMPLE)
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Object", result.uri)
+    table.add_row("Size", f"{result.megabytes:.1f} MB in {result.part_count} parts")
+    table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s ({result.average_megabytes_per_second:.1f} MB/s)")
+    table.add_row("Quality", f"{result.quality} ({escape(result.format_selector)})")
+    table.add_row("Pipeline", "yt-dlp -> ffmpeg remux -> R2" if result.remuxed else "yt-dlp -> R2")
+    if result.video and result.video.extractor:
+        table.add_row("Source", escape(result.video.extractor))
+    if result.public_url:
+        table.add_row("Public URL", result.public_url)
+    console.print(table)
+
+
+def _ingest_plan_panel(
+    video: "VideoInfo",
+    bucket: str,
+    key: str,
+    quality: str,
+    max_height: Optional[int],
+    remux: bool,
+) -> Panel:
+    """Render the resolved source/target summary shown before the transfer."""
+    height_note = f" (max height {max_height}px)" if max_height else ""
+    formats = "+".join(video.requested_format_ids) or "auto"
+    lines = [
+        f"[bold]{escape(video.title)}[/bold]",
+        f"[dim]{escape(video.uploader or 'unknown channel')} · {video.duration_label} · "
+        f"id {escape(video.video_id)}[/dim]",
+        "",
+        f"Source  : {escape(video.extractor or 'unknown')} · format {escape(formats)} · "
+        f"{escape(video.protocol or 'unknown')}",
+        f"Target  : s3://{bucket}/{escape(key)}",
+        f"Quality : {quality}{height_note}",
+        f"Pipeline: {'yt-dlp -> ffmpeg remux -> R2' if remux else 'yt-dlp -> R2 (byte-for-byte)'}",
+    ]
+    if video.filesize_approx:
+        lines.append(f"Size    : ~{video.filesize_approx / 1024 / 1024:.1f} MB estimated")
+    if video.is_live:
+        lines.append("[yellow]Live stream: the transfer runs until the broadcast ends[/yellow]")
+    return Panel("\n".join(lines), title="Source → R2", border_style="cyan")
 
 
 def main() -> None:

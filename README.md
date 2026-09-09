@@ -586,6 +586,90 @@ source .venv/bin/activate
 
 ---
 
+## Streaming Ingest (any source → Cloudflare R2)
+
+`ingest` pulls a video from any site yt-dlp supports — YouTube, Twitch, Vimeo, RuTube,
+VK, or a bare media URL — and pushes it into an R2 bucket **without ever writing the
+full file to local disk**. yt-dlp downloads into a pipe while the uploader consumes that
+pipe as S3 multipart parts, so the two halves run at the same time and memory stays
+bounded at roughly `part_size × concurrency`:
+
+```
+source --> yt-dlp (stdout pipe) --> 16 MiB parts --> R2 multipart --> input/{video_id}/source.mp4
+```
+
+### Configuration
+
+Add to `.env` (see `.env.example`):
+
+```bash
+R2_BUCKET=freecher
+R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_PUBLIC_BASE_URL=          # optional custom domain for a readable URL
+```
+
+The R2 API token needs **Object Read & Write** on the target bucket — multipart upload
+uses `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
+plus `HeadObject` for the overwrite guard.
+
+### Usage
+
+```bash
+# Resolve metadata and print the plan, transfer nothing
+python -m freecher_worker ingest "https://youtu.be/VIDEO_ID" --dry-run
+
+# Max quality: bestvideo+bestaudio muxed into the pipe by ffmpeg (default)
+python -m freecher_worker ingest "https://youtu.be/VIDEO_ID"
+
+# A Twitch VOD — HLS, so ffmpeg assembles the segments on the way through
+python -m freecher_worker ingest "https://www.twitch.tv/videos/VOD_ID"
+
+# Explicit key, capped resolution, larger parts
+python -m freecher_worker ingest "https://vimeo.com/VIDEO_ID" \
+  --key input/proj-42/source.mp4 \
+  --max-height 1080 \
+  --part-size 32 --concurrency 6
+```
+
+Key templates accept `{video_id}`, `{project_id}`, `{extractor}` and `{date}`.
+
+### Quality modes
+
+| Mode | Format selector | Pipe contents |
+|------|-----------------|---------------|
+| `best` (default) | `bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/...` | ffmpeg muxes both tracks into a **fragmented** MP4 |
+| `progressive` | `b[ext=mp4]/b` | one already-muxed stream, copied through byte for byte |
+
+### When ffmpeg sits in the middle
+
+The probe runs the *same* format selector the transfer will use, so the reported protocol
+describes the formats actually chosen. ffmpeg is inserted when the bytes cannot be piped
+through untouched — two tracks to merge, or a segmented protocol (`m3u8`, `http_dash_segments`),
+which is what Twitch and every live platform serve. `--remux` / `--no-remux` overrides the
+decision. Two details that are easy to get wrong here:
+
+- **Fragmented mp4.** mp4's `moov` atom needs a seekable target, which a pipe is not, so the
+  remux asks for `-movflags frag_keyframe+empty_moov+default_base_moof`. Without the explicit
+  `-f mp4` yt-dlp would emit MPEG-TS for a stdout target, and without `--downloader ffmpeg` it
+  would write the two tracks back to back instead of merging them.
+- **`-bsf:a aac_adtstoasc` for HLS.** HLS carries AAC as ADTS frames and the mp4 muxer only
+  accepts ASC. yt-dlp applies this filter only on its own mp4 branch, which a stdout target
+  never reaches, so the ingest adds it whenever the selected source is AAC-over-HLS.
+
+### Safety properties
+
+- **No truncated objects.** yt-dlp's exit code is checked *before* `CompleteMultipartUpload`;
+  a non-zero exit aborts the upload instead of publishing a partial file.
+- **Equal parts.** Every part but the last is exactly `part_size` — R2 rejects a multipart
+  object whose middle parts differ in size — so short pipe reads are always refilled.
+- **No accidental overwrite.** An existing key aborts the run unless `--overwrite` is passed.
+- **No stderr deadlock.** yt-dlp's stderr is drained by a background thread and the last
+  40 lines are attached to any failure.
+
+---
+
 ## CLI Usage
 
 ### Process a Video

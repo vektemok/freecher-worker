@@ -16,6 +16,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "httpx>=0.24.0",
     "opencv-python-headless>=4.8.0",
+    "yt-dlp>=2024.1.0",
+    "boto3>=1.34.0",
 ]
 
 [project.scripts]

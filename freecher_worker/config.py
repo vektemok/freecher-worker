@@ -252,6 +252,41 @@ class Settings(BaseSettings):
     shorts_x264_preset: str = Field(default="veryfast", description="libx264 preset for the final encode")
     shorts_x264_crf: int = Field(default=20, description="libx264 CRF quality for the final encode")
 
+    # Streaming Ingest — Cloudflare R2 (S3-compatible)
+    r2_bucket: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_R2_BUCKET", "R2_BUCKET"),
+        description="R2 bucket that receives ingested source videos",
+    )
+    r2_endpoint: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_R2_ENDPOINT", "R2_ENDPOINT", "R2_ENDPOINT_URL"),
+        description="R2 S3 API endpoint, e.g. https://<account_id>.r2.cloudflarestorage.com",
+    )
+    r2_access_key_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_R2_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"),
+        description="R2 API token access key id",
+    )
+    r2_secret_access_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_R2_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"),
+        description="R2 API token secret access key",
+    )
+    r2_public_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("FREECHER_R2_PUBLIC_BASE_URL", "R2_PUBLIC_BASE_URL"),
+        description="Optional public/custom domain used to build a readable object URL",
+    )
+    ingest_quality: str = Field(default="best", description="Ingest quality mode: 'best' or 'progressive'")
+    ingest_max_height: Optional[int] = Field(default=None, description="Optional cap on source video height in pixels")
+    ingest_part_size_mb: int = Field(default=16, description="Multipart chunk size in MiB (minimum 5)")
+    ingest_concurrency: int = Field(default=4, description="Parts uploaded to R2 in parallel")
+    ingest_key_template: str = Field(
+        default="input/{video_id}/source.mp4",
+        description="Object key template; supports {video_id}, {project_id}, {date}",
+    )
+
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")
 
