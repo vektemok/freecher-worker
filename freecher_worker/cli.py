@@ -51,6 +51,11 @@ from freecher_worker.evaluation.annotator import (
 from freecher_worker.evaluation.disagreements import extract_disagreements
 from freecher_worker.scoring.heuristic import HeuristicScorer
 from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
+from freecher_worker.scoring.audio_text import (
+    AudioTextScorer,
+    AudioTextScoringError,
+    ensure_wav,
+)
 from freecher_worker.scoring.logprob import MODE_BINARY, MODE_GRADED, LogprobBinaryScorer
 from freecher_worker.media.clipper import is_nvenc_available
 from freecher_worker.ingest import (
@@ -901,6 +906,21 @@ def score_run_command(
         "-o",
         help="Custom destination for scores JSON file (default: <run_dir>/scores/<scorer>_<version>.json)",
     ),
+    audio: Optional[Path] = typer.Option(
+        None,
+        "--audio",
+        help="Audio artifact (m4a or wav) for --scorer audio_text; decoded to WAV once",
+    ),
+    text_scores: Optional[Path] = typer.Option(
+        None,
+        "--text-scores",
+        help="Existing scorer document supplying the text side of the audio_text blend",
+    ),
+    audio_weight: float = typer.Option(
+        0.4,
+        "--audio-weight",
+        help="Share of the audio_text blend taken from prosody (0-1, measured plateau 0.4-0.5)",
+    ),
     temperature: Optional[float] = typer.Option(
         None,
         "--temperature",
@@ -1016,6 +1036,45 @@ def score_run_command(
             scorer_version="highlight_v2_1",
             **v2_1_kwargs,
         )
+    elif requested_scorer in ("audio_text", "audio_text_v1"):
+        if audio is None:
+            console.print("[bold red]--audio is required for --scorer audio_text.[/bold red]")
+            raise typer.Exit(code=1)
+        settings = get_settings()
+        blend_text_scores = None
+        if text_scores is not None:
+            if not text_scores.is_file():
+                console.print(f"[bold red]Text scores not found:[/bold red] {text_scores}")
+                raise typer.Exit(code=1)
+            doc = ScorerPredictionDocument.model_validate(load_json(text_scores))
+            if doc.candidate_set_id and doc.candidate_set_id != candidate_set_id:
+                console.print(
+                    f"[bold red]Candidate set mismatch![/bold red] text scores are for "
+                    f"{doc.candidate_set_id}, this run is {candidate_set_id}"
+                )
+                raise typer.Exit(code=1)
+            blend_text_scores = {p.candidate_id: p.score for p in doc.predictions}
+        try:
+            wav = ensure_wav(audio, resolved_dir / "audio.wav")
+        except AudioTextScoringError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(code=1)
+        active_scorer = AudioTextScorer(
+            wav,
+            text_scores=blend_text_scores,
+            text_scorer=None if blend_text_scores is not None else LogprobBinaryScorer(
+                base_url=settings.llm_base_url,
+                api_key=settings.llm_api_key,
+                model=model or settings.llm_model or "gpt-4o-mini",
+                mode=MODE_BINARY,
+            ),
+            audio_weight=audio_weight,
+            source_fingerprint=candidate_set_id,
+            profile_cache=resolved_dir / "audio_profile.json",
+        )
+        actual_scorer = "audio_text"
+        scorer_ver = active_scorer.version
+        actual_model = model or settings.llm_model if blend_text_scores is None else None
     elif requested_scorer in ("logprob", "logprob_v1", "logprob_binary", "logprob_graded"):
         mode = MODE_GRADED if requested_scorer == "logprob_graded" else MODE_BINARY
         settings = get_settings()
