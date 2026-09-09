@@ -739,6 +739,73 @@ decision. Two details that are easy to get wrong here:
 
 ---
 
+## GPU Transcription (R2 audio artifact → transcript.json)
+
+`transcribe` reads the audio artifact ingest produced and writes a transcript beside it.
+It never touches `source.mp4` — the input is the ~50 MB `audio.m4a`, not the 6.25 GB video:
+
+```
+processing/{id}/audio.m4a --> download --> faster-whisper (CUDA) --> processing/{id}/transcript.json
+```
+
+```bash
+# The whole workflow for one source
+python -m freecher_worker transcribe --source-id v2866049874
+
+# Resolve keys and print the plan without spending GPU time
+python -m freecher_worker transcribe --source-id v2866049874 --dry-run
+
+# A smaller model, a forced language, replacing an existing transcript
+python -m freecher_worker transcribe --source-id v2866049874 \
+  --model medium --language ru --overwrite
+```
+
+Defaults come from `.env` and target a single NVIDIA T4:
+
+```bash
+FREECHER_TRANSCRIBE_MODEL=large-v3
+FREECHER_TRANSCRIBE_DEVICE=cuda
+FREECHER_TRANSCRIBE_COMPUTE_TYPE=float16
+FREECHER_TRANSCRIBE_BEAM_SIZE=5
+FREECHER_TRANSCRIBE_VAD_FILTER=true
+FREECHER_TRANSCRIBE_WORD_TIMESTAMPS=true
+```
+
+These are separate from the `FREECHER_ASR_*` settings, which describe the local `process`
+pipeline on modest hardware; `transcribe` is the GPU path.
+
+### What it produces
+
+`transcript.json` carries segment timestamps, word timestamps, the detected language with
+its probability, the full decoding configuration, how long inference took, and the R2 key
+of the audio it was made from — enough to reproduce or audit the run without a database.
+Key order follows the model definition, so an unchanged transcription serialises byte for
+byte identically.
+
+### Safety properties
+
+- **Never the source video.** The workflow only ever reads `processing/{id}/audio.m4a`.
+- **The timeline is the source's.** Word timings sit inside their segment, which sits on
+  the audio timeline ingest aligned to `source.mp4`. The downloaded artifact is
+  cross-checked against the `source-duration-seconds` ingest wrote on the object, using the
+  same bounded tolerance, before any GPU time is spent.
+- **Validated before inference.** A short download is refused by comparing bytes written
+  against `ContentLength`, and the file is probed for a decodable audio stream — feeding
+  Whisper a truncated file yields a short transcript rather than an error.
+- **Atomic output.** The transcript goes up as a single `PutObject` once it is complete, so
+  a failure anywhere leaves the previous object or nothing — never a half-written one.
+- **Idempotent.** An existing, parseable transcript is left alone; `--overwrite` replaces
+  it. An unreadable object at the key is treated as absent, since it cannot be the valid
+  transcript worth protecting.
+- **Temporary files always removed**, including on failure. `--keep-audio` opts out for
+  inspection.
+- **Progress you can read.** A ~2 hour source reports position on the audio timeline,
+  percent, segment count, realtime factor and ETA rather than sitting silent.
+- **An empty transcript is flagged.** Zero segments on real audio is legitimate but almost
+  always means the wrong input, so it is published with a warning rather than silently.
+
+---
+
 ## CLI Usage
 
 ### Process a Video

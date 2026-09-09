@@ -53,6 +53,13 @@ from freecher_worker.ingest import (
     resolve_remux,
 )
 from freecher_worker.pipeline.processor import Manifest, run_pipeline
+from freecher_worker.transcription import (
+    DownloadProgress,
+    TranscriptionProgress,
+    audio_key_for,
+    transcribe_from_r2,
+    transcript_key_for,
+)
 from freecher_worker.rendering import (
     AVAILABLE_PRESETS,
     get_preset,
@@ -2837,6 +2844,195 @@ def ingest_command(
         table.add_row("Audio", f"{artifact.uri}\n[dim]{detail}[/dim]")
     elif result.audio_error:
         table.add_row("Audio", f"[red]not produced: {escape(result.audio_error)}[/red]")
+    console.print(table)
+
+
+@app.command("transcribe")
+def transcribe_command(
+    source_id: Optional[str] = typer.Option(
+        None,
+        "--source-id",
+        help="Source id, i.e. the processing/{source_id}/ folder written by ingest (e.g. v2866049874)",
+    ),
+    bucket: Optional[str] = typer.Option(None, "--bucket", help="R2 bucket (default: R2_BUCKET)"),
+    audio_key: Optional[str] = typer.Option(
+        None, "--audio-key", help="Explicit audio object key (default: processing/{source_id}/audio.m4a)"
+    ),
+    transcript_key: Optional[str] = typer.Option(
+        None, "--transcript-key", help="Explicit transcript key (default: processing/{source_id}/transcript.json)"
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Whisper model (tiny, base, small, medium, turbo, large-v3)"
+    ),
+    device: Optional[str] = typer.Option(None, "--device", "-d", help="Inference device: 'cuda' or 'cpu'"),
+    compute_type: Optional[str] = typer.Option(
+        None, "--compute-type", "-c", help="CTranslate2 compute type (float16, int8_float16, int8, float32)"
+    ),
+    language: Optional[str] = typer.Option(
+        None, "--language", "-l", help="Force a language code; omit for automatic detection"
+    ),
+    beam_size: Optional[int] = typer.Option(None, "--beam-size", help="Beam size for decoding"),
+    word_timestamps: Optional[bool] = typer.Option(
+        None, "--word-timestamps/--no-word-timestamps", help="Emit word-level timestamps (default: on)"
+    ),
+    vad_filter: Optional[bool] = typer.Option(
+        None, "--vad/--no-vad", help="Silero VAD filter (default: on)"
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace an existing transcript.json"
+    ),
+    keep_audio: bool = typer.Option(
+        False, "--keep-audio", help="Leave the downloaded audio on disk for inspection"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Resolve keys and print the plan without transcribing"
+    ),
+) -> None:
+    """Transcribe the R2 audio artifact for a source and write transcript.json beside it."""
+    cfg = get_settings()
+
+    if not source_id and not (audio_key and transcript_key):
+        console.print(
+            "[bold red]--source-id is required[/bold red] unless both --audio-key and "
+            "--transcript-key are given."
+        )
+        sys.exit(1)
+
+    resolved_bucket = bucket or cfg.r2_bucket
+    if not resolved_bucket:
+        console.print(
+            "[bold red]R2 bucket is not configured.[/bold red] Set R2_BUCKET in .env or pass --bucket."
+        )
+        sys.exit(1)
+
+    resolved_model = model or cfg.transcribe_model
+    resolved_device = device or cfg.transcribe_device
+    resolved_compute = compute_type or cfg.transcribe_compute_type
+    resolved_beam = beam_size if beam_size is not None else cfg.transcribe_beam_size
+    resolved_words = cfg.transcribe_word_timestamps if word_timestamps is None else word_timestamps
+    resolved_vad = cfg.transcribe_vad_filter if vad_filter is None else vad_filter
+
+    try:
+        resolved_audio_key = audio_key or audio_key_for(source_id or "")
+        resolved_transcript_key = transcript_key or transcript_key_for(source_id or "")
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        sys.exit(1)
+
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    f"Source  : {escape(source_id or 'explicit keys')}",
+                    f"Audio   : s3://{resolved_bucket}/{escape(resolved_audio_key)}",
+                    f"Output  : s3://{resolved_bucket}/{escape(resolved_transcript_key)}",
+                    f"Model   : {resolved_model} on {resolved_device} ({resolved_compute})",
+                    f"Decoding: beam {resolved_beam} · "
+                    f"{'word timestamps' if resolved_words else 'segment timestamps only'} · "
+                    f"{'VAD on' if resolved_vad else 'VAD off'}",
+                    f"Language: {language or 'auto-detect'}",
+                ]
+            ),
+            title="R2 → transcript",
+            border_style="cyan",
+        )
+    )
+
+    if dry_run:
+        console.print("[dim]Dry run: nothing was transcribed.[/dim]")
+        return
+
+    try:
+        client = build_r2_client(
+            endpoint_url=cfg.r2_endpoint or "",
+            access_key_id=cfg.r2_access_key_id or "",
+            secret_access_key=cfg.r2_secret_access_key or "",
+        )
+    except R2ConfigurationError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        sys.exit(1)
+
+    state = {"last_report": 0.0}
+
+    def report_download(progress: "DownloadProgress") -> None:
+        now = time.monotonic()
+        if now - state["last_report"] < 1.0 and progress.percent not in (None, 100.0):
+            return
+        state["last_report"] = now
+        share = f" ({progress.percent:.0f}%)" if progress.percent is not None else ""
+        console.print(f"[dim]downloading[/dim] {progress.downloaded_bytes / 1024 / 1024:.1f} MB{share}")
+
+    def report_transcribe(progress: "TranscriptionProgress") -> None:
+        now = time.monotonic()
+        if now - state["last_report"] < 2.0:
+            return
+        state["last_report"] = now
+        share = f" ({progress.percent:.1f}%)" if progress.percent is not None else ""
+        eta = progress.eta_seconds
+        eta_label = f" · ETA {_format_timestamp(eta)}" if eta is not None else ""
+        console.print(
+            f"[dim]{_format_timestamp(progress.current_seconds)}[/dim]{share}  "
+            f"{progress.segment_count:>5} segments  "
+            f"[cyan]{progress.speed:.1f}x realtime[/cyan]{eta_label}"
+        )
+
+    try:
+        result = transcribe_from_r2(
+            source_id or "",
+            client=client,
+            bucket=resolved_bucket,
+            audio_key=resolved_audio_key,
+            transcript_key=resolved_transcript_key,
+            model_name=resolved_model,
+            device=resolved_device,
+            compute_type=resolved_compute,
+            beam_size=resolved_beam,
+            vad_filter=resolved_vad,
+            word_timestamps=resolved_words,
+            language=language,
+            overwrite=overwrite,
+            keep_audio=keep_audio,
+            on_download_progress=report_download,
+            on_transcribe_progress=report_transcribe,
+        )
+    except Exception as exc:
+        console.print(f"\n[bold red]Transcription failed:[/bold red] {exc}")
+        sys.exit(1)
+
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+
+    transcript = result.transcript
+    table = Table(title="Transcription complete", box=box.SIMPLE)
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Transcript", result.transcript_uri)
+    if result.skipped:
+        table.add_row("Status", "[yellow]already present, left untouched[/yellow]")
+        table.add_row("Hint", "pass --overwrite to replace it")
+    else:
+        table.add_row("Source", result.audio_uri)
+        table.add_row("Size", f"{result.uploaded_bytes / 1024:.1f} KB")
+        table.add_row(
+            "Timings",
+            f"download {result.download_seconds:.1f}s · "
+            f"transcribe {result.transcribe_seconds:.1f}s · total {result.total_seconds:.1f}s",
+        )
+    if transcript is not None:
+        table.add_row(
+            "Language",
+            f"{transcript.language} (p={transcript.language_probability:.2f})",
+        )
+        table.add_row("Audio", f"{_format_timestamp(transcript.duration)}")
+        words = transcript.word_count
+        table.add_row(
+            "Content",
+            f"{len(transcript.segments)} segments · "
+            + (f"{words} words" if transcript.word_timestamps else "no word timestamps"),
+        )
+        table.add_row("Model", f"{transcript.model} on {transcript.device} ({transcript.compute_type})")
+        if not result.skipped and result.transcribe_seconds > 0 and transcript.duration:
+            table.add_row("Speed", f"{transcript.duration / result.transcribe_seconds:.1f}x realtime")
     console.print(table)
 
 

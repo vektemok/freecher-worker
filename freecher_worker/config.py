@@ -298,6 +298,16 @@ class Settings(BaseSettings):
     ingest_audio_channels: int = Field(default=1, description="Audio channel count; mono for speech")
     ingest_audio_bitrate: str = Field(default="64k", description="Audio bitrate for the transcription artifact")
 
+    # R2-backed transcription (processing/{id}/audio.m4a -> transcript.json).
+    # Separate from the asr_* defaults, which describe the local `process`
+    # pipeline on modest hardware; this milestone targets a T4 with float16.
+    transcribe_model: str = Field(default="large-v3", description="Whisper model for R2 transcription")
+    transcribe_device: str = Field(default="cuda", description="Inference device for R2 transcription")
+    transcribe_compute_type: str = Field(default="float16", description="CTranslate2 compute type on GPU")
+    transcribe_beam_size: int = Field(default=5, description="Beam size for R2 transcription")
+    transcribe_vad_filter: bool = Field(default=True, description="Enable Silero VAD for R2 transcription")
+    transcribe_word_timestamps: bool = Field(default=True, description="Emit word-level timestamps")
+
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")
 
