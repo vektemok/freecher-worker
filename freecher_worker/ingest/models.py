@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from freecher_worker.ingest.audio import AudioArtifact
+
 # S3/R2 multipart constraints. Every part except the last must be at least
 # 5 MiB and — on R2 specifically — every part except the last must be the
 # same size, which is why the reader always fills a full chunk before upload.
@@ -116,6 +118,11 @@ class IngestResult:
     public_url: Optional[str] = None
     etag: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
+    # The transcription artifact is a second object, produced from the same
+    # stream. It is optional by construction: a failure here is reported but
+    # never takes the source video down with it.
+    audio: Optional[AudioArtifact] = None
+    audio_error: Optional[str] = None
 
     @property
     def uri(self) -> str:

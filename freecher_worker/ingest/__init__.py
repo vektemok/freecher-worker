@@ -1,5 +1,19 @@
 """Streaming ingest: any yt-dlp source -> Cloudflare R2, nothing staged on disk."""
 
+from freecher_worker.ingest.audio import (
+    DEFAULT_AUDIO_BITRATE,
+    DEFAULT_AUDIO_CHANNELS,
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_AUDIO_SAMPLE_RATE,
+    AudioArtifact,
+    AudioArtifactError,
+    AudioEncodeSettings,
+    AudioSidecar,
+    TeeReader,
+    build_audio_command,
+    duration_mismatch,
+    probe_audio_file,
+)
 from freecher_worker.ingest.models import (
     AVAILABLE_QUALITY_MODES,
     DEFAULT_PART_SIZE,
@@ -20,7 +34,10 @@ from freecher_worker.ingest.r2 import (
     read_exact,
 )
 from freecher_worker.ingest.service import (
+    AUDIO_FILENAME,
+    AUDIO_KEY_PREFIX,
     DEFAULT_KEY_TEMPLATE,
+    derive_audio_key,
     ingest_to_r2,
     object_exists,
     render_key,
@@ -35,7 +52,13 @@ from freecher_worker.ingest.source import (
 )
 
 __all__ = [
+    "AUDIO_FILENAME",
+    "AUDIO_KEY_PREFIX",
     "AVAILABLE_QUALITY_MODES",
+    "DEFAULT_AUDIO_BITRATE",
+    "DEFAULT_AUDIO_CHANNELS",
+    "DEFAULT_AUDIO_CODEC",
+    "DEFAULT_AUDIO_SAMPLE_RATE",
     "DEFAULT_KEY_TEMPLATE",
     "DEFAULT_PART_SIZE",
     "DIRECT_PROTOCOLS",
@@ -43,19 +66,28 @@ __all__ = [
     "MIN_PART_SIZE",
     "QUALITY_BEST",
     "QUALITY_PROGRESSIVE",
+    "AudioArtifact",
+    "AudioArtifactError",
+    "AudioEncodeSettings",
+    "AudioSidecar",
     "IngestResult",
     "R2ConfigurationError",
     "R2UploadError",
     "SourceStreamError",
     "StreamingMultipartUploader",
+    "TeeReader",
     "UploadProgress",
     "VideoInfo",
+    "build_audio_command",
     "build_format_selector",
     "build_r2_client",
     "build_stream_command",
+    "derive_audio_key",
+    "duration_mismatch",
     "ingest_to_r2",
     "object_exists",
     "open_source_stream",
+    "probe_audio_file",
     "probe_source",
     "read_exact",
     "render_key",

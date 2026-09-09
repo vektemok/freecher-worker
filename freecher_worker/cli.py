@@ -39,12 +39,14 @@ from freecher_worker.scoring.heuristic import HeuristicScorer
 from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
 from freecher_worker.media.clipper import is_nvenc_available
 from freecher_worker.ingest import (
+    AudioEncodeSettings,
     AVAILABLE_QUALITY_MODES,
     R2ConfigurationError,
     UploadProgress,
     VideoInfo,
     build_format_selector,
     build_r2_client,
+    derive_audio_key,
     ingest_to_r2,
     probe_source,
     render_key,
@@ -2651,6 +2653,19 @@ def ingest_command(
         "--remux/--no-remux",
         help="Force or forbid the ffmpeg pass (default: decided from the probed source)",
     ),
+    audio: Optional[bool] = typer.Option(
+        None,
+        "--audio/--no-audio",
+        help=(
+            "Also write a transcription-ready processing/{id}/audio.m4a cut from the "
+            "same stream (default: FREECHER_INGEST_EXTRACT_AUDIO)"
+        ),
+    ),
+    audio_key: Optional[str] = typer.Option(
+        None,
+        "--audio-key",
+        help="Explicit R2 key for the audio artifact (default: derived from the video key)",
+    ),
     overwrite: bool = typer.Option(
         False,
         "--overwrite",
@@ -2675,6 +2690,13 @@ def ingest_command(
     resolved_part_size = (part_size_mb or cfg.ingest_part_size_mb) * 1024 * 1024
     resolved_concurrency = concurrency or cfg.ingest_concurrency
     resolved_max_height = max_height if max_height is not None else cfg.ingest_max_height
+    resolved_audio = cfg.ingest_extract_audio if audio is None else audio
+    audio_settings = AudioEncodeSettings(
+        codec=cfg.ingest_audio_codec,
+        sample_rate=cfg.ingest_audio_sample_rate,
+        channels=cfg.ingest_audio_channels,
+        bitrate=cfg.ingest_audio_bitrate,
+    )
 
     if resolved_quality not in AVAILABLE_QUALITY_MODES:
         console.print(
@@ -2712,6 +2734,8 @@ def ingest_command(
                 resolved_quality,
                 resolved_max_height,
                 resolve_remux(resolved_quality, video, remux),
+                _planned_audio_key(planned_key, audio_key) if resolved_audio else None,
+                audio_settings,
             )
         )
         console.print("[dim]Dry run: nothing was transferred.[/dim]")
@@ -2739,6 +2763,8 @@ def ingest_command(
                 resolved_quality,
                 resolved_max_height,
                 resolve_remux(resolved_quality, video, remux),
+                _planned_audio_key(planned_key, audio_key) if resolved_audio else None,
+                audio_settings,
             )
         )
 
@@ -2775,6 +2801,9 @@ def ingest_command(
             cookies_file=str(cookies_file) if cookies_file else None,
             on_progress=report_progress,
             on_video_info=report_video,
+            extract_audio=resolved_audio,
+            audio_key=audio_key,
+            audio_settings=audio_settings,
         )
     except Exception as exc:
         console.print(f"\n[bold red]Ingest failed:[/bold red] {exc}")
@@ -2795,7 +2824,30 @@ def ingest_command(
         table.add_row("Source", escape(result.video.extractor))
     if result.public_url:
         table.add_row("Public URL", result.public_url)
+    if result.audio is not None:
+        artifact = result.audio
+        if artifact.skipped:
+            detail = "already present, left untouched"
+        else:
+            detail = (
+                f"{artifact.megabytes:.1f} MB · {artifact.codec} "
+                f"{artifact.sample_rate} Hz · "
+                f"{'mono' if artifact.channels == 1 else f'{artifact.channels} ch'}"
+            )
+        table.add_row("Audio", f"{artifact.uri}\n[dim]{detail}[/dim]")
+    elif result.audio_error:
+        table.add_row("Audio", f"[red]not produced: {escape(result.audio_error)}[/red]")
     console.print(table)
+
+
+def _planned_audio_key(video_key: str, explicit: Optional[str]) -> Optional[str]:
+    """The audio key the transfer will use, for the pre-flight plan."""
+    if explicit:
+        return explicit
+    try:
+        return derive_audio_key(video_key)
+    except ValueError:
+        return None
 
 
 def _ingest_plan_panel(
@@ -2805,6 +2857,8 @@ def _ingest_plan_panel(
     quality: str,
     max_height: Optional[int],
     remux: bool,
+    audio_key: Optional[str] = None,
+    audio_settings: Optional["AudioEncodeSettings"] = None,
 ) -> Panel:
     """Render the resolved source/target summary shown before the transfer."""
     height_note = f" (max height {max_height}px)" if max_height else ""
@@ -2820,6 +2874,12 @@ def _ingest_plan_panel(
         f"Quality : {quality}{height_note}",
         f"Pipeline: {'yt-dlp -> ffmpeg remux -> R2' if remux else 'yt-dlp -> R2 (byte-for-byte)'}",
     ]
+    if audio_key and audio_settings is not None:
+        channels = "mono" if audio_settings.channels == 1 else f"{audio_settings.channels} ch"
+        lines.append(
+            f"Audio   : s3://{bucket}/{escape(audio_key)} · {audio_settings.codec} "
+            f"{audio_settings.sample_rate} Hz {channels} @ {audio_settings.bitrate}"
+        )
     if video.filesize_approx:
         lines.append(f"Size    : ~{video.filesize_approx / 1024 / 1024:.1f} MB estimated")
     if video.is_live:

@@ -595,8 +595,13 @@ pipe as S3 multipart parts, so the two halves run at the same time and memory st
 bounded at roughly `part_size × concurrency`:
 
 ```
-source --> yt-dlp (stdout pipe) --> 16 MiB parts --> R2 multipart --> input/{video_id}/source.mp4
+                                 +-> 16 MiB parts -> R2 multipart -> input/{id}/source.mp4
+source --> yt-dlp (stdout pipe) -+
+                                 +-> ffmpeg -vn -> audio.m4a -----> processing/{id}/audio.m4a
 ```
+
+Every ingest produces **two** objects from one pass over the source: the video itself and a
+transcription-ready audio artifact cut from the same bytes on the way past.
 
 ### Configuration
 
@@ -635,6 +640,58 @@ python -m freecher_worker ingest "https://vimeo.com/VIDEO_ID" \
 
 Key templates accept `{video_id}`, `{project_id}`, `{extractor}` and `{date}`.
 
+### The audio artifact
+
+Alongside `input/{id}/source.mp4` the ingest writes `processing/{id}/audio.m4a`, shaped for
+speech recognition rather than for archival: **mono, 16 kHz, AAC-LC at 64 kb/s** — the format
+every ASR frontend resamples to anyway, at roughly 0.5 MB per minute instead of 55.
+
+```bash
+# Both objects (the default)
+python -m freecher_worker ingest "https://www.twitch.tv/videos/VOD_ID"
+
+# Source video only
+python -m freecher_worker ingest "https://youtu.be/VIDEO_ID" --no-audio
+
+# Somewhere else
+python -m freecher_worker ingest "https://youtu.be/VIDEO_ID" --audio-key processing/proj-42/speech.m4a
+```
+
+The encode is configurable in `.env`:
+
+```bash
+FREECHER_INGEST_EXTRACT_AUDIO=true
+FREECHER_INGEST_AUDIO_CODEC=aac
+FREECHER_INGEST_AUDIO_SAMPLE_RATE=16000
+FREECHER_INGEST_AUDIO_CHANNELS=1
+FREECHER_INGEST_AUDIO_BITRATE=64k
+```
+
+The audio key is *derived* from the resolved video key rather than rendered from a template of
+its own, so the pair can never drift apart: the leading `input/` becomes `processing/` and the
+filename becomes `audio.m4a`.
+
+**How it is produced.** A `TeeReader` sits between yt-dlp's pipe and the uploader and mirrors
+every chunk into an ffmpeg process that keeps only the audio track. The video is therefore
+fetched exactly once and never re-read from R2. The mirror runs on its own thread behind a
+byte-bounded queue, so a slow encoder throttles the reader instead of buffering without limit —
+it never drops a byte to keep up.
+
+Only the audio touches the disk, and only until it is uploaded (a temporary directory, removed
+afterwards). Staging it rather than piping ffmpeg into a second multipart upload is what makes
+the artifact a normal seekable `.m4a` whose real codec, sample rate, channels and duration can
+be read back with `ffprobe` *before* the object is written.
+
+**Timeline alignment.** The encode passes `-af aresample=async=1:first_pts=0` and never `-ss`
+or `-t`: a gap in the source is filled with silence instead of pulling the rest of the audio
+earlier, and a track that starts late is padded back to zero rather than shifted. A timestamp
+in `audio.m4a` is therefore the same timestamp in `source.mp4`.
+
+**Object metadata.** The audio object carries enough to reconstruct the pairing without a
+database — `source-key`, `source-bucket`, `source-duration-seconds`, `audio-codec`,
+`audio-sample-rate`, `audio-channels`, `audio-duration-seconds` and `artifact=audio`. Neither
+object is given an ACL, so neither is publicly readable.
+
 ### Quality modes
 
 | Mode | Format selector | Pipe contents |
@@ -667,6 +724,13 @@ decision. Two details that are easy to get wrong here:
 - **No accidental overwrite.** An existing key aborts the run unless `--overwrite` is passed.
 - **No stderr deadlock.** yt-dlp's stderr is drained by a background thread and the last
   40 lines are attached to any failure.
+- **The audio branch can never cost you the video.** If ffmpeg is missing, dies, or produces
+  something that does not span the whole source, the source video still lands and the failure
+  is reported as a warning through `IngestResult.audio_error`. ffmpeg exits `0` even after a
+  demux fault or a truncated input, so the artifact's *duration* is checked against the source
+  (tolerance: 1%, floor 2s) rather than trusting the exit code.
+- **Idempotent.** An audio artifact that is already in place is left untouched rather than
+  re-encoded and re-uploaded; `--overwrite` replaces both objects.
 
 ---
 

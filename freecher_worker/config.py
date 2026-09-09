@@ -286,6 +286,17 @@ class Settings(BaseSettings):
         default="input/{video_id}/source.mp4",
         description="Object key template; supports {video_id}, {project_id}, {date}",
     )
+    # The audio artifact key is derived from the resolved video key
+    # (input/<id>/source.mp4 -> processing/<id>/audio.m4a), so it has no
+    # template of its own; only the encode is configurable.
+    ingest_extract_audio: bool = Field(
+        default=True,
+        description="Also write a transcription-ready processing/{id}/audio.m4a during ingest",
+    )
+    ingest_audio_codec: str = Field(default="aac", description="Audio codec for the transcription artifact")
+    ingest_audio_sample_rate: int = Field(default=16000, description="Audio sample rate in Hz (16 kHz is what ASR uses)")
+    ingest_audio_channels: int = Field(default=1, description="Audio channel count; mono for speech")
+    ingest_audio_bitrate: str = Field(default="64k", description="Audio bitrate for the transcription artifact")
 
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")

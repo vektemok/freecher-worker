@@ -8,16 +8,28 @@ version = "0.2.0"
 description = "Local worker for automated video highlight extraction and clipping"
 readme = "README.md"
 requires-python = ">=3.12"
+# Every third-party module the package imports directly is listed here, plus
+# yt-dlp, which is invoked as an executable and is looked up next to the
+# current interpreter — so it has to live in the same environment. Relying on
+# a transitive dependency to supply an import is how boto3 and yt-dlp came to
+# be missing from an editable install in the first place.
 dependencies = [
     "faster-whisper>=1.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "typer>=0.9.0",
+    "rich>=13.0.0",
     "python-dotenv>=1.0.0",
     "httpx>=0.24.0",
+    "numpy>=1.24.0",
     "opencv-python-headless>=4.8.0",
     "yt-dlp>=2024.1.0",
     "boto3>=1.34.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
 ]
 
 [project.scripts]
