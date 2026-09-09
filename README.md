@@ -806,6 +806,72 @@ byte identically.
 
 ---
 
+## Highlight Discovery (R2 transcript → ranked highlights)
+
+`discover` turns a transcript into ranked highlights without a video anywhere in sight:
+
+```
+processing/{id}/transcript.json
+   -> generate_candidate_windows -> heuristic_v1 -> rank_and_deduplicate
+        -> processing/{id}/candidates.json
+        -> processing/{id}/highlights.json
+        -> processing/{id}/manifest.json
+```
+
+```bash
+python -m freecher_worker discover --source-id v2866049874
+
+# Mirror the artifacts locally so `inspect` and `export-eval` can read them
+python -m freecher_worker discover --source-id v2866049874 --local-dir runs/v2866049874
+
+# Different window shape, more highlights
+python -m freecher_worker discover --source-id v2866049874 \
+  --target-seconds 45 --overlap 10 --top-k 10 --overwrite
+```
+
+The candidate generator, heuristic scorer, deduplicator and ranker are used **unchanged** —
+this command is orchestration, not a second implementation of the algorithms.
+
+### Run identity without a local file
+
+`SourceFingerprint` normally identifies a run by a video's size, mtime and sampled content.
+An R2-backed run has no such file, and inventing one would make the manifest lie. Its
+identity is instead the remote one — `source_id + transcript key + transcript hash` — which
+is equally deterministic: re-running over an unchanged transcript reproduces the same
+`fingerprint_id`, and a changed transcript produces a different one. Local-only fields such
+as `mtime_ns` are left unset rather than zero-filled, and `kind` distinguishes the two.
+
+The synthesized manifest says plainly that no video exists: `run_kind` is `r2_transcript`,
+`source_video_available` is `false`, `source` is the `s3://` URI, no highlight claims a clip
+file, and the probe/audio/clipping timings stay at zero because those stages did not run.
+Transcription time is carried over from what the transcript itself records. Anything
+downstream that needs frames learns this from the manifest instead of from a missing file.
+
+### Safety properties
+
+- **No video is read.** The only object fetched is `transcript.json`.
+- **Deterministic identity.** `candidate_set_id` covers the transcript hash and every window
+  parameter; the run fingerprint covers the remote identity.
+- **Idempotent.** A complete, parseable artifact set is left untouched; `--overwrite`
+  rebuilds it. A *partial* set is rebuilt rather than trusted.
+- **The manifest is written last**, so its presence marks a finished run — the same
+  condition `_resolve_run_path` already uses. A failure part-way leaves no manifest.
+- **Nothing is published on failure.** A bad transcript or a failing scorer raises before
+  any object is written.
+- **No LLM calls and no multimodal scoring** in this milestone; `heuristic_v1` needs no
+  network at all.
+
+### Measured on the real 1:53:37 VOD
+
+| | |
+|---|---|
+| Candidates | 146 windows |
+| Duration min/mean/max | 52.2 / 61.8 / 75.2 s |
+| Scorer | `heuristic_v1` |
+| Load + discovery | ~4 s + ~0.02 s |
+
+---
+
 ## CLI Usage
 
 ### Process a Video

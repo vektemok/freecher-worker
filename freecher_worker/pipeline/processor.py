@@ -105,6 +105,21 @@ class HighlightManifestItem(BaseModel):
     score_breakdown: Optional[HighlightScore] = None
 
 
+LOCAL_VIDEO_RUN = "local_video"
+R2_TRANSCRIPT_RUN = "r2_transcript"
+
+
+class R2ArtifactInfo(BaseModel):
+    """Where an R2-backed run read from and wrote to."""
+
+    bucket: str
+    source_id: str
+    transcript_key: str
+    candidates_key: str
+    highlights_key: str
+    manifest_key: str
+
+
 class Manifest(BaseModel):
     pipeline_version: str = PIPELINE_VERSION
     created_at: str
@@ -118,6 +133,16 @@ class Manifest(BaseModel):
     timings: PipelineTimings
     statistics: PipelineStatistics
     highlights: list[HighlightManifestItem] = Field(default_factory=list)
+
+    # A run driven from an R2 transcript has no video anywhere on this machine,
+    # so anything downstream that wants frames has to know that up front rather
+    # than discovering it as a missing file. Defaults describe the local
+    # pipeline, which is what every manifest written before this meant.
+    run_kind: str = Field(default=LOCAL_VIDEO_RUN, description="local_video or r2_transcript")
+    source_video_available: bool = Field(
+        default=True, description="False when no local video exists for this run"
+    )
+    r2: Optional[R2ArtifactInfo] = Field(default=None, description="Remote artifact locations for an R2-backed run")
 
 
 def _resolve_run_dir(

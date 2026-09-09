@@ -52,7 +52,13 @@ from freecher_worker.ingest import (
     render_key,
     resolve_remux,
 )
+from freecher_worker.highlights.r2 import discover_from_r2
 from freecher_worker.pipeline.processor import Manifest, run_pipeline
+from freecher_worker.highlights.r2 import (
+    candidates_key_for,
+    highlights_key_for,
+    manifest_key_for,
+)
 from freecher_worker.transcription import (
     DownloadProgress,
     TranscriptionProgress,
@@ -3034,6 +3040,159 @@ def transcribe_command(
         if not result.skipped and result.transcribe_seconds > 0 and transcript.duration:
             table.add_row("Speed", f"{transcript.duration / result.transcribe_seconds:.1f}x realtime")
     console.print(table)
+
+
+@app.command("discover")
+def discover_command(
+    source_id: str = typer.Option(
+        ...,
+        "--source-id",
+        help="Source id, i.e. the processing/{source_id}/ folder holding transcript.json",
+    ),
+    bucket: Optional[str] = typer.Option(None, "--bucket", help="R2 bucket (default: R2_BUCKET)"),
+    top_k: Optional[int] = typer.Option(None, "--top-k", "-k", help="Number of highlights to keep"),
+    min_seconds: Optional[float] = typer.Option(None, "--min-seconds", help="Minimum candidate window length"),
+    target_seconds: Optional[float] = typer.Option(None, "--target-seconds", help="Target candidate window length"),
+    max_seconds: Optional[float] = typer.Option(None, "--max-seconds", help="Maximum candidate window length"),
+    overlap_seconds: Optional[float] = typer.Option(None, "--overlap", help="Overlap between adjacent windows"),
+    dedup_threshold: Optional[float] = typer.Option(None, "--dedup-threshold", help="Temporal overlap suppression threshold"),
+    local_dir: Optional[Path] = typer.Option(
+        None,
+        "--local-dir",
+        help="Also mirror the artifacts into this run directory so 'inspect' and 'export-eval' can read them",
+    ),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace an existing artifact set"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve keys and print the plan without discovering"),
+) -> None:
+    """Discover ranked highlights from an R2 transcript, writing candidates/highlights/manifest."""
+    cfg = get_settings()
+
+    resolved_bucket = bucket or cfg.r2_bucket
+    if not resolved_bucket:
+        console.print(
+            "[bold red]R2 bucket is not configured.[/bold red] Set R2_BUCKET in .env or pass --bucket."
+        )
+        sys.exit(1)
+
+    resolved_top_k = top_k if top_k is not None else cfg.highlight_top_k
+    resolved_min = min_seconds if min_seconds is not None else cfg.highlight_min_seconds
+    resolved_target = target_seconds if target_seconds is not None else cfg.highlight_target_seconds
+    resolved_max = max_seconds if max_seconds is not None else cfg.highlight_max_seconds
+    resolved_overlap = overlap_seconds if overlap_seconds is not None else cfg.highlight_overlap_seconds
+    resolved_dedup = dedup_threshold if dedup_threshold is not None else cfg.dedup_overlap_threshold
+
+    try:
+        keys = {
+            "transcript": transcript_key_for(source_id),
+            "candidates": candidates_key_for(source_id),
+            "highlights": highlights_key_for(source_id),
+            "manifest": manifest_key_for(source_id),
+        }
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        sys.exit(1)
+
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    f"Source  : {escape(source_id)} [dim](no video; transcript-backed run)[/dim]",
+                    f"Input   : s3://{resolved_bucket}/{escape(keys['transcript'])}",
+                    f"Output  : s3://{resolved_bucket}/{escape(keys['candidates'])}",
+                    f"          s3://{resolved_bucket}/{escape(keys['highlights'])}",
+                    f"          s3://{resolved_bucket}/{escape(keys['manifest'])}",
+                    f"Windows : {resolved_min:g}-{resolved_max:g}s, target {resolved_target:g}s, "
+                    f"overlap {resolved_overlap:g}s",
+                    f"Ranking : heuristic_v1 · top {resolved_top_k} · dedup {resolved_dedup:g}",
+                ]
+            ),
+            title="transcript → highlights",
+            border_style="cyan",
+        )
+    )
+
+    if dry_run:
+        console.print("[dim]Dry run: nothing was discovered.[/dim]")
+        return
+
+    try:
+        client = build_r2_client(
+            endpoint_url=cfg.r2_endpoint or "",
+            access_key_id=cfg.r2_access_key_id or "",
+            secret_access_key=cfg.r2_secret_access_key or "",
+        )
+    except R2ConfigurationError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        sys.exit(1)
+
+    try:
+        result = discover_from_r2(
+            source_id,
+            client=client,
+            bucket=resolved_bucket,
+            min_seconds=resolved_min,
+            target_seconds=resolved_target,
+            max_seconds=resolved_max,
+            overlap_seconds=resolved_overlap,
+            top_k=resolved_top_k,
+            dedup_threshold=resolved_dedup,
+            overwrite=overwrite,
+            local_dir=local_dir,
+        )
+    except Exception as exc:
+        console.print(f"\n[bold red]Discovery failed:[/bold red] {exc}")
+        sys.exit(1)
+
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+
+    if result.skipped:
+        console.print(
+            "\n[yellow]Artifacts already present, left untouched.[/yellow] "
+            "[dim]Pass --overwrite to rebuild them.[/dim]"
+        )
+
+    low, mean, high = result.candidate_durations
+    summary = Table(title="Discovery complete", box=box.SIMPLE)
+    summary.add_column("Field", style="cyan")
+    summary.add_column("Value", style="white")
+    summary.add_row("Candidates", f"{len(result.candidates)} windows ({low:.1f} / {mean:.1f} / {high:.1f}s min/mean/max)")
+    summary.add_row("Candidate set", result.candidate_set_id)
+    summary.add_row("Scorer", result.scorer_version)
+    summary.add_row("Highlights", f"{len(result.highlights)} ranked")
+    if result.manifest is not None:
+        summary.add_row("Run identity", result.manifest.source_fingerprint.fingerprint_id)
+    if not result.skipped:
+        summary.add_row(
+            "Timings",
+            f"load {result.load_seconds:.2f}s · candidates {result.candidate_seconds:.2f}s · "
+            f"score {result.scoring_seconds:.2f}s · rank {result.ranking_seconds:.2f}s · "
+            f"total {result.total_seconds:.2f}s",
+        )
+    summary.add_row("Written", "\n".join(result.uri(k) for k in (result.candidates_key, result.highlights_key, result.manifest_key)))
+    if local_dir is not None:
+        summary.add_row("Mirrored", str(local_dir))
+    console.print(summary)
+
+    if result.highlights:
+        table = Table(title=f"Top {len(result.highlights)} highlights", box=box.SIMPLE)
+        table.add_column("#", justify="center", style="cyan")
+        table.add_column("Time", justify="center", style="magenta")
+        table.add_column("Len", justify="right")
+        table.add_column("Score", justify="right", style="bold yellow")
+        table.add_column("Text")
+        for highlight in result.highlights:
+            preview = highlight.text.strip().replace("\n", " ")
+            if len(preview) > 90:
+                preview = preview[:87] + "..."
+            table.add_row(
+                str(highlight.rank),
+                f"{_format_timestamp(highlight.start)}-{_format_timestamp(highlight.end)}",
+                f"{highlight.duration:.0f}s",
+                f"{highlight.score:.1f}",
+                escape(preview),
+            )
+        console.print(table)
 
 
 def _planned_audio_key(video_key: str, explicit: Optional[str]) -> Optional[str]:
