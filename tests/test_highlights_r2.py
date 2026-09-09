@@ -578,3 +578,42 @@ def test_an_empty_result_reports_zeroed_durations():
         bucket=BUCKET, source_id=SOURCE_ID, transcript_key=TRANSCRIPT_KEY,
         candidates_key=CANDIDATES_KEY, highlights_key=HIGHLIGHTS_KEY, manifest_key=MANIFEST_KEY,
     ).candidate_durations == (0.0, 0.0, 0.0)
+
+
+# --------------------------------------------------------------------------
+# mirroring is reported from what happened, not what was asked for
+# --------------------------------------------------------------------------
+
+
+def test_a_skipped_run_still_writes_the_local_mirror(client, tmp_path):
+    # Skipping the work must not skip the mirror: whether R2 already held the
+    # artifacts is beside the point if a local run directory was requested.
+    discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET)
+    run_dir = tmp_path / "run"
+
+    again = discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET, local_dir=run_dir)
+
+    assert again.skipped is True
+    assert again.mirrored_to == str(run_dir)
+    for name in ("manifest.json", "candidates.json", "highlights.json", "transcript.json"):
+        assert (run_dir / name).is_file(), name
+
+
+def test_a_skipped_mirror_carries_the_same_candidate_set(client, tmp_path):
+    first = discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET)
+    run_dir = tmp_path / "run"
+
+    discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET, local_dir=run_dir)
+
+    mirrored = CandidateDocument.model_validate(json.loads((run_dir / "candidates.json").read_text()))
+    assert mirrored.candidate_set_id == first.candidate_set_id
+    assert len(mirrored.candidates) == len(first.candidates)
+
+
+def test_mirroring_is_only_reported_when_it_actually_happened(client, tmp_path):
+    # Nothing requested, nothing claimed.
+    assert discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET).mirrored_to is None
+
+    run_dir = tmp_path / "run"
+    fresh = discover_from_r2(SOURCE_ID, client=client, bucket=BUCKET, overwrite=True, local_dir=run_dir)
+    assert fresh.mirrored_to == str(run_dir)

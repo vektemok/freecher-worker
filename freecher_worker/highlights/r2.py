@@ -93,6 +93,7 @@ class DiscoveryResult:
     scoring_seconds: float = 0.0
     ranking_seconds: float = 0.0
     total_seconds: float = 0.0
+    mirrored_to: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -305,6 +306,28 @@ def discover_from_r2(
         existing = _existing_run(client, bucket, artifacts)
         if existing is not None:
             logger.info("discovery artifacts already present, skipping: %s", artifacts.manifest_key)
+            if local_dir is not None and existing.manifest is not None:
+                # Skipping the work must not skip the mirror: the caller asked
+                # for a local run directory, and whether R2 already held the
+                # artifacts is beside the point. The transcript is fetched here
+                # because the skip path never loaded it.
+                transcript, _ = load_transcript_from_r2(client, bucket, resolved_transcript_key)
+                _mirror_locally(
+                    Path(local_dir),
+                    CandidateDocument(
+                        transcript_hash=transcript.compute_transcript_hash(),
+                        min_seconds=existing.manifest.candidate_config.min_seconds,
+                        target_seconds=existing.manifest.candidate_config.target_seconds,
+                        max_seconds=existing.manifest.candidate_config.max_seconds,
+                        overlap_seconds=existing.manifest.candidate_config.overlap,
+                        candidates=existing.candidates,
+                        candidate_set_id=existing.candidate_set_id,
+                    ),
+                    existing.highlights,
+                    existing.manifest,
+                    transcript,
+                )
+                existing.mirrored_to = str(local_dir)
             return existing
 
     if not object_exists(client, bucket, resolved_transcript_key):
@@ -429,8 +452,10 @@ def discover_from_r2(
         artifacts.manifest_key,
     )
 
+    mirrored_to: Optional[str] = None
     if local_dir is not None:
         _mirror_locally(Path(local_dir), candidate_document, highlights, manifest, transcript)
+        mirrored_to = str(local_dir)
 
     return DiscoveryResult(
         bucket=bucket,
@@ -450,6 +475,7 @@ def discover_from_r2(
         scoring_seconds=round(scoring_seconds, 3),
         ranking_seconds=round(ranking_seconds, 3),
         total_seconds=round(time.perf_counter() - started_at, 3),
+        mirrored_to=mirrored_to,
         warnings=warnings,
     )
 

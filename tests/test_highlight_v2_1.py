@@ -20,6 +20,7 @@ import pytest
 from typer.testing import CliRunner
 
 from freecher_worker.cli import app
+from freecher_worker.config import Settings
 from freecher_worker.utils.json_io import load_json, save_json
 from freecher_worker.highlights.models import (
     CandidateDocument,
@@ -435,6 +436,12 @@ def test_benchmark_score_run_cannot_silently_mix_llm_and_heuristic(tmp_path, mon
     monkeypatch.delenv("FREECHER_LLM_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ARNY_LLM_API_KEY", raising=False)
+    # delenv only clears the environment; Settings also reads the developer's
+    # .env, so without this the test silently stops simulating "no API key"
+    # the moment a real key is configured locally.
+    monkeypatch.setattr(
+        "freecher_worker.cli.get_settings", lambda: Settings(_env_file=None)
+    )
 
     # 1. Default (no --allow-fallback): MUST FAIL!
     res = runner.invoke(app, ["score-run", str(run_dir), "--scorer", "highlight_v2_1"])

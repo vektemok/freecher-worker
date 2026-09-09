@@ -51,6 +51,7 @@ from freecher_worker.evaluation.annotator import (
 from freecher_worker.evaluation.disagreements import extract_disagreements
 from freecher_worker.scoring.heuristic import HeuristicScorer
 from freecher_worker.scoring.llm import OpenAILLMScorer, compute_score_distribution
+from freecher_worker.scoring.logprob import MODE_BINARY, MODE_GRADED, LogprobBinaryScorer
 from freecher_worker.media.clipper import is_nvenc_available
 from freecher_worker.ingest import (
     AudioEncodeSettings,
@@ -900,6 +901,14 @@ def score_run_command(
         "-o",
         help="Custom destination for scores JSON file (default: <run_dir>/scores/<scorer>_<version>.json)",
     ),
+    temperature: Optional[float] = typer.Option(
+        None,
+        "--temperature",
+        help=(
+            "Sampling temperature. Leave unset for each scorer's own default; "
+            "the gpt-5.5/5.6 families accept only 1."
+        ),
+    ),
     source_video: Optional[Path] = typer.Option(
         None,
         "--source-video",
@@ -998,24 +1007,41 @@ def score_run_command(
         scorer_ver = "highlight_v2_1"
         settings = get_settings()
         actual_model = model or settings.llm_model or "gpt-4o-mini"
+        v2_1_kwargs = {} if temperature is None else {"temperature": temperature}
         active_scorer = OpenAILLMScorer(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             model=actual_model,
             allow_fallback=allow_fallback,
             scorer_version="highlight_v2_1",
+            **v2_1_kwargs,
         )
+    elif requested_scorer in ("logprob", "logprob_v1", "logprob_binary", "logprob_graded"):
+        mode = MODE_GRADED if requested_scorer == "logprob_graded" else MODE_BINARY
+        settings = get_settings()
+        actual_model = model or settings.llm_model or "gpt-4o-mini"
+        active_scorer = LogprobBinaryScorer(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=actual_model,
+            mode=mode,
+            temperature=temperature if temperature is not None else 0.0,
+        )
+        actual_scorer = "logprob"
+        scorer_ver = active_scorer.version
     elif requested_scorer == "highlight_v2":
         actual_scorer = "highlight_v2"
         scorer_ver = "highlight_v2"
         settings = get_settings()
         actual_model = model or settings.llm_model or "gpt-4o-mini"
+        v2_kwargs = {} if temperature is None else {"temperature": temperature}
         active_scorer = OpenAILLMScorer(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             model=actual_model,
             allow_fallback=allow_fallback,
             scorer_version="highlight_v2",
+            **v2_kwargs,
         )
     else:
         requested_scorer = "heuristic"
@@ -3390,8 +3416,9 @@ def discover_command(
             f"total {result.total_seconds:.2f}s",
         )
     summary.add_row("Written", "\n".join(result.uri(k) for k in (result.candidates_key, result.highlights_key, result.manifest_key)))
-    if local_dir is not None:
-        summary.add_row("Mirrored", str(local_dir))
+    # Reported from what actually happened, not from what was requested.
+    if result.mirrored_to:
+        summary.add_row("Mirrored", result.mirrored_to)
     console.print(summary)
 
     if result.highlights:

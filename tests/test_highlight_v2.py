@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from freecher_worker.cli import app
+from freecher_worker.config import Settings
 from freecher_worker.evaluation.metrics import compute_evaluation_metrics
 from freecher_worker.evaluation.models import (
     BlindEvaluationDocument,
@@ -269,6 +270,12 @@ def test_benchmark_score_run_fails_without_allow_fallback(tmp_path, monkeypatch)
     monkeypatch.delenv("FREECHER_LLM_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ARNY_LLM_API_KEY", raising=False)
+    # delenv only clears the environment; Settings also reads the developer's
+    # .env, so without this the test silently stops simulating "no API key"
+    # the moment a real key is configured locally.
+    monkeypatch.setattr(
+        "freecher_worker.cli.get_settings", lambda: Settings(_env_file=None)
+    )
 
     # 1. Default (no --allow-fallback): must fail!
     res = runner.invoke(app, ["score-run", str(run_dir), "--scorer", "highlight_v2"])
