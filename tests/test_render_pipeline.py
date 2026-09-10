@@ -293,3 +293,303 @@ def test_cli_inspect_displays_rendered_shorts(tmp_path):
     assert res.exit_code == 0
     assert "Rendered Vertical Shorts (1):" in res.output
     assert "1080x1920" in res.output
+
+
+# ==============================================================================
+# --source-video override (explicit only, no guessing)
+# ==============================================================================
+
+
+def _make_r2_style_run(tmp_path):
+    """A run whose manifest records an s3:// URI, as an R2-backed run does.
+
+    The video exists on disk but the manifest cannot name it, which is exactly
+    the situation the override is for.
+    """
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    manifest = load_json(run_dir / "manifest.json")
+    real_video = Path(manifest["source"])
+    manifest["source"] = "s3://bucket/processing/abc123/transcript.json"
+    save_json(manifest, run_dir / "manifest.json")
+    return run_dir, real_video
+
+
+def test_render_highlight_uses_the_explicit_source_video(tmp_path):
+    run_dir, real_video = _make_r2_style_run(tmp_path)
+
+    # Without the override the manifest is unusable and the command must refuse.
+    without = runner.invoke(app, ["render-highlight", str(run_dir), "--rank", "1", "--force"])
+    assert without.exit_code == 1
+    assert "Source video does not exist" in without.output
+
+    # With it, the render proceeds from the named file.
+    with_flag = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--rank", "1", "--force",
+        "--source-video", str(real_video),
+    ])
+    assert with_flag.exit_code == 0, with_flag.output
+
+
+def test_render_batch_uses_the_explicit_source_video(tmp_path):
+    run_dir, real_video = _make_r2_style_run(tmp_path)
+
+    without = runner.invoke(app, ["render", str(run_dir), "--top-k", "1", "--force"])
+    assert without.exit_code != 0
+
+    with_flag = runner.invoke(app, [
+        "render", str(run_dir), "--top-k", "1", "--force", "--source-video", str(real_video),
+    ])
+    assert with_flag.exit_code == 0, with_flag.output
+    assert (run_dir / "render_manifest.json").is_file()
+
+
+def test_a_missing_override_fails_with_a_clear_message(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    missing = tmp_path / "nowhere" / "absent.mp4"
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--rank", "1", "--force", "--source-video", str(missing),
+    ])
+
+    assert result.exit_code == 1
+    # Names the flag, so the reader knows which input was wrong.
+    assert "--source-video" in result.output
+    assert "absent.mp4" in result.output
+
+
+def test_a_directory_is_not_accepted_as_a_source_video(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--rank", "1", "--force", "--source-video", str(tmp_path),
+    ])
+
+    assert result.exit_code == 1
+    assert "--source-video" in result.output
+
+
+def test_the_override_is_not_consulted_when_absent(tmp_path):
+    """Backward compatibility: without the flag the manifest still decides."""
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    manifest_path = Path(load_json(run_dir / "manifest.json")["source"])
+
+    result = runner.invoke(app, ["render-highlight", str(run_dir), "--rank", "1", "--force"])
+
+    assert result.exit_code == 0, result.output
+    # The file the manifest names is the one that was rendered from. Only the
+    # basename is checked: rich wraps long paths across lines in the output.
+    assert manifest_path.name in result.output
+    assert "does not exist" not in result.output
+
+
+def test_the_library_function_defaults_to_the_manifest(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+
+    # No override argument at all: the pre-existing signature still works.
+    render_manifest = render_highlights_for_run(run_dir=run_dir, top_k=1, force=True)
+
+    assert len(render_manifest.shorts) == 1
+
+
+def test_the_library_function_rejects_a_missing_override(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="--source-video"):
+        render_highlights_for_run(
+            run_dir=run_dir, top_k=1, force=True,
+            source_video_override=tmp_path / "absent.mp4",
+        )
+
+
+# ==============================================================================
+# render-highlight: an explicit candidate outside the top-K
+# ==============================================================================
+
+
+def _add_unranked_candidate(run_dir, candidate_id="cand_0099", start=0.2, end=2.4):
+    """Put a candidate in candidates.json that highlights.json does not list."""
+    doc = {
+        "candidate_set_id": "cset_render_test",
+        "transcript_hash": "hash_render_test",
+        "min_seconds": 2.0,
+        "target_seconds": 3.0,
+        "max_seconds": 4.0,
+        "overlap_seconds": 1.0,
+        "candidates": [
+            {
+                "id": candidate_id,
+                "start": start,
+                "end": end,
+                "duration": round(end - start, 2),
+                "text": "Кандидат вне топ-К.",
+                "segment_ids": [0],
+            }
+        ],
+    }
+    save_json(doc, run_dir / "candidates.json")
+    return doc["candidates"][0]
+
+
+def test_a_candidate_present_in_highlights_still_renders(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    _add_unranked_candidate(run_dir)  # unrelated extra candidate
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_0001", "--force",
+    ])
+
+    assert result.exit_code == 0, result.output
+    # The ranked path is taken, so no fallback note appears.
+    assert "not in highlights.json" not in result.output
+
+
+def test_a_candidate_outside_the_top_k_renders_from_the_frozen_set(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    window = _add_unranked_candidate(run_dir, "cand_0099", start=0.2, end=2.4)
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_0099", "--force",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "not in highlights.json" in result.output
+    # The frozen boundaries are the ones used, not a re-derived window.
+    assert f"{window['start']:.2f}-{window['end']:.2f}s" in result.output
+
+
+def test_the_frozen_boundaries_survive_into_the_render(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    window = _add_unranked_candidate(run_dir, "cand_0099", start=0.3, end=2.1)
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_0099", "--force",
+    ])
+    assert result.exit_code == 0, result.output
+
+    # The window the renderer starts from is the frozen one. What it finally
+    # cuts may differ -- boundary refinement is a separate existing feature --
+    # so this pins the input, which is what "frozen" means here.
+    assert f"{window['start']:.2f}-{window['end']:.2f}s" in result.output
+    # rank 0 marks a candidate rendered outside any ranking.
+    rendered = run_dir / "final" / "short_00.mp4"
+    assert rendered.is_file(), f"no rendered file at {rendered}"
+
+
+def test_a_candidate_in_neither_file_fails_clearly(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    _add_unranked_candidate(run_dir, "cand_0099")
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_nope", "--force",
+    ])
+
+    assert result.exit_code == 1
+    assert "cand_nope" in result.output
+    # Both places that were searched are named, so the reader can check either.
+    assert "highlights.json" in result.output and "candidates.json" in result.output
+
+
+def test_the_fallback_does_not_apply_to_rank(tmp_path):
+    """--rank only means something inside a ranking, so no fallback for it."""
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    _add_unranked_candidate(run_dir, "cand_0099")
+
+    result = runner.invoke(app, ["render-highlight", str(run_dir), "--rank", "99", "--force"])
+
+    assert result.exit_code == 1
+    assert "candidates.json" not in result.output
+
+
+def test_batch_render_is_unaffected_by_the_fallback(tmp_path):
+    """Only render-highlight gained this; `render` still renders the ranking."""
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    _add_unranked_candidate(run_dir, "cand_0099")
+
+    result = runner.invoke(app, ["render", str(run_dir), "--top-k", "5", "--force"])
+
+    assert result.exit_code == 0, result.output
+    rendered = {item["candidate_id"] for item in load_json(run_dir / "render_manifest.json")["shorts"]}
+    assert "cand_0099" not in rendered
+
+
+# ==============================================================================
+# --no-refine-boundaries: cut the frozen window exactly
+# ==============================================================================
+
+
+def test_refinement_runs_by_default(tmp_path):
+    """Backward compatibility: without the flag the window is still refined."""
+    run_dir = _setup_mock_run_with_media(tmp_path)
+
+    result = runner.invoke(app, ["render-highlight", str(run_dir), "--rank", "1", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert "boundary refinement disabled" not in result.output
+
+
+def test_disabling_refinement_keeps_the_frozen_boundaries_exactly(tmp_path):
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    window = _add_unranked_candidate(run_dir, "cand_0099", start=0.4, end=2.3)
+
+    result = runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_0099", "--force",
+        "--no-refine-boundaries",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "boundary refinement disabled" in result.output
+    # The rendered window is the frozen one, to the second.
+    from freecher_worker.cli import _format_timestamp
+
+    assert _format_timestamp(window["start"]) in result.output
+    assert _format_timestamp(window["end"]) in result.output
+
+
+def test_the_disabled_path_never_calls_the_refiner(monkeypatch, tmp_path):
+    """Not merely 'the numbers match': the refinement logic must not run."""
+    import freecher_worker.rendering.renderer as renderer
+
+    calls = []
+    original = renderer.refine_highlight
+    monkeypatch.setattr(
+        renderer, "refine_highlight",
+        lambda **kwargs: calls.append(kwargs) or original(**kwargs),
+    )
+
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    _add_unranked_candidate(run_dir, "cand_0099", start=0.4, end=2.3)
+
+    runner.invoke(app, [
+        "render-highlight", str(run_dir), "--candidate-id", "cand_0099", "--force",
+        "--no-refine-boundaries",
+    ])
+    assert calls == []
+
+    runner.invoke(app, ["render-highlight", str(run_dir), "--rank", "1", "--force"])
+    assert len(calls) == 1
+
+
+def test_the_library_default_still_refines(tmp_path):
+    """render_single_short keeps its old behaviour when the flag is absent."""
+    run_dir = _setup_mock_run_with_media(tmp_path)
+    manifest = load_json(run_dir / "manifest.json")
+    transcript = Transcript.model_validate(load_json(run_dir / "transcript.json"))
+    highlights = [Highlight.model_validate(h) for h in load_json(run_dir / "highlights.json")]
+
+    item = render_single_short(
+        source_video=Path(manifest["source"]),
+        highlight=highlights[0],
+        transcript=transcript,
+        source_fingerprint_id="fp_test_render",
+        video_duration=4.0,
+        run_dir=run_dir,
+        preset=get_preset("shorts"),
+        force=True,
+    )
+    assert "disabled" not in item.refinement_reason
+
+
+def test_batch_render_is_unaffected_by_the_refinement_flag(tmp_path):
+    """The flag exists only on render-highlight."""
+    result = runner.invoke(app, ["render", "--help"])
+    assert "--no-refine-boundaries" not in result.output

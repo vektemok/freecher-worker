@@ -95,6 +95,7 @@ def render_single_short(
     enable_subtitles: bool = True,
     enable_audio_normalization: bool = True,
     force: bool = False,
+    refine_boundaries: bool = True,
 ) -> RenderItemManifest:
     """Execute complete end-to-end rendering for one highlight into a publication-ready vertical video."""
     cfg = config or get_settings()
@@ -102,14 +103,30 @@ def render_single_short(
 
     # 1. Boundary Refinement
     t0 = time.perf_counter()
-    refined = refine_highlight(
-        highlight=highlight,
-        transcript=transcript,
-        video_duration=video_duration,
-        max_shift_seconds=cfg.boundary_max_shift_seconds,
-        context_before=cfg.boundary_context_before,
-        context_after=cfg.boundary_context_after,
-    )
+    if refine_boundaries:
+        refined = refine_highlight(
+            highlight=highlight,
+            transcript=transcript,
+            video_duration=video_duration,
+            max_shift_seconds=cfg.boundary_max_shift_seconds,
+            context_before=cfg.boundary_context_before,
+            context_after=cfg.boundary_context_after,
+        )
+    else:
+        # Cut exactly what the candidate set froze. Refinement both snaps to
+        # phrase boundaries and pads by context_before/context_after, so it
+        # moves the window even at max_shift_seconds=0 -- there is no way to
+        # get the frozen boundaries by tuning it.
+        refined = RefinedHighlight(
+            rank=highlight.rank,
+            candidate_id=highlight.candidate_id,
+            original_start=highlight.start,
+            original_end=highlight.end,
+            refined_start=highlight.start,
+            refined_end=highlight.end,
+            duration=round(highlight.end - highlight.start, 3),
+            refinement_reason="boundary refinement disabled; frozen candidate boundaries used verbatim",
+        )
     timings["boundary_refinement_seconds"] = round(time.perf_counter() - t0, 3)
 
     r_start = refined.refined_start
@@ -311,8 +328,16 @@ def render_highlights_for_run(
     enable_subtitles: bool = True,
     enable_audio_normalization: bool = True,
     force: bool = False,
+    source_video_override: Optional[Path] = None,
 ) -> RenderManifest:
-    """Render top highlights from an existing run directory into vertical short-form videos."""
+    """Render top highlights from an existing run directory into vertical short-form videos.
+
+    `source_video_override` names the video explicitly, for runs whose manifest
+    does not point at a local file -- an R2-backed run records the s3:// URI of
+    the transcript it was built from, because no local video existed when it
+    was made. Nothing is guessed: without the override the manifest is used
+    exactly as before.
+    """
     manifest_file = run_dir / "manifest.json"
     highlights_file = run_dir / "highlights.json"
     transcript_file = run_dir / "transcript.json"
@@ -325,9 +350,16 @@ def render_highlights_for_run(
         raise FileNotFoundError(f"Transcript not found in {run_dir}")
 
     man = load_json(manifest_file)
-    source_video = Path(man["source"])
-    if not source_video.is_file():
-        raise FileNotFoundError(f"Source video file does not exist: {source_video}")
+    if source_video_override is not None:
+        source_video = Path(source_video_override).expanduser().resolve()
+        if not source_video.is_file():
+            raise FileNotFoundError(
+                f"--source-video does not exist or is not a file: {source_video}"
+            )
+    else:
+        source_video = Path(man["source"])
+        if not source_video.is_file():
+            raise FileNotFoundError(f"Source video file does not exist: {source_video}")
 
     source_fp_id = man.get("source_fingerprint", {}).get("fingerprint_id", "unknown_fp")
     video_duration = float(man.get("source_fingerprint", {}).get("duration_seconds", 0.0))

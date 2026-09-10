@@ -150,6 +150,13 @@ def _format_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+SOURCE_VIDEO_OVERRIDE_HELP = (
+    "Explicit path to the source video. Required for a run whose manifest records "
+    "an s3:// URI instead of a local file, as an R2-backed run does. Without it the "
+    "manifest is used exactly as before."
+)
+
+
 def _resolve_run_path(run_arg: Path | str, base_dir: Path = Path("runs")) -> Path:
     """Resolve a run argument to an existing run directory."""
     p = Path(run_arg)
@@ -1694,6 +1701,11 @@ def render_command(
         "-f",
         help="Force re-rendering even if output short files already exist",
     ),
+    source_video: Optional[Path] = typer.Option(
+        None,
+        "--source-video",
+        help=SOURCE_VIDEO_OVERRIDE_HELP,
+    ),
 ) -> None:
     """Render top highlights from an existing run into 9:16 publication-ready vertical short-form videos."""
     try:
@@ -1722,6 +1734,7 @@ def render_command(
             enable_smart_crop=not no_crop,
             enable_subtitles=not no_subtitles,
             enable_audio_normalization=not no_loudnorm,
+            source_video_override=source_video,
             force=force,
         )
     except Exception as exc:
@@ -1803,6 +1816,21 @@ def render_highlight_command(
         "-f",
         help="Force re-rendering even if output short file already exists",
     ),
+    source_video: Optional[Path] = typer.Option(
+        None,
+        "--source-video",
+        help=SOURCE_VIDEO_OVERRIDE_HELP,
+    ),
+    no_refine_boundaries: bool = typer.Option(
+        False,
+        "--no-refine-boundaries",
+        help=(
+            "Cut the candidate's frozen start/end exactly, skipping boundary "
+            "refinement. Refinement snaps to phrase boundaries and pads by "
+            "context_before/after, so it moves the window even at "
+            "boundary_max_shift_seconds=0."
+        ),
+    ),
 ) -> None:
     """Render a specific highlight from a run into a 9:16 publication-ready vertical video."""
     if rank is None and candidate_id is None:
@@ -1834,10 +1862,19 @@ def render_highlight_command(
         raise typer.Exit(code=1)
 
     man = load_json(manifest_file)
-    source_video = Path(man["source"])
-    if not source_video.is_file():
-        console.print(f"[bold red]Error:[/bold red] Source video does not exist: {source_video}")
-        raise typer.Exit(code=1)
+    if source_video is not None:
+        # Explicit override: never consult the manifest for the video path.
+        source_video = Path(source_video).expanduser().resolve()
+        if not source_video.is_file():
+            console.print(
+                f"[bold red]Error:[/bold red] --source-video does not exist or is not a file: {source_video}"
+            )
+            raise typer.Exit(code=1)
+    else:
+        source_video = Path(man["source"])
+        if not source_video.is_file():
+            console.print(f"[bold red]Error:[/bold red] Source video does not exist: {source_video}")
+            raise typer.Exit(code=1)
 
     transcript = Transcript.model_validate(load_json(transcript_file))
     highlights_data = load_json(highlights_file)
@@ -1852,9 +1889,42 @@ def render_highlight_command(
             target = h
             break
 
+    if target is None and candidate_id is not None:
+        # An explicitly named candidate may sit outside the top-K that
+        # highlights.json records. Render it from the frozen candidate set at
+        # its original boundaries rather than asking the user to re-rank.
+        # Deliberately limited to --candidate-id: --rank only means anything
+        # inside a ranking.
+        candidates_file = run_dir / "candidates.json"
+        if candidates_file.is_file():
+            cand_data = load_json(candidates_file)
+            raw_candidates = (
+                cand_data.get("candidates", []) if isinstance(cand_data, dict) else cand_data
+            )
+            for raw in raw_candidates:
+                if raw.get("id") == candidate_id:
+                    window = CandidateWindow.model_validate(raw)
+                    target = Highlight(
+                        rank=0,
+                        start=window.start,
+                        end=window.end,
+                        duration=window.duration,
+                        score=0.0,
+                        reason="rendered directly from the frozen candidate set (not ranked)",
+                        candidate_id=window.id,
+                        text=window.text,
+                    )
+                    console.print(
+                        f"[yellow]Note:[/yellow] {candidate_id} is not in highlights.json; "
+                        f"rendering it from candidates.json at its frozen boundaries "
+                        f"({window.start:.2f}-{window.end:.2f}s)."
+                    )
+                    break
+
     if target is None:
         identifier = f"rank={rank}" if rank is not None else f"candidate_id={candidate_id}"
-        console.print(f"[bold red]Error:[/bold red] Highlight with {identifier} not found in {highlights_file}.")
+        where = highlights_file if rank is not None else f"{highlights_file} or {run_dir / 'candidates.json'}"
+        console.print(f"[bold red]Error:[/bold red] Highlight with {identifier} not found in {where}.")
         raise typer.Exit(code=1)
 
     source_fp_id = man.get("source_fingerprint", {}).get("fingerprint_id", "unknown_fp")
@@ -1883,6 +1953,7 @@ def render_highlight_command(
             enable_subtitles=not no_subtitles,
             enable_audio_normalization=not no_loudnorm,
             force=force,
+            refine_boundaries=not no_refine_boundaries,
         )
     except Exception as exc:
         console.print(f"[bold red]Rendering Failed:[/bold red] {exc}")
