@@ -42,6 +42,52 @@ class SourceStreamError(Exception):
     """Raised when yt-dlp cannot resolve or deliver the requested video."""
 
 
+class SourceBlockedError(SourceStreamError):
+    """The site refused this host, rather than failing to find the video.
+
+    Distinct from a generic failure because the remedy is different and the
+    retry semantics are different: the same request from the same egress will be
+    refused identically, however many times it is repeated. Only a different
+    egress changes the outcome.
+    """
+
+
+#: Refusals that mean "not you, from there" rather than "no such video". Matched
+#: against yt-dlp's stderr, which is the only place the site's reason surfaces.
+_BLOCKED_MARKERS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you\u2019re not a bot",
+    "confirm you are not a bot",
+    "this content isn't available",
+    "in your country",
+    "in your location",
+    "geo restricted",
+    "http error 429",
+    "too many requests",
+)
+
+
+def _classify_failure(url: str, stderr: str) -> SourceStreamError:
+    """Turn yt-dlp stderr into the most specific error we can justify."""
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in _BLOCKED_MARKERS):
+        return SourceBlockedError(
+            f"the site refused this request for {url} from this host's network. "
+            f"This is an egress problem, not a bad URL: the same request will be "
+            f"refused again from the same address. Route ingest through an egress "
+            f"the site accepts (FREECHER_INGEST_PROXY), or run ingest on a host "
+            f"whose address is accepted.\n" + stderr.strip()
+        )
+    return SourceStreamError(
+        "yt-dlp could not read the video metadata:\n" + stderr.strip()
+    )
+
+
+def _proxy_args(proxy: Optional[str]) -> list[str]:
+    """yt-dlp proxy selection. Accepts http(s):// and socks5:// URLs."""
+    return ["--proxy", proxy] if proxy else []
+
+
 def resolve_ytdlp_path(explicit: Optional[str] = None) -> str:
     """Locate the yt-dlp executable, preferring the current interpreter's venv."""
     if explicit:
@@ -84,6 +130,21 @@ def build_format_selector(quality: str, max_height: Optional[int] = None) -> str
     return "/".join(dict.fromkeys(candidates))
 
 
+def resolve_proxy(explicit: Optional[str] = None, settings: object | None = None) -> Optional[str]:
+    """The egress to send yt-dlp through, if one is configured.
+
+    Explicit argument wins, then FREECHER_INGEST_PROXY. Returning None means
+    "use this host's own network", which is the default everywhere.
+    """
+    if explicit:
+        return explicit
+    if settings is None:
+        from freecher_worker.config import get_settings
+
+        settings = get_settings()
+    return getattr(settings, "ingest_proxy", None) or None
+
+
 def _auth_args(
     cookies_from_browser: Optional[str],
     cookies_file: Optional[str],
@@ -106,8 +167,14 @@ def build_stream_command(
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
+    proxy: Optional[str] = None,
 ) -> list[str]:
-    """Build the yt-dlp command that writes the chosen video to stdout."""
+    """Build the yt-dlp command that writes the chosen video to stdout.
+
+    The transfer uses the same egress as the probe: resolving metadata from one
+    address and fetching media from another is how a site decides the session is
+    not genuine, and it also makes failures unreproducible.
+    """
     command = [
         resolve_ytdlp_path(ytdlp_path),
         "--no-playlist",
@@ -132,6 +199,7 @@ def build_stream_command(
         ]
 
     command += _auth_args(cookies_from_browser, cookies_file)
+    command += _proxy_args(resolve_proxy(proxy))
     if extra_args:
         command += list(extra_args)
 
@@ -147,6 +215,7 @@ def probe_source(
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
+    proxy: Optional[str] = None,
     timeout: float = 120.0,
 ) -> VideoInfo:
     """Resolve title/duration/protocol for a video without downloading it.
@@ -159,6 +228,7 @@ def probe_source(
     if format_selector:
         command += ["-f", format_selector]
     command += _auth_args(cookies_from_browser, cookies_file)
+    command += _proxy_args(resolve_proxy(proxy))
     if extra_args:
         command += list(extra_args)
     command.append(url)
@@ -176,10 +246,7 @@ def probe_source(
         raise SourceStreamError(f"yt-dlp metadata probe timed out after {timeout:.0f}s") from exc
 
     if result.returncode != 0:
-        raise SourceStreamError(
-            "yt-dlp could not read the video metadata:\n"
-            + result.stderr.decode("utf-8", errors="ignore").strip()
-        )
+        raise _classify_failure(url, result.stderr.decode("utf-8", errors="ignore"))
 
     try:
         payload: dict[str, Any] = json.loads(result.stdout.decode("utf-8", errors="ignore"))

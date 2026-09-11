@@ -385,6 +385,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("FREECHER_R2_PUBLIC_BASE_URL", "R2_PUBLIC_BASE_URL"),
         description="Optional public/custom domain used to build a readable object URL",
     )
+    ingest_proxy: Optional[str] = Field(
+        default=None,
+        description=(
+            "Egress for yt-dlp metadata probes and transfers, e.g. "
+            "http://user:pass@host:port or socks5://host:1080. Unset means this "
+            "host's own network. Needed for sites that refuse datacenter "
+            "addresses outright -- YouTube refuses anonymous extraction from the "
+            "Oracle range, and no code change makes that address acceptable."
+        ),
+    )
     ingest_quality: str = Field(default="best", description="Ingest quality mode: 'best' or 'progressive'")
     ingest_max_height: Optional[int] = Field(default=None, description="Optional cap on source video height in pixels")
     ingest_part_size_mb: int = Field(default=16, description="Multipart chunk size in MiB (minimum 5)")

@@ -47,6 +47,9 @@ _NON_RETRYABLE_TYPES = {
     "SubtitleBurnUnsupportedError", "FFmpegNotFoundError", "R2ConfigurationError",
     # Retrying a full disk fills it again. An operator (or `cleanup`) must act.
     "InsufficientDiskSpaceError",
+    # A site that refused this host's address refuses it every time. Only a
+    # different egress changes the answer, so churning the queue is pointless.
+    "SourceBlockedError",
 }
 
 

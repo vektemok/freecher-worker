@@ -4035,3 +4035,71 @@ def cleanup_command(
         for path, err in result.failed:
             console.print(f"[red]failed[/red] {path}: {err}")
         raise typer.Exit(code=1)
+
+
+#: Representative public URLs, one per supported platform, used only to find out
+#: whether this host's egress is accepted. Metadata probes -- no media transfer.
+EGRESS_PROBES = {
+    "youtube": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+    "twitch": "https://www.twitch.tv/xqc/clip/PluckyPoorGerbilKappaWealth-UI6cT_jVCX_UcYpw",
+    "rutube": "https://rutube.ru/video/c58f502c7bb34a8fcdd976b221fca292/",
+}
+
+
+@app.command("egress-check")
+def egress_check_command(
+    url: Optional[str] = typer.Option(None, "--url", help="Check one specific URL instead"),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="Egress to test (default: FREECHER_INGEST_PROXY, else direct)"),
+    timeout: float = typer.Option(60.0, "--timeout", help="Per-probe timeout in seconds"),
+) -> None:
+    """Report which video platforms accept this host's egress.
+
+    Ingest fails on some sites not because the URL is wrong but because the
+    address it comes from is refused -- YouTube does this to datacenter ranges.
+    That is invisible in the pipeline logs until a job fails, so this asks each
+    platform directly, with a metadata probe and no media transfer.
+
+    Use it to validate a proxy before pointing production at it:
+
+        freecher-worker egress-check --proxy socks5://host:1080
+    """
+    from freecher_worker.ingest.source import (
+        SourceBlockedError, SourceStreamError, probe_source, resolve_proxy,
+    )
+
+    effective = resolve_proxy(proxy)
+    console.print(f"[bold cyan]egress[/bold cyan] {effective or 'direct (this host)'}\n")
+
+    targets = {"url": url} if url else EGRESS_PROBES
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Platform", width=10)
+    table.add_column("", width=9)
+    table.add_column("Detail")
+
+    blocked = []
+    for name, target in targets.items():
+        try:
+            info = probe_source(target, proxy=effective, timeout=timeout)
+            title = (info.title or "")[:44]
+            # Duration is absent for some sites and for live sources; that is
+            # not a failure of the egress, which is all this command measures.
+            length = f"{info.duration_seconds:.0f}s" if info.duration_seconds else "?"
+            table.add_row(name, "[green]OK[/green]", f"{length}  {title}")
+        except SourceBlockedError:
+            blocked.append(name)
+            table.add_row(name, "[red]REFUSED[/red]", "this egress is not accepted by the site")
+        except SourceStreamError as exc:
+            first = str(exc).strip().splitlines()[-1][:70]
+            table.add_row(name, "[yellow]ERROR[/yellow]", first)
+    console.print(table)
+
+    if blocked:
+        console.print(
+            f"\n[bold red]refused by:[/bold red] {', '.join(blocked)}\n"
+            "Nothing in Freecher can change this: the site is rejecting the address, "
+            "not the request. Point FREECHER_INGEST_PROXY at an egress the site "
+            "accepts, or run ingest on a host whose address is accepted."
+        )
+        raise typer.Exit(code=1)
+    console.print("\n[bold green]every platform accepts this egress[/bold green]")

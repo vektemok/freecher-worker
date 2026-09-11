@@ -126,6 +126,36 @@ substitute for the real reading. `GET /health` reports the same numbers and goes
 degraded on the same thresholds, so a host that would refuse work says so before
 anyone submits any.
 
+## Ingest egress
+
+A site can refuse this host's *address* rather than the request. That failure
+looks like an ordinary ingest error but has a different cause and a different
+remedy, so it is reported as `SourceBlockedError`, excluded from automatic
+retry, and carries the setting that fixes it.
+
+Measured on the Oracle host:
+
+| Platform | Direct from Oracle |
+|---|---|
+| Twitch | accepted |
+| RuTube | accepted |
+| YouTube | **refused** — "Sign in to confirm you're not a bot" |
+
+YouTube's refusal is IP reputation on the datacenter range. Confirmed not to be
+a missing-JavaScript problem: it persists with deno 2.9.6 installed as the EJS
+runtime and across the `tv`, `android_vr`, `web_safari`, `tv_simply` and `mweb`
+player clients.
+
+```bash
+sudo freecher-run egress-check                        # what this host can reach
+sudo freecher-run egress-check --proxy socks5://h:1080  # validate a new egress
+sudo freecher-run egress-check --url '<some url>'     # one specific source
+```
+
+Set `FREECHER_INGEST_PROXY` to route yt-dlp -- both the metadata probe and the
+media transfer, deliberately through the same egress -- via an address the site
+accepts. Restart the worker afterwards, and re-run `egress-check` to confirm.
+
 ## Environment
 
 Every variable is documented in `freecher.env.example`. The ones a deployment
