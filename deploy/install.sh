@@ -100,8 +100,12 @@ if ! ( cd "$STATE_DIR" && runuser -u "$SERVICE_USER" -- \
 fi
 
 if [[ $START -eq 1 ]]; then
-  echo "==> enable + start"
-  systemctl enable --now freecher-api.service freecher-worker.service
+  echo "==> enable + (re)start"
+  systemctl enable freecher-api.service freecher-worker.service
+  # restart, not `enable --now`: --now only *starts* a unit that is stopped, so
+  # on an upgrade it silently left the old code running. The venv install is
+  # editable, so new code takes effect only when the process is replaced.
+  systemctl restart freecher-api.service freecher-worker.service
   systemctl --no-pager --lines=0 status freecher-api.service freecher-worker.service || true
 else
   echo "==> --no-start: units installed but not enabled"

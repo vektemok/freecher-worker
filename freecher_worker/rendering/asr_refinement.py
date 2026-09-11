@@ -83,7 +83,18 @@ def extract_audio_chunk(
 
 
 class HighlightWordTranscriber:
-    """Produces refined word timestamps for a single highlight clip."""
+    """Produces refined word timestamps for highlight clips.
+
+    The model is loaded lazily on first use and then held for the lifetime of
+    this object, so one instance shared across a render batch loads it once. A
+    per-clip instance therefore pays the load per clip -- roughly 115 s each on
+    the two-core ARM host -- which is why `render_top_n` and
+    `render_highlights_for_run` now construct exactly one and pass it down.
+
+    Batch-scoped, deliberately not a module-level singleton: the model is over
+    2 GiB resident, and a process that renders once should not keep it for the
+    rest of its life. Use `release()`, or the context manager, to drop it.
+    """
 
     def __init__(
         self,
@@ -95,6 +106,30 @@ class HighlightWordTranscriber:
         self.device = device
         self.compute_type = compute_type
         self._model = None
+        #: How many times a model was actually constructed. One shared instance
+        #: across a batch must never exceed 1; asserted by the test suite.
+        self.load_count = 0
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def release(self) -> None:
+        """Drop the loaded model so its memory can be reclaimed.
+
+        Safe to call when nothing was ever loaded, and safe to call twice; the
+        next transcribe_highlight simply loads again.
+        """
+        if self._model is not None:
+            logger.info("[refinement] releasing '%s' after %d load(s)",
+                        self.model_name, self.load_count)
+        self._model = None
+
+    def __enter__(self) -> "HighlightWordTranscriber":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
     def _get_model(self):
         if self._model is None:
@@ -131,6 +166,7 @@ class HighlightWordTranscriber:
                     )
                 else:
                     raise
+            self.load_count += 1
         return self._model
 
     def transcribe_highlight(

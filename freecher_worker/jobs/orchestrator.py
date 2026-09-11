@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from freecher_worker.config import Settings, get_settings
+from freecher_worker.ops.disk import InsufficientDiskSpaceError, require_disk_space
 from freecher_worker.jobs.models import Job, JobStatus, StageTiming
 from freecher_worker.jobs.store import JobStore
 
@@ -44,6 +45,8 @@ _RETRYABLE_TYPES = {
 _NON_RETRYABLE_TYPES = {
     "InvalidUrlError", "ValueError", "FileNotFoundError", "KeyError",
     "SubtitleBurnUnsupportedError", "FFmpegNotFoundError", "R2ConfigurationError",
+    # Retrying a full disk fills it again. An operator (or `cleanup`) must act.
+    "InsufficientDiskSpaceError",
 }
 
 
@@ -110,6 +113,25 @@ def _object_exists(client: Any, bucket: str, key: str) -> Optional[int]:
         return int(head.get("ContentLength") or 0)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _estimated_source_bytes(url: str) -> Optional[int]:
+    """A best-effort size for the pending download, or None.
+
+    Used only to tighten the free-space check, never to replace it: yt-dlp's
+    `filesize_approx` is missing for many sites and wrong for some.
+    """
+    try:
+        from freecher_worker.ingest.source import probe_source
+
+        info = probe_source(url)
+    except Exception:  # noqa: BLE001 - probing is advisory
+        return None
+    for attr in ("filesize", "filesize_approx"):
+        value = getattr(info, attr, None)
+        if value:
+            return int(value)
+    return None
 
 
 def _audio_duration_seconds(client: Any, bucket: str, key: str) -> Optional[float]:
@@ -204,6 +226,7 @@ class Orchestrator:
                 setattr(j, "completed_at", _now()),
             ) and None)
             logger.info("[job %s] DONE", job_id)
+            self._cleanup_if_configured(job_id, client)
         except (KeyboardInterrupt, SystemExit):
             # An operator stopped the service; the pipeline did not fail. Put the
             # job back in the queue so the restarted worker resumes it (every
@@ -269,6 +292,10 @@ class Orchestrator:
                 return candidate_id
 
         self._log_gate("INGESTING", False, "no existing source object for this URL")
+        # Before pulling potentially gigabytes: a full disk turns into a
+        # truncated source and a confusing failure three stages later.
+        require_disk_space(Path(self.cfg.runs_dir), "INGESTING", settings=self.cfg,
+                           expected_bytes=_estimated_source_bytes(job.source_url))
         result = ingest_to_r2(
             job.source_url, client=client, bucket=bucket,
             key_template=self.cfg.ingest_key_template,
@@ -373,6 +400,7 @@ class Orchestrator:
         source_video = self._ensure_local_source(source_id, run_dir, client, bucket)
 
         t0 = self._enter(job_id, JobStatus.RENDERING)
+        require_disk_space(run_dir, "RENDERING", settings=self.cfg)
         self._log_gate("RENDERING", False,
                        "render_top_n performs its own per-clip artifact reuse")
         manifest = render_top_n(
@@ -401,6 +429,27 @@ class Orchestrator:
             setattr(j, "clips", payload), setattr(j, "clips_manifest_key", key),
         ) and None)
         self._leave(job_id, t1)
+
+    # ------------------------------------------------------- post-DONE cleanup
+    def _cleanup_if_configured(self, job_id: str, client: Any) -> None:
+        """Reclaim regenerable local files once the outputs are safely in R2.
+
+        Opt-in via FREECHER_CLEANUP_AFTER_DONE. Failure here is logged and
+        swallowed: the job succeeded, and housekeeping must not turn a delivered
+        result into a reported failure.
+        """
+        if not getattr(self.cfg, "cleanup_after_done", False):
+            return
+        try:
+            from freecher_worker.ops.cleanup import cleanup_completed_job
+
+            result = cleanup_completed_job(self.store.get(job_id), settings=self.cfg,
+                                           store=self.store, client=client)
+            logger.info("[job %s] post-DONE cleanup freed %.2f GiB across %d item(s)",
+                        job_id, result.freed_bytes / (1 << 30), result.deleted)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[job %s] post-DONE cleanup skipped: %s: %s",
+                           job_id, type(exc).__name__, exc)
 
     # ------------------------------------------------------ crash recovery
     def reclaim_orphans(self) -> list[str]:

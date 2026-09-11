@@ -3959,3 +3959,79 @@ def transcribe_queue_command(
         if max_jobs and done >= max_jobs:
             console.print(f"reached --max {max_jobs}; exiting")
             return
+
+
+@app.command("cleanup")
+def cleanup_command(
+    runs_dir: Optional[Path] = typer.Option(None, "--runs-dir", help="Run artifact directory"),
+    jobs_dir: Optional[Path] = typer.Option(None, "--jobs-dir", help="Job store directory"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; delete nothing"),
+    older_than_hours: float = typer.Option(
+        1.0, "--older-than-hours",
+        help="Leave runs touched more recently than this alone"),
+    keep_recent: int = typer.Option(
+        0, "--keep-recent", help="Always keep this many most-recent runs intact"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Limit to one job's source"),
+    max_disk_usage_gb: Optional[float] = typer.Option(
+        None, "--max-disk-usage-gb",
+        help="Reclaim oldest-first only until the runs tree is under this size"),
+    aggressive: bool = typer.Option(
+        False, "--aggressive",
+        help="Also remove subtitles/words/crop_paths (regenerable, but slow to rebuild)"),
+    verify_sha256: bool = typer.Option(
+        False, "--verify-sha256",
+        help="Re-hash each local clip instead of trusting its sidecar"),
+) -> None:
+    """Reclaim local run artifacts whose durable copy is verified in R2.
+
+    Nothing is removed unless its remote replacement answers a live HEAD with a
+    matching size (and sha256, where one was recorded), and nothing belonging to
+    a job that is still running is touched at all. Start with --dry-run.
+    """
+    from freecher_worker.config import get_settings
+    from freecher_worker.ops.cleanup import GIB, Action, execute, plan_cleanup
+
+    _configure_job_logging()
+    cfg = get_settings()
+    store = _jobs_store(jobs_dir)
+    root = runs_dir or Path(cfg.runs_dir)
+
+    client = None
+    if cfg.r2_bucket and cfg.r2_endpoint:
+        from freecher_worker.ingest.r2 import build_r2_client
+        client = build_r2_client(cfg.r2_endpoint, cfg.r2_access_key_id,
+                                 cfg.r2_secret_access_key)
+    else:
+        console.print("[yellow]R2 is not configured; nothing can be verified as "
+                      "remote, so nothing will be deleted.[/yellow]")
+
+    plan = plan_cleanup(
+        root, store=store, client=client, bucket=cfg.r2_bucket,
+        older_than_hours=older_than_hours, keep_recent=keep_recent, job_id=job_id,
+        max_disk_usage_gb=max_disk_usage_gb, aggressive=aggressive,
+        verify_sha256=verify_sha256,
+    )
+    result = execute(plan, dry_run=dry_run)
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Action", width=7)
+    table.add_column("Size", width=12, justify="right")
+    table.add_column("Path")
+    table.add_column("Reason")
+    for item in plan.items:
+        colour = {"DELETE": "red", "KEEP": "green", "SKIP": "yellow"}[item.action.value]
+        table.add_row(f"[{colour}]{item.action.value}[/{colour}]",
+                      f"{item.bytes:,}" if item.bytes else "-",
+                      str(item.path), item.reason)
+    console.print(table)
+
+    if dry_run:
+        console.print(f"\n[bold]dry run[/bold]: {len(plan.deletions)} item(s), "
+                      f"{plan.reclaimable_bytes / GIB:.2f} GiB reclaimable")
+        return
+    console.print(f"\n[bold green]removed[/bold green] {result.deleted} item(s), "
+                  f"{result.freed_bytes / GIB:.2f} GiB freed")
+    if result.failed:
+        for path, err in result.failed:
+            console.print(f"[red]failed[/red] {path}: {err}")
+        raise typer.Exit(code=1)

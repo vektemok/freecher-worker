@@ -389,22 +389,40 @@ def render_highlights_for_run(
     rendered_items: List[RenderItemManifest] = []
     logger.info(f"Rendering top {len(target_highlights)} highlights using preset '{preset.name}'...")
 
-    for hl in target_highlights:
-        logger.info(f"Rendering highlight #{hl.rank} (candidate: {hl.candidate_id})...")
-        item_manifest = render_single_short(
-            source_video=source_video,
-            highlight=hl,
-            transcript=transcript,
-            source_fingerprint_id=source_fp_id,
-            video_duration=video_duration,
-            run_dir=run_dir,
-            preset=preset,
-            enable_smart_crop=enable_smart_crop,
-            enable_subtitles=enable_subtitles,
-            enable_audio_normalization=enable_audio_normalization,
-            force=force,
+    # One refinement model for this run, for the same reason as in
+    # rendering.batch: loading it per clip costs roughly as much as encoding the
+    # clip. Lazy, so a subtitle-less run never loads it at all.
+    cfg = get_settings()
+    batch_transcriber = (
+        HighlightWordTranscriber(
+            model_name=cfg.refinement_asr_model,
+            device=cfg.asr_device,
+            compute_type=cfg.refinement_asr_compute_type,
         )
-        rendered_items.append(item_manifest)
+        if enable_subtitles else None
+    )
+
+    try:
+        for hl in target_highlights:
+            logger.info(f"Rendering highlight #{hl.rank} (candidate: {hl.candidate_id})...")
+            item_manifest = render_single_short(
+                source_video=source_video,
+                highlight=hl,
+                transcript=transcript,
+                source_fingerprint_id=source_fp_id,
+                video_duration=video_duration,
+                run_dir=run_dir,
+                preset=preset,
+                enable_smart_crop=enable_smart_crop,
+                enable_subtitles=enable_subtitles,
+                enable_audio_normalization=enable_audio_normalization,
+                force=force,
+                transcriber=batch_transcriber,
+            )
+            rendered_items.append(item_manifest)
+    finally:
+        if batch_transcriber is not None:
+            batch_transcriber.release()
 
     render_manifest = RenderManifest(
         source_video=str(source_video),

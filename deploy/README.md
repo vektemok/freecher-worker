@@ -84,6 +84,48 @@ says exactly what it is waiting for instead of failing or hanging.
 Set `FREECHER_TRANSCRIBE_BACKEND=local` plus `FREECHER_ALLOW_CPU_TRANSCRIPTION=true`
 to accept CPU transcription of any length — it works, it is just slow.
 
+## Disk lifecycle
+
+`runs/<source_id>/` is where a job's working files land, and nothing in the
+pipeline used to delete any of them. Artifacts fall into three classes:
+
+* **durable/remote** — the published clip and the transcript/candidates/
+  highlights/manifest objects in R2, plus the job records. Never deleted locally
+  by cleanup, and the job store is not touched at all.
+* **regenerable local** — the downloaded `source.mp4`, the local copy of a
+  published clip, and the small intermediates (`subtitles/`, `words/`,
+  `crop_paths/`).
+* **shared cache** — model weights under `~/.cache`. Expensive, not per-job,
+  never a cleanup target.
+
+A local file is only removed when **both** guards pass: its source belongs to no
+job in a non-terminal state, and its remote replacement answers a live HEAD with
+a matching size (and sha256 where one was recorded).
+
+```bash
+sudo freecher-run cleanup --dry-run --older-than-hours 0   # see the plan
+sudo freecher-run cleanup --older-than-hours 24            # routine
+sudo freecher-run cleanup --max-disk-usage-gb 10           # oldest-first to a cap
+sudo freecher-run cleanup --job-id <id>                    # one job's source
+sudo freecher-run cleanup --aggressive                     # also the intermediates
+```
+
+Every decision is logged as `DELETE`, `KEEP ... reason=`, or
+`SKIP ... active_job`, and `--dry-run` logs exactly what a real run would do.
+
+Nothing runs automatically on startup. Set `FREECHER_CLEANUP_AFTER_DONE=true` to
+reclaim a job's regenerable files as soon as its clips are verified in R2.
+
+## Disk guards
+
+Ingest and render check free space first and refuse to start below
+`FREECHER_MIN_FREE_DISK_GB` or `FREECHER_MIN_FREE_DISK_PERCENT`, failing the job
+with an actionable resource error instead of producing a truncated file. Where
+the source reports a size, that is used as an additional check -- never as a
+substitute for the real reading. `GET /health` reports the same numbers and goes
+degraded on the same thresholds, so a host that would refuse work says so before
+anyone submits any.
+
 ## Environment
 
 Every variable is documented in `freecher.env.example`. The ones a deployment
@@ -100,8 +142,9 @@ must get right:
 
     git pull && sudo ./deploy/install.sh
 
-The venv install is editable, so this is effectively a restart. `install.sh`
-re-runs preflight before restarting anything.
+The venv install is editable, so the code is picked up by restarting the
+processes, which `install.sh` does explicitly -- after re-running preflight, so a
+bad configuration stops the upgrade before it replaces a working process.
 
 ## Scope
 

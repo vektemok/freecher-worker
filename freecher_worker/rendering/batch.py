@@ -252,108 +252,138 @@ def render_top_n(
     clips_dir = run_dir / "final"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
-    for raw in selected:
-        rank = int(raw["rank"])
-        cand = str(raw["candidate_id"])
-        cid = clip_id_for(source_id, cand, rank)
-        rec = ClipRecord(
-            clip_id=cid, candidate_id=cand, rank=rank,
-            start_seconds=float(raw["start"]), end_seconds=float(raw["end"]),
-            duration_seconds=float(raw["end"]) - float(raw["start"]),
+    # One refinement model for the whole batch. Construction is free -- the model
+    # loads lazily on the first clip that actually needs rendering -- so a batch
+    # in which every clip is reused still never loads it. Released in the finally
+    # below, so a worker that rendered one job does not hold 2+ GiB afterwards.
+    transcriber = None
+    if enable_subtitles:
+        from freecher_worker.rendering.asr_refinement import HighlightWordTranscriber
+
+        transcriber = HighlightWordTranscriber(
+            model_name=cfg.refinement_asr_model,
+            device=cfg.asr_device,
+            compute_type=cfg.refinement_asr_compute_type,
         )
-        target = clips_dir / f"{cid}.mp4"
-        t0 = time.perf_counter()
-        try:
-            expected_dur = rec.duration_seconds
-            reuse = False
-            if target.is_file() and not force:
-                # Read the sidecar BEFORE validating. Boundary refinement moves the
-                # window, so the highlight's raw duration is not what was rendered;
-                # validating against it fails and the clip is re-rendered on every
-                # run, quietly defeating idempotency.
-                sidecar = target.with_suffix(".json")
-                prior = None
-                if sidecar.is_file():
+
+    try:
+        for raw in selected:
+            rank = int(raw["rank"])
+            cand = str(raw["candidate_id"])
+            cid = clip_id_for(source_id, cand, rank)
+            rec = ClipRecord(
+                clip_id=cid, candidate_id=cand, rank=rank,
+                start_seconds=float(raw["start"]), end_seconds=float(raw["end"]),
+                duration_seconds=float(raw["end"]) - float(raw["start"]),
+            )
+            target = clips_dir / f"{cid}.mp4"
+            t0 = time.perf_counter()
+            try:
+                expected_dur = rec.duration_seconds
+                reuse = False
+                if target.is_file() and not force:
+                    # Read the sidecar BEFORE validating. Boundary refinement moves the
+                    # window, so the highlight's raw duration is not what was rendered;
+                    # validating against it fails and the clip is re-rendered on every
+                    # run, quietly defeating idempotency.
+                    sidecar = target.with_suffix(".json")
+                    prior = None
+                    if sidecar.is_file():
+                        try:
+                            prior = json.loads(sidecar.read_text())
+                            expected_dur = float(prior.get("duration_seconds", expected_dur))
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            prior = None
                     try:
-                        prior = json.loads(sidecar.read_text())
-                        expected_dur = float(prior.get("duration_seconds", expected_dur))
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        prior = None
-                try:
+                        probe = validate_clip(target, expected_width=preset.width,
+                                              expected_height=preset.height,
+                                              expected_duration=expected_dur, settings=cfg)
+                        reuse = True
+                        logger.info("[batch] %s already rendered and valid; reusing", cid)
+                        if prior:
+                            rec.subtitles_burned = bool(prior.get("subtitles_burned", False))
+                            rec.crop_mode = prior.get("crop_mode")
+                            rec.crop_summary = prior.get("crop_summary")
+                            rec.start_seconds = float(prior.get("start_seconds", rec.start_seconds))
+                            rec.end_seconds = float(prior.get("end_seconds", rec.end_seconds))
+                            rec.duration_seconds = float(prior.get("duration_seconds",
+                                                                  rec.duration_seconds))
+                    except ClipValidationError as exc:
+                        logger.info("[batch] %s exists but did not validate (%s); re-rendering",
+                                    cid, exc)
+                        reuse = False
+
+                if not reuse:
+                    item = render_single_short(
+                        highlight=Highlight.model_validate(raw), transcript=transcript,
+                        preset=preset, source_video=source_video, run_dir=run_dir,
+                        source_fingerprint_id=fp_id, video_duration=video_duration,
+                        config=cfg, enable_smart_crop=enable_smart_crop,
+                        enable_subtitles=enable_subtitles,
+                        enable_audio_normalization=enable_audio_normalization,
+                        # `force` here governs the refinement-ASR word cache, not
+                        # whether we re-render: reuse was already decided above.
+                        # Passing True discarded a cache whose key covers the
+                        # fingerprint, the exact boundaries, the model, the
+                        # compute type and the language -- so it re-ran ~100 s of
+                        # Whisper per clip to produce byte-identical words. Honour
+                        # the caller's force instead, which is what a user asking
+                        # to redo the work actually means.
+                        force=force, refine_boundaries=refine_boundaries,
+                        transcriber=transcriber,
+                    )
+                    produced = run_dir / item.file
+                    produced.replace(target)
+                    rec.subtitles_burned = bool(item.subtitles_burned)
+                    rec.crop_mode = item.crop_mode
+                    rec.start_seconds, rec.end_seconds = item.refined_start, item.refined_end
+                    rec.duration_seconds = item.duration
+                    expected_dur = item.duration
+                    crop_json = run_dir / "crop_paths" / f"highlight_{rank:02d}.json"
+                    if crop_json.is_file():
+                        diag = (json.loads(crop_json.read_text()).get("diagnostics") or {})
+                        rec.crop_summary = diag.get("summary")
                     probe = validate_clip(target, expected_width=preset.width,
                                           expected_height=preset.height,
                                           expected_duration=expected_dur, settings=cfg)
-                    reuse = True
-                    logger.info("[batch] %s already rendered and valid; reusing", cid)
-                    if prior:
-                        rec.subtitles_burned = bool(prior.get("subtitles_burned", False))
-                        rec.crop_mode = prior.get("crop_mode")
-                        rec.crop_summary = prior.get("crop_summary")
-                        rec.start_seconds = float(prior.get("start_seconds", rec.start_seconds))
-                        rec.end_seconds = float(prior.get("end_seconds", rec.end_seconds))
-                        rec.duration_seconds = float(prior.get("duration_seconds",
-                                                              rec.duration_seconds))
-                except ClipValidationError as exc:
-                    logger.info("[batch] %s exists but did not validate (%s); re-rendering",
-                                cid, exc)
-                    reuse = False
 
-            if not reuse:
-                item = render_single_short(
-                    highlight=Highlight.model_validate(raw), transcript=transcript,
-                    preset=preset, source_video=source_video, run_dir=run_dir,
-                    source_fingerprint_id=fp_id, video_duration=video_duration,
-                    config=cfg, enable_smart_crop=enable_smart_crop,
-                    enable_subtitles=enable_subtitles,
-                    enable_audio_normalization=enable_audio_normalization,
-                    force=True, refine_boundaries=refine_boundaries,
-                )
-                produced = run_dir / item.file
-                produced.replace(target)
-                rec.subtitles_burned = bool(item.subtitles_burned)
-                rec.crop_mode = item.crop_mode
-                rec.start_seconds, rec.end_seconds = item.refined_start, item.refined_end
-                rec.duration_seconds = item.duration
-                expected_dur = item.duration
-                crop_json = run_dir / "crop_paths" / f"highlight_{rank:02d}.json"
-                if crop_json.is_file():
-                    diag = (json.loads(crop_json.read_text()).get("diagnostics") or {})
-                    rec.crop_summary = diag.get("summary")
-                probe = validate_clip(target, expected_width=preset.width,
-                                      expected_height=preset.height,
-                                      expected_duration=expected_dur, settings=cfg)
+                rec.render_seconds = round(time.perf_counter() - t0, 2)
+                rec.width, rec.height = probe["width"], probe["height"]
+                rec.video_codec, rec.audio_codec = probe["video_codec"], probe["audio_codec"]
+                rec.bytes = probe["bytes"]
+                rec.local_path = str(target)
+                rec.sha256 = sha256_file(target)
 
-            rec.render_seconds = round(time.perf_counter() - t0, 2)
-            rec.width, rec.height = probe["width"], probe["height"]
-            rec.video_codec, rec.audio_codec = probe["video_codec"], probe["audio_codec"]
-            rec.bytes = probe["bytes"]
-            rec.local_path = str(target)
-            rec.sha256 = sha256_file(target)
+                if publish:
+                    key = CLIP_KEY_TEMPLATE.format(source_id=source_id, clip_id=cid)
+                    t1 = time.perf_counter()
+                    upload_clip(client, bucket, key, target, rec.sha256)
+                    if not verify_remote(client, bucket, key, rec.bytes):
+                        raise RuntimeError(f"remote object {key} did not verify after upload")
+                    rec.upload_seconds = round(time.perf_counter() - t1, 2)
+                    rec.r2_key = key
+                    if cfg.r2_public_base_url:
+                        rec.r2_url = f"{cfg.r2_public_base_url.rstrip('/')}/{key}"
 
-            if publish:
-                key = CLIP_KEY_TEMPLATE.format(source_id=source_id, clip_id=cid)
-                t1 = time.perf_counter()
-                upload_clip(client, bucket, key, target, rec.sha256)
-                if not verify_remote(client, bucket, key, rec.bytes):
-                    raise RuntimeError(f"remote object {key} did not verify after upload")
-                rec.upload_seconds = round(time.perf_counter() - t1, 2)
-                rec.r2_key = key
-                if cfg.r2_public_base_url:
-                    rec.r2_url = f"{cfg.r2_public_base_url.rstrip('/')}/{key}"
-
-            rec.status = ClipStatus.DONE
-            # Per-clip sidecar: the durable record for THIS artifact, independent
-            # of whichever batch selection last wrote clips.json.
-            target.with_suffix(".json").write_text(rec.model_dump_json(indent=2))
-            out.succeeded += 1
-            logger.info("[batch] %s DONE (%s bytes)", cid, rec.bytes)
-        except Exception as exc:  # noqa: BLE001 - per-clip isolation is the point
-            rec.status = ClipStatus.FAILED
-            rec.error_type = type(exc).__name__
-            rec.error_message = str(exc)[:400]
-            out.failed += 1
-            logger.error("[batch] %s FAILED: %s: %s", cid, type(exc).__name__, exc)
-        out.clips.append(rec)
+                rec.status = ClipStatus.DONE
+                # Per-clip sidecar: the durable record for THIS artifact, independent
+                # of whichever batch selection last wrote clips.json.
+                target.with_suffix(".json").write_text(rec.model_dump_json(indent=2))
+                out.succeeded += 1
+                logger.info("[batch] %s DONE (%s bytes)", cid, rec.bytes)
+            except Exception as exc:  # noqa: BLE001 - per-clip isolation is the point
+                rec.status = ClipStatus.FAILED
+                rec.error_type = type(exc).__name__
+                rec.error_message = str(exc)[:400]
+                out.failed += 1
+                logger.error("[batch] %s FAILED: %s: %s", cid, type(exc).__name__, exc)
+            out.clips.append(rec)
+    finally:
+        # Per-clip failures are already isolated inside the loop, so reaching
+        # here means the batch is over one way or another and the model is no
+        # longer needed. A clip failure never invalidates the model itself.
+        if transcriber is not None:
+            transcriber.release()
 
     out.status = "DONE" if (out.failed == 0 and out.succeeded == out.requested
                             and out.requested > 0) else "FAILED"

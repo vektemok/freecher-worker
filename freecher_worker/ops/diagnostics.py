@@ -29,6 +29,11 @@ from typing import Any, Optional
 R2_CACHE_SECONDS = 15.0
 _R2_CACHE: dict[str, tuple[float, "Check"]] = {}
 
+#: Walking the run tree is stat-only but still touches every file; once a minute
+#: is plenty for a size that changes only when a job renders.
+RUNS_CACHE_SECONDS = 60.0
+_RUNS_CACHE: dict[str, tuple[float, "Check"]] = {}
+
 
 @dataclass
 class Check:
@@ -187,16 +192,97 @@ def check_ytdlp() -> Check:
     return Check("yt-dlp", True, path, {"path": path})
 
 
-def check_disk(path: Optional[Path] = None, min_free_gib: float = 5.0) -> Check:
-    """Rendering writes multi-hundred-megabyte intermediates; a full disk fails late."""
-    target = Path(path or os.environ.get("FREECHER_JOBS_DIR") or ".").resolve()
-    while not target.exists() and target != target.parent:
-        target = target.parent
-    usage = shutil.disk_usage(target)
-    free_gib = usage.free / (1 << 30)
-    return Check("disk", free_gib >= min_free_gib,
-                 f"{free_gib:.1f} GiB free at {target}",
-                 {"free_gib": round(free_gib, 1), "min_gib": min_free_gib})
+def check_disk(path: Optional[Path] = None, settings: Any = None) -> Check:
+    """Free space against the same thresholds the ingest/render guards enforce.
+
+    Reporting a different number here than the guard uses would be worse than
+    not reporting one, so both read `ops.disk.disk_status`.
+    """
+    from freecher_worker.ops.disk import GIB, disk_status
+
+    target = Path(path or os.environ.get("FREECHER_JOBS_DIR") or ".")
+    status = disk_status(target, settings)
+    return Check("disk", status.ok, status.summary, {
+        "path": status.path,
+        "free_gib": round(status.free_gib, 2),
+        "total_gib": round(status.total_gib, 2),
+        "free_percent": round(status.free_percent, 1),
+        "min_free_gib": round(status.min_free_bytes / GIB, 2),
+        "min_free_percent": status.min_free_percent,
+        "guards_would_block": not status.ok,
+    })
+
+
+def check_runs(settings: Any = None, *, use_cache: bool = True) -> Check:
+    """How much the run tree is holding, and how much of it is reclaimable-looking.
+
+    Deliberately a stat-only walk: no hashing, no R2 calls. The precise
+    reclaimable figure needs remote verification and belongs to
+    `freecher-worker cleanup --dry-run`; this is the cheap signal that says when
+    to go run it.
+    """
+    from freecher_worker.config import get_settings
+    from freecher_worker.ops.cleanup import GIB
+
+    cfg = settings or get_settings()
+    root = Path(getattr(cfg, "runs_dir", "runs"))
+    if not root.is_dir():
+        return Check("runs", True, f"{root} does not exist yet",
+                     {"path": str(root), "bytes": 0}, required=False)
+
+    cached = _RUNS_CACHE.get(str(root))
+    if use_cache and cached and (time.monotonic() - cached[0]) < RUNS_CACHE_SECONDS:
+        return cached[1]
+
+    total = 0
+    sources = 0
+    for child in root.iterdir():
+        if not child.is_dir() or child.name.startswith("_"):
+            continue
+        sources += 1
+        for f in child.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                continue
+    result = Check("runs", True, f"{total / GIB:.2f} GiB across {sources} source(s)",
+                   {"path": str(root), "bytes": total, "sources": sources},
+                   required=False)
+    _RUNS_CACHE[str(root)] = (time.monotonic(), result)
+    return result
+
+
+def check_model_cache(settings: Any = None) -> Check:
+    """Are the big model files already on disk? Path checks only -- never a load.
+
+    A health endpoint that loaded the 1.5 GB refinement model would take minutes
+    and 2+ GiB of RSS to answer "yes".
+    """
+    from freecher_worker.ops.cleanup import GIB
+
+    home = Path(os.environ.get("HOME") or Path.home())
+    targets = {
+        "yunet": home / ".cache" / "freecher-worker" / "models",
+        "whisper": home / ".cache" / "huggingface" / "hub",
+    }
+    info: dict[str, Any] = {}
+    for name, path in targets.items():
+        if not path.is_dir():
+            info[name] = "absent"
+            continue
+        size = 0
+        for f in path.rglob("*"):
+            try:
+                if f.is_file():
+                    size += f.stat().st_size
+            except OSError:
+                continue
+        info[name] = f"{size / GIB:.2f} GiB"
+    warm = [n for n, v in info.items() if v != "absent"]
+    detail = ("warm: " + ", ".join(f"{n} {info[n]}" for n in warm)) if warm else "cold (first render will download)"
+    # Never required: a cold cache costs time on the first render, not correctness.
+    return Check("models", True, detail, info, required=False)
 
 
 def collect(settings: Any = None, *, jobs_dir: Optional[Path] = None,
@@ -212,6 +298,8 @@ def collect(settings: Any = None, *, jobs_dir: Optional[Path] = None,
     checks.extend(check_ffmpeg(cfg))
     checks.append(check_transcription(cfg))
     checks.append(check_ytdlp())
-    checks.append(check_disk(jobs_dir))
+    checks.append(check_disk(jobs_dir, cfg))
+    checks.append(check_runs(cfg))
+    checks.append(check_model_cache(cfg))
     status = "ok" if all(c.ok for c in checks if c.required) else "degraded"
     return Diagnostics(status=status, checks=checks)

@@ -2,11 +2,64 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("freecher_worker")
+
+#: Loaded from the working directory if it happens to be there. Incidental: the
+#: caller did not ask for it, so it must never be the reason a command fails.
+DEFAULT_ENV_FILE = ".env"
+
+#: An env file the operator explicitly asked for. Unreadable here IS an error --
+#: silently starting with the wrong configuration is worse than refusing to.
+ENV_FILE_VAR = "FREECHER_ENV_FILE"
+
+
+class EnvFileError(RuntimeError):
+    """An explicitly requested env file could not be read."""
+
+
+def resolve_env_file() -> Optional[str]:
+    """Decide which env file to load, tolerating an unreadable incidental one.
+
+    A checkout whose directory the current user cannot traverse -- the service
+    user against a developer's home, say -- made `Path(".env").is_file()` raise
+    PermissionError from inside pydantic-settings, and every CLI command in that
+    directory died with a traceback before it could do anything. An env file
+    nobody asked for is not worth failing over; one that was asked for is.
+    """
+    explicit = os.environ.get(ENV_FILE_VAR)
+    if explicit:
+        path = Path(explicit).expanduser()
+        try:
+            usable = path.is_file() and os.access(path, os.R_OK)
+        except OSError as exc:
+            raise EnvFileError(f"{ENV_FILE_VAR}={explicit} cannot be read: {exc}") from exc
+        if not usable:
+            raise EnvFileError(
+                f"{ENV_FILE_VAR}={explicit} is not a readable file. "
+                f"Point it at an existing env file, or unset it to fall back to "
+                f"./{DEFAULT_ENV_FILE} and the process environment."
+            )
+        return str(path)
+
+    default = Path(DEFAULT_ENV_FILE)
+    try:
+        if default.is_file() and not os.access(default, os.R_OK):
+            logger.warning("ignoring unreadable %s in %s; using the process environment",
+                           DEFAULT_ENV_FILE, Path.cwd())
+            return None
+    except OSError as exc:
+        logger.warning("ignoring %s in this directory (%s); using the process environment",
+                       DEFAULT_ENV_FILE, exc)
+        return None
+    return DEFAULT_ENV_FILE
 
 
 class Settings(BaseSettings):
@@ -14,10 +67,18 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="FREECHER_",
-        env_file=".env",
+        env_file=DEFAULT_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    def __init__(self, **values: Any) -> None:
+        # Resolve the env file per instantiation rather than at class definition:
+        # the default is relative to the working directory, which is not known at
+        # import time. An explicit _env_file from the caller always wins.
+        if "_env_file" not in values:
+            values["_env_file"] = resolve_env_file()
+        super().__init__(**values)
 
     # ASR Settings
     asr_model: str = Field(default="small", description="Whisper model name (small, medium, turbo, etc.)")
@@ -258,6 +319,32 @@ class Settings(BaseSettings):
     shorts_encoder: str = Field(default="auto", description="Encoder selection: auto | libx264 | h264_nvenc")
     shorts_x264_preset: str = Field(default="veryfast", description="libx264 preset for the final encode")
     shorts_x264_crf: int = Field(default=20, description="libx264 CRF quality for the final encode")
+
+    # Disk lifecycle and guards
+    runs_dir: str = Field(
+        default="runs",
+        description="Directory holding per-source run artifacts; cleanup operates here",
+    )
+    min_free_disk_gb: float = Field(
+        default=5.0,
+        description=(
+            "Refuse to start ingest or render below this much free space. A "
+            "1080x1920 clip plus ffmpeg intermediates is comfortably under a "
+            "gigabyte, so this leaves room for several plus the source."
+        ),
+    )
+    min_free_disk_percent: float = Field(
+        default=5.0,
+        description="Second floor, as a percentage, for hosts with large disks",
+    )
+    cleanup_after_done: bool = Field(
+        default=False,
+        description=(
+            "After a job reaches DONE and its clips are verified in R2, delete "
+            "the regenerable local files for that source. Off by default: "
+            "destruction should be asked for, not inherited."
+        ),
+    )
 
     # Media tooling
     ffmpeg_path: Optional[str] = Field(
