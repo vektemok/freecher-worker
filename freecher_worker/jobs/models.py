@@ -73,6 +73,7 @@ class Job(BaseModel):
     status: JobStatus = JobStatus.QUEUED
     stage: JobStatus = JobStatus.QUEUED
     top_n: int = 5
+    owner_user_id: Optional[str] = None
 
     created_at: str = Field(default_factory=_now)
     started_at: Optional[str] = None

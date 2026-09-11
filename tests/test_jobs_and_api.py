@@ -23,7 +23,7 @@ def store(tmp_path) -> JobStore:
 
 @pytest.fixture
 def client(store) -> TestClient:
-    return TestClient(create_app(store))
+    return TestClient(create_app(store), headers={"Authorization": "Bearer test-user-testuid"})
 
 
 # ------------------------------------------------------------------ job store
@@ -222,8 +222,56 @@ def test_retry_of_an_unknown_job_is_404(client):
     assert client.post("/jobs/nope/retry").status_code == 404
 
 
-def test_api_never_runs_the_pipeline_in_the_request(client, store):
+def test_api_never_runs_the_pipeline_in_the_request(client, store, monkeypatch):
     """POST must only enqueue; a worker does the work."""
+    monkeypatch.setenv("FREECHER_INLINE_WORKER", "0")
     jid = client.post("/jobs", json={"url": URL}).json()["job_id"]
     assert store.get(jid).status is JobStatus.QUEUED
     assert store.get(jid).source_id is None
+
+
+# -------------------------------------------------------- auth boundary tests
+def test_unauthenticated_jobs_endpoints_return_401(store):
+    raw_client = TestClient(create_app(store))
+    assert raw_client.post("/jobs", json={"url": URL}).status_code == 401
+    assert raw_client.get("/jobs").status_code == 401
+    assert raw_client.get("/jobs/some_id").status_code == 401
+    assert raw_client.post("/jobs/some_id/retry").status_code == 401
+
+
+def test_health_remains_public_without_auth(store):
+    raw_client = TestClient(create_app(store))
+    res = raw_client.get("/health?deep=false")
+    assert res.status_code in (200, 503)
+
+
+def test_job_ownership_isolation(store):
+    client_a = TestClient(create_app(store), headers={"Authorization": "Bearer test-user-alice"})
+    client_b = TestClient(create_app(store), headers={"Authorization": "Bearer test-user-bob"})
+
+    # Alice creates a job
+    resp_a = client_a.post("/jobs", json={"url": URL})
+    assert resp_a.status_code == 201
+    job_id = resp_a.json()["job_id"]
+
+    # Alice can see her job
+    get_a = client_a.get(f"/jobs/{job_id}")
+    assert get_a.status_code == 200
+    assert get_a.json()["owner_user_id"] == "alice"
+
+    # Alice sees it in list
+    list_a = client_a.get("/jobs").json()
+    assert any(j["job_id"] == job_id for j in list_a)
+
+    # Bob CANNOT see Alice's job (returns 404 for security)
+    get_b = client_b.get(f"/jobs/{job_id}")
+    assert get_b.status_code == 404
+
+    # Bob does NOT see Alice's job in list
+    list_b = client_b.get("/jobs").json()
+    assert not any(j["job_id"] == job_id for j in list_b)
+
+    # Bob CANNOT retry Alice's job
+    retry_b = client_b.post(f"/jobs/{job_id}/retry")
+    assert retry_b.status_code == 404
+

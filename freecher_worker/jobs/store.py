@@ -45,8 +45,19 @@ class JobStore:
         return self.root / f"{safe}.json"
 
     # ------------------------------------------------------------------- CRUD
-    def create(self, source_url: str, top_n: int = 5, job_id: Optional[str] = None) -> Job:
-        job = Job(job_id=job_id or uuid.uuid4().hex, source_url=source_url, top_n=top_n)
+    def create(
+        self,
+        source_url: str,
+        top_n: int = 5,
+        job_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+    ) -> Job:
+        job = Job(
+            job_id=job_id or uuid.uuid4().hex,
+            source_url=source_url,
+            top_n=top_n,
+            owner_user_id=owner_user_id,
+        )
         self._write(job)
         return job
 
@@ -62,11 +73,14 @@ class JobStore:
         except ValueError:
             return False
 
-    def list(self) -> list[Job]:
+    def list(self, owner_user_id: Optional[str] = None) -> list[Job]:
         out = []
         for p in sorted(self.root.glob("*.json")):
             try:
-                out.append(Job.model_validate_json(p.read_text()))
+                j = Job.model_validate_json(p.read_text())
+                if owner_user_id is not None and j.owner_user_id != owner_user_id:
+                    continue
+                out.append(j)
             except Exception:  # noqa: BLE001 - a corrupt file must not hide the rest
                 continue
         return sorted(out, key=lambda j: j.created_at, reverse=True)

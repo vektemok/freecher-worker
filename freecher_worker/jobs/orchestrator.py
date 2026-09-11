@@ -172,9 +172,14 @@ def _valid_json_object(client: Any, bucket: str, key: str, min_bytes: int = 2) -
 class Orchestrator:
     """Runs one job to completion (or failure), persisting every transition."""
 
-    def __init__(self, store: JobStore, settings: Optional[Settings] = None):
+    def __init__(
+        self,
+        store: JobStore,
+        settings: Optional[Settings] = None,
+        cfg: Optional[Settings] = None,
+    ):
         self.store = store
-        self.cfg = settings or get_settings()
+        self.cfg = settings or cfg or get_settings()
 
     # ------------------------------------------------------------- bookkeeping
     def _enter(self, job_id: str, stage: JobStatus) -> float:
@@ -267,11 +272,22 @@ class Orchestrator:
 
     # --------------------------------------------------------------- INGESTING
     def _ingest(self, job_id: str, client: Any, bucket: str) -> str:
+        import hashlib
+        from freecher_worker.ingest.lock import SourceIngestLock
         from freecher_worker.ingest.service import ingest_to_r2, render_key
         from freecher_worker.ingest.source import probe_source
 
         job = self.store.get(job_id)
         t0 = self._enter(job_id, JobStatus.INGESTING)
+
+        def _both_artifacts_valid(sid: str) -> tuple[bool, str]:
+            src_key = f"input/{sid}/source.mp4"
+            aud_key = f"processing/{sid}/audio.m4a"
+            src_size = _object_exists(client, bucket, src_key)
+            aud_size = _object_exists(client, bucket, aud_key)
+            if src_size and src_size > 0 and aud_size and aud_size > 0:
+                return True, f"{src_key} ({src_size} bytes) and {aud_key} ({aud_size} bytes)"
+            return False, f"source={src_size} bytes, audio={aud_size} bytes"
 
         # Resolve the prospective source_id BEFORE transferring anything. A brand
         # new job for an already-ingested URL has no source_id of its own, so
@@ -286,32 +302,79 @@ class Orchestrator:
                 logger.info("[ingest] could not pre-resolve source id (%s); ingesting", exc)
 
         if candidate_id:
-            key = f"input/{candidate_id}/source.mp4"
-            size = _object_exists(client, bucket, key)
-            if size and size > 0:
-                self._log_gate("INGESTING", True, f"{key} = {size} bytes")
+            valid, details = _both_artifacts_valid(candidate_id)
+            if valid:
+                self._log_gate("INGESTING", True, details)
                 self.store.update(job_id, lambda j: setattr(j, "source_id", candidate_id))
-                self._leave(job_id, t0, skipped=True, reason="source object present")
+                self._leave(job_id, t0, skipped=True, reason="source and audio artifacts present")
                 return candidate_id
 
-        self._log_gate("INGESTING", False, "no existing source object for this URL")
-        # Before pulling potentially gigabytes: a full disk turns into a
-        # truncated source and a confusing failure three stages later.
-        require_disk_space(Path(self.cfg.runs_dir), "INGESTING", settings=self.cfg,
-                           expected_bytes=_estimated_source_bytes(job.source_url))
-        result = ingest_to_r2(
-            job.source_url, client=client, bucket=bucket,
-            key_template=self.cfg.ingest_key_template,
-            quality=self.cfg.ingest_quality if hasattr(self.cfg, "ingest_quality") else "best",
-            extract_audio=True,
-            public_base_url=self.cfg.r2_public_base_url,
-            overwrite=False,
+        # Lock source_id to prevent duplicate concurrent ingest
+        lock_id = candidate_id or hashlib.sha256(job.source_url.encode()).hexdigest()[:32]
+        locks_dir = Path(self.cfg.runs_dir) / "_locks"
+        lock = SourceIngestLock(
+            source_id=lock_id,
+            job_id=job_id,
+            locks_dir=locks_dir,
         )
-        source_id = (result.video.video_id if result.video
-                     else result.key.split("/")[-2])
-        self.store.update(job_id, lambda j: setattr(j, "source_id", source_id))
-        self._leave(job_id, t0)
-        return source_id
+
+        acquired = lock.acquire(force_if_stale=True)
+        if not acquired:
+            logger.info(
+                "[ingest] concurrent ingest in progress for source %s; waiting for artifacts",
+                lock_id,
+            )
+            poll_interval = 2.0
+            max_wait_seconds = 3600.0
+            wait_start = time.perf_counter()
+            while True:
+                time.sleep(poll_interval)
+                if candidate_id:
+                    valid, details = _both_artifacts_valid(candidate_id)
+                    if valid:
+                        self._log_gate("INGESTING", True, f"reused: {details}")
+                        self.store.update(job_id, lambda j: setattr(j, "source_id", candidate_id))
+                        self._leave(
+                            job_id, t0, skipped=True,
+                            reason="source and audio artifacts present (from concurrent ingest)"
+                        )
+                        return candidate_id
+
+                if lock.acquire(force_if_stale=True):
+                    acquired = True
+                    break
+
+                if time.perf_counter() - wait_start > max_wait_seconds:
+                    raise TimeoutError(
+                        f"timed out waiting {max_wait_seconds:.0f}s for concurrent ingest of {lock_id}"
+                    )
+
+        lock.start_heartbeat(interval_seconds=10.0)
+        try:
+            self._log_gate("INGESTING", False, "no existing complete source+audio objects for this URL")
+            # Before pulling potentially gigabytes: a full disk turns into a
+            # truncated source and a confusing failure three stages later.
+            require_disk_space(Path(self.cfg.runs_dir), "INGESTING", settings=self.cfg,
+                               expected_bytes=_estimated_source_bytes(job.source_url))
+            part_size_mb = getattr(self.cfg, "ingest_part_size_mb", 16)
+            concurrency = getattr(self.cfg, "ingest_concurrency", 4)
+            result = ingest_to_r2(
+                job.source_url, client=client, bucket=bucket,
+                key_template=self.cfg.ingest_key_template,
+                quality=self.cfg.ingest_quality if hasattr(self.cfg, "ingest_quality") else "best",
+                part_size=part_size_mb * 1024 * 1024,
+                concurrency=concurrency,
+                extract_audio=True,
+                public_base_url=self.cfg.r2_public_base_url,
+                overwrite=False,
+            )
+            source_id = (result.video.video_id if result.video
+                         else result.key.split("/")[-2])
+            self.store.update(job_id, lambda j: setattr(j, "source_id", source_id))
+            self._leave(job_id, t0)
+            return source_id
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------ TRANSCRIBING
     def _transcribe(self, job_id: str, source_id: str, client: Any, bucket: str) -> None:

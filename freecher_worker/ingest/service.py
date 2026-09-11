@@ -295,6 +295,9 @@ def ingest_to_r2(
     ffmpeg_path: str = "ffmpeg",
     ffprobe_path: str = "ffprobe",
     on_audio_progress: Optional[ProgressCallback] = None,
+    network_timeout: float = 30.0,
+    network_retries: int = 5,
+    stall_timeout: float = 60.0,
 ) -> IngestResult:
     """Stream a video from any yt-dlp-supported site into an R2 object.
 
@@ -400,6 +403,9 @@ def ingest_to_r2(
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
             extra_args=extra_args,
+            network_timeout=network_timeout,
+            network_retries=network_retries,
+            stall_timeout=stall_timeout,
         ) as stream:
             upload_source = stream.stdout
             if produce_audio and audio_path is not None:

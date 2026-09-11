@@ -47,3 +47,6 @@ runs/
 # Secrets & environment
 .env
 *.local
+
+# Frontend web app
+freecher-web/

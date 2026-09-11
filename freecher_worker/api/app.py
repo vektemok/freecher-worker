@@ -15,10 +15,12 @@ import os
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from freecher_worker.api.auth import AuthenticatedUser, get_current_user
 from freecher_worker.jobs.models import Job, JobStatus
 from freecher_worker.jobs.store import JobNotFound, JobStore
 
@@ -71,6 +73,8 @@ class JobResponse(BaseModel):
     status: str
     stage: str
     progress: int
+    source_url: Optional[str] = None
+    owner_user_id: Optional[str] = None
     source_id: Optional[str] = None
     error: Optional[dict[str, Any]] = None
     clips: list[ClipOut] = Field(default_factory=list)
@@ -88,7 +92,7 @@ def _to_response(job: Job) -> JobResponse:
     ]
     return JobResponse(
         job_id=job.job_id, status=job.status.value, stage=job.stage.value,
-        progress=job.progress, source_id=job.source_id,
+        progress=job.progress, source_url=job.source_url, owner_user_id=job.owner_user_id, source_id=job.source_id,
         error=job.public_error(), clips=clips,
     )
 
@@ -97,6 +101,14 @@ def create_app(store: Optional[JobStore] = None) -> FastAPI:
     app = FastAPI(title="Freecher", version="0.2.0",
                   description="URL in, finished vertical clips out.")
     app.state.store = store or _store()
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):  # noqa: ANN202
@@ -122,28 +134,57 @@ def create_app(store: Optional[JobStore] = None) -> FastAPI:
         return JSONResponse(status_code=200 if diag.ok else 503, content=diag.as_dict())
 
     @app.post("/jobs", response_model=CreateJobResponse, status_code=201)
-    def create_job(body: CreateJobRequest) -> CreateJobResponse:
-        job = app.state.store.create(source_url=body.url, top_n=body.top_n)
-        logger.info("[api] queued job %s for %s (top_n=%d)", job.job_id, body.url, body.top_n)
+    def create_job(
+        body: CreateJobRequest,
+        background_tasks: BackgroundTasks,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> CreateJobResponse:
+        job = app.state.store.create(
+            source_url=body.url, top_n=body.top_n, owner_user_id=user.uid
+        )
+        logger.info(
+            "[api] queued job %s for %s by user %s (top_n=%d)",
+            job.job_id, body.url, user.uid, body.top_n
+        )
+        if os.environ.get("FREECHER_INLINE_WORKER", "1") == "1":
+            from freecher_worker.jobs.orchestrator import Orchestrator
+            background_tasks.add_task(Orchestrator(app.state.store).run, job.job_id)
         return CreateJobResponse(job_id=job.job_id, status=job.status.value)
 
     @app.get("/jobs/{job_id}", response_model=JobResponse)
-    def get_job(job_id: str) -> JobResponse:
+    def get_job(
+        job_id: str,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> JobResponse:
         try:
             job = app.state.store.get(job_id)
         except (JobNotFound, ValueError):
             raise HTTPException(status_code=404, detail="job not found")
+        if job.owner_user_id is not None and job.owner_user_id != user.uid:
+            raise HTTPException(status_code=404, detail="job not found")
         return _to_response(job)
 
     @app.get("/jobs", response_model=list[JobResponse])
-    def list_jobs(limit: int = 50) -> list[JobResponse]:
-        return [_to_response(j) for j in app.state.store.list()[: max(1, min(limit, 200))]]
+    def list_jobs(
+        limit: int = 50,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> list[JobResponse]:
+        return [
+            _to_response(j)
+            for j in app.state.store.list(owner_user_id=user.uid)[: max(1, min(limit, 200))]
+        ]
 
     @app.post("/jobs/{job_id}/retry", response_model=JobResponse)
-    def retry_job(job_id: str) -> JobResponse:
+    def retry_job(
+        job_id: str,
+        background_tasks: BackgroundTasks,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> JobResponse:
         try:
             job = app.state.store.get(job_id)
         except (JobNotFound, ValueError):
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.owner_user_id is not None and job.owner_user_id != user.uid:
             raise HTTPException(status_code=404, detail="job not found")
         if job.status is JobStatus.DONE:
             raise HTTPException(status_code=409, detail="job already completed")
@@ -160,7 +201,11 @@ def create_app(store: Optional[JobStore] = None) -> FastAPI:
 
         # Resume, not restart: source_id, run_dir and clips are kept so the
         # orchestrator's per-stage artifact checks can skip completed work.
-        return _to_response(app.state.store.update(job_id, reset))
+        updated_job = app.state.store.update(job_id, reset)
+        if os.environ.get("FREECHER_INLINE_WORKER", "1") == "1":
+            from freecher_worker.jobs.orchestrator import Orchestrator
+            background_tasks.add_task(Orchestrator(app.state.store).run, job_id)
+        return _to_response(updated_job)
 
     return app
 

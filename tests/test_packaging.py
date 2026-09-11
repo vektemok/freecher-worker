@@ -24,6 +24,7 @@ DISTRIBUTION_FOR_MODULE = {
     "faster_whisper": "faster-whisper",
     "pydantic_settings": "pydantic-settings",
     "dotenv": "python-dotenv",
+    "jwt": "pyjwt",
 }
 
 # Modules that arrive as a hard dependency of a declared distribution and are

@@ -31,7 +31,7 @@ class R2UploadError(Exception):
 # Retried inside the worker rather than left to botocore: a part is already
 # fully in memory, so replaying it is free, and on a thin uplink a single
 # dropped connection would otherwise throw away the whole transfer.
-DEFAULT_PART_ATTEMPTS = 5
+DEFAULT_PART_ATTEMPTS = 8
 RETRY_BACKOFF_SECONDS = 2.0
 
 

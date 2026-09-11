@@ -276,7 +276,7 @@ def test_a_parked_job_stays_parked_while_the_transcript_is_missing(tmp_path, mon
 
 def test_the_api_reports_a_parked_job_plainly(tmp_path):
     store = JobStore(tmp_path / "jobs")
-    client = TestClient(create_app(store))
+    client = TestClient(create_app(store), headers={"Authorization": "Bearer test-user-deploy"})
     jid = client.post("/jobs", json={"url": URL}).json()["job_id"]
     store.update(jid, lambda j: (setattr(j, "status", JobStatus.AWAITING_TRANSCRIPT),
                                  setattr(j, "stage", JobStatus.AWAITING_TRANSCRIPT)) and None)

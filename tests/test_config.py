@@ -4,8 +4,12 @@ import pytest
 from freecher_worker.config import Settings
 
 
-def test_default_settings():
-    settings = Settings()
+def test_default_settings(monkeypatch):
+    import os
+    for k in list(os.environ):
+        if k.startswith("FREECHER_"):
+            monkeypatch.delenv(k, raising=False)
+    settings = Settings(_env_file=None)
     assert settings.asr_model == "small"
     assert settings.asr_device == "cuda"
     assert settings.asr_compute_type == "int8_float16"

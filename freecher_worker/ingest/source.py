@@ -7,15 +7,18 @@ RuTube, VK, a bare .mp4 URL) goes through the same two calls.
 from __future__ import annotations
 
 import collections
+import io
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Optional, Sequence
 
 from freecher_worker.ingest.models import (
     AVAILABLE_QUALITY_MODES,
@@ -168,6 +171,8 @@ def build_stream_command(
     cookies_file: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
     proxy: Optional[str] = None,
+    network_timeout: float = 30.0,
+    network_retries: int = 5,
 ) -> list[str]:
     """Build the yt-dlp command that writes the chosen video to stdout.
 
@@ -180,6 +185,12 @@ def build_stream_command(
         "--no-playlist",
         "--no-progress",
         "--no-warnings",
+        "--socket-timeout",
+        str(max(1, int(network_timeout))),
+        "--retries",
+        str(max(0, int(network_retries))),
+        "--fragment-retries",
+        str(max(0, int(network_retries))),
         "-f",
         format_selector,
     ]
@@ -191,9 +202,17 @@ def build_stream_command(
         output_args = FRAGMENTED_MP4_ARGS
         if adts_to_asc:
             output_args = f"{output_args} {ADTS_TO_ASC_ARGS}"
+        timeout_us = int(network_timeout * 1_000_000)
+        ffmpeg_i_args = (
+            f"-timeout {timeout_us} "
+            f"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            f"-seg_max_retry {max(0, int(network_retries))}"
+        )
         command += [
             "--downloader",
             "ffmpeg",
+            "--downloader-args",
+            f"ffmpeg_i:{ffmpeg_i_args}",
             "--downloader-args",
             f"ffmpeg_o:{output_args}",
         ]
@@ -292,22 +311,110 @@ def video_info_from_payload(payload: dict[str, Any]) -> VideoInfo:
     )
 
 
+class MonitoredStream(io.RawIOBase):
+    """Wraps a readable binary stream and tracks in-flight read duration."""
+
+    def __init__(
+        self,
+        raw: BinaryIO,
+        on_read_start: Callable[[], None],
+        on_read_end: Callable[[], None],
+    ) -> None:
+        self._raw = raw
+        self._on_read_start = on_read_start
+        self._on_read_end = on_read_end
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:  # type: ignore[override]
+        self._on_read_start()
+        try:
+            return self._raw.read(size)
+        finally:
+            self._on_read_end()
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+        super().close()
+
+
 class SourceStream:
     """A running yt-dlp process whose stdout carries the video bytes."""
 
-    def __init__(self, process: subprocess.Popen, command: Sequence[str]) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        command: Sequence[str],
+        stall_timeout: float = 60.0,
+    ) -> None:
         self.process = process
         self.command = list(command)
+        self.stall_timeout = stall_timeout
+        self.stalled = False
+        self._reading = False
+        self._read_start_time = 0.0
+        self._lock = threading.Lock()
+        self._stop_watchdog = threading.Event()
+
+        assert self.process.stdout is not None
+        self._stdout = MonitoredStream(
+            self.process.stdout, self._on_read_start, self._on_read_end
+        )
         self._stderr_tail: collections.deque[str] = collections.deque(maxlen=STDERR_TAIL_LINES)
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, name="yt-dlp-stderr", daemon=True
         )
         self._stderr_thread.start()
 
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="yt-dlp-watchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+
+    def _on_read_start(self) -> None:
+        with self._lock:
+            self._reading = True
+            self._read_start_time = time.perf_counter()
+
+    def _on_read_end(self) -> None:
+        with self._lock:
+            self._reading = False
+            self._read_start_time = 0.0
+
+    def _watchdog_loop(self) -> None:
+        interval = min(1.0, max(0.05, self.stall_timeout / 4.0))
+        while not self._stop_watchdog.wait(interval):
+            if self.process.poll() is not None:
+                break
+            with self._lock:
+                if self._reading and self._read_start_time > 0:
+                    age = time.perf_counter() - self._read_start_time
+                    if age > self.stall_timeout:
+                        logger.error(
+                            "source stream stalled: read waited %.1fs without bytes (> %.1fs limit)",
+                            age, self.stall_timeout
+                        )
+                        self.stalled = True
+                        self._kill_process_group()
+                        break
+
+    def _kill_process_group(self) -> None:
+        try:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, 9)
+        except (OSError, ProcessLookupError):
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+
     @property
     def stdout(self):
-        assert self.process.stdout is not None
-        return self.process.stdout
+        return self._stdout
 
     def _drain_stderr(self) -> None:
         """Keep the stderr pipe empty so a chatty yt-dlp can never deadlock."""
@@ -326,21 +433,31 @@ class SourceStream:
 
     def wait_and_check(self, timeout: float = 60.0) -> None:
         """Wait for yt-dlp to exit and raise if it failed."""
+        self._stop_watchdog.set()
+        if self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2.0)
         return_code = self.process.wait(timeout=timeout)
         self._stderr_thread.join(timeout=5.0)
+        if self.stalled:
+            raise SourceStreamError(
+                f"media stream stalled: no bytes delivered for {self.stall_timeout:.1f}s:\n{self.stderr_tail}"
+            )
         if return_code != 0:
             raise SourceStreamError(
                 f"yt-dlp exited with code {return_code}:\n{self.stderr_tail}"
             )
 
     def terminate(self) -> None:
+        self._stop_watchdog.set()
+        if self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2.0)
         if self.process.poll() is None:
-            self.process.kill()
+            self._kill_process_group()
             self.process.wait()
         # The drain thread is still iterating the stderr pipe; closing it under
         # the thread raises there and can swallow the real failure message.
         self._stderr_thread.join(timeout=5.0)
-        for stream in (self.process.stdout, self.process.stderr):
+        for stream in (self._stdout, self.process.stdout, self.process.stderr):
             if stream is not None:
                 try:
                     stream.close()
@@ -360,6 +477,9 @@ def open_source_stream(
     cookies_file: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
     pipe_buffer_size: int = 1024 * 1024,
+    network_timeout: float = 30.0,
+    network_retries: int = 5,
+    stall_timeout: float = 60.0,
 ) -> Iterator[SourceStream]:
     """Start yt-dlp and yield its output stream, killing it on any failure."""
     command = build_stream_command(
@@ -371,6 +491,8 @@ def open_source_stream(
         cookies_from_browser=cookies_from_browser,
         cookies_file=cookies_file,
         extra_args=extra_args,
+        network_timeout=network_timeout,
+        network_retries=network_retries,
     )
     logger.info("starting yt-dlp: %s", " ".join(command))
 
@@ -380,8 +502,9 @@ def open_source_stream(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=pipe_buffer_size,
+        start_new_session=True,
     )
-    stream = SourceStream(process, command)
+    stream = SourceStream(process, command, stall_timeout=stall_timeout)
     try:
         yield stream
     finally:
