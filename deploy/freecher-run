@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run the Freecher CLI exactly as the systemd units do: same user, same working
+# directory, same environment file -- so what an operator sees matches what the
+# services see.
+#
+#   sudo freecher-run preflight
+#   sudo freecher-run run-url <url> --top-n 3 --jobs-dir /var/lib/freecher/jobs
+#
+# systemd-run rather than sudo/runuser on purpose: systemd reads the env file
+# itself, inside the transient unit. Expanding it into argv here would publish
+# the R2 secret and the LLM key in /proc/*/cmdline, readable by every user on
+# the host. Needs root because /etc/freecher is deliberately root-only.
+set -euo pipefail
+
+ENV_FILE=/etc/freecher/freecher.env
+VENV=/opt/freecher/venv
+STATE=/var/lib/freecher
+SERVICE_USER=freecher
+
+[[ $EUID -eq 0 ]] || exec sudo -- "$0" "$@"
+[[ -r $ENV_FILE ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
+
+args=(--quiet --collect --wait
+      --uid="$SERVICE_USER" --gid="$SERVICE_USER"
+      --working-directory="$STATE"
+      --property=EnvironmentFile="$ENV_FILE")
+# --pty gives an interactive operator live output; --pipe is what works over a
+# non-interactive ssh command, and both propagate the exit status.
+if [[ -t 0 && -t 1 ]]; then args+=(--pty); else args+=(--pipe); fi
+
+exec systemd-run "${args[@]}" "$VENV/bin/freecher-worker" "$@"

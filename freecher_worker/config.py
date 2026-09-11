@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     subtitle_active_word: bool = Field(default=True, description="Enable active spoken word karaoke pop effect")
 
     # Phase 2 — Smart Crop 9:16 Settings
+    crop_detector: str = Field(
+        default="auto",
+        description=(
+            "Subject detector for smart crop: 'auto' (YuNet, degrading to Haar/HOG), "
+            "'yunet', 'haar' (legacy; detects nothing on OpenCV 5), or 'center'"
+        ),
+    )
     crop_analysis_fps: float = Field(default=2.0, description="Frame sampling rate (FPS) for subject detection")
     crop_deadzone_ratio: float = Field(default=0.03, description="Dead-zone ratio of width to suppress jitter")
     crop_max_velocity_pixels_per_sec: float = Field(default=200.0, description="Maximum pan velocity in pixels/second")
@@ -252,6 +259,19 @@ class Settings(BaseSettings):
     shorts_x264_preset: str = Field(default="veryfast", description="libx264 preset for the final encode")
     shorts_x264_crf: int = Field(default=20, description="libx264 CRF quality for the final encode")
 
+    # Media tooling
+    ffmpeg_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit ffmpeg binary (or a directory containing it). Falls back to PATH. "
+            "Use this to select a build with libass, e.g. /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+        ),
+    )
+    ffprobe_path: Optional[str] = Field(
+        default=None,
+        description="Explicit ffprobe binary (or directory). Falls back to PATH, then next to ffmpeg.",
+    )
+
     # Streaming Ingest — Cloudflare R2 (S3-compatible)
     r2_bucket: Optional[str] = Field(
         default=None,
@@ -307,6 +327,30 @@ class Settings(BaseSettings):
     transcribe_beam_size: int = Field(default=5, description="Beam size for R2 transcription")
     transcribe_vad_filter: bool = Field(default=True, description="Enable Silero VAD for R2 transcription")
     transcribe_word_timestamps: bool = Field(default=True, description="Emit word-level timestamps")
+
+    # Where TRANSCRIBING actually executes.
+    #   local  — run faster-whisper in this process (needs a GPU for real videos)
+    #   remote — publish a transcription request to R2 and park the job until a
+    #            GPU host (the proven Kaggle T4 notebook) writes transcript.json
+    #   auto   — local when CUDA is importable and visible, otherwise remote
+    # The Oracle ARM VM has no CUDA, so 'auto' resolves to 'remote' there and to
+    # 'local' on the GPU host, with no per-host code differences.
+    transcribe_backend: str = Field(
+        default="auto",
+        description="Transcription placement: auto | local | remote",
+    )
+    allow_cpu_transcription: bool = Field(
+        default=False,
+        description=(
+            "Permit CPU faster-whisper for audio longer than "
+            "cpu_transcription_max_seconds. Off by default: a 2-hour VOD on 2 ARM "
+            "cores takes many hours, and silently starting it looks like a hang."
+        ),
+    )
+    cpu_transcription_max_seconds: float = Field(
+        default=900.0,
+        description="Longest audio a CPU transcription may attempt without allow_cpu_transcription",
+    )
 
     # Optional External Services
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN", description="HuggingFace token if needed")

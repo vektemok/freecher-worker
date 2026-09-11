@@ -2934,13 +2934,48 @@ def doctor_command() -> None:
     else:
         table.add_row("FFmpeg NVENC", "[yellow]NOT AVAILABLE[/yellow]", "h264_nvenc unavailable, worker will use libx264 fallback")
 
-    # 4b. FFmpeg libass subtitle burning
-    from freecher_worker.rendering.renderer import is_ffmpeg_filter_supported
-    ass_ok = is_ffmpeg_filter_supported("ass") or is_ffmpeg_filter_supported("subtitles")
-    if ass_ok:
-        table.add_row("FFmpeg libass", "[green]OK[/green]", "Subtitle filtering (ass/subtitles) supported for burning subtitles")
-    else:
-        table.add_row("FFmpeg libass", "[yellow]NOT AVAILABLE[/yellow]", "FFmpeg build lacks libass; ASS files saved to disk, burn-in skipped")
+    # 4b. Resolved media toolchain and its capabilities
+    from freecher_worker.media.ffmpeg_env import (
+        FFmpegNotFoundError,
+        REQUIRED_ENCODERS,
+        REQUIRED_FILTERS,
+        probe_capabilities,
+    )
+    _settings = get_settings()
+    try:
+        caps = probe_capabilities(_settings)
+        table.add_row("FFmpeg (resolved)", "[green]OK[/green]",
+                      f"{caps.ffmpeg_path}" + (f"  [via FREECHER_FFMPEG_PATH]" if _settings.ffmpeg_path else "  [via PATH]"))
+        table.add_row("ffprobe (resolved)",
+                      "[green]OK[/green]" if caps.ffprobe_path else "[red]MISSING[/red]",
+                      caps.ffprobe_path or "not found")
+        table.add_row("FFmpeg version", "[green]OK[/green]", caps.version[:70])
+
+        missing_f = caps.missing_filters()
+        table.add_row(
+            "Required filters",
+            "[green]OK[/green]" if not missing_f else "[red]MISSING[/red]",
+            f"{len(caps.filters)} available; need {', '.join(REQUIRED_FILTERS)}"
+            + (f" — MISSING: {', '.join(missing_f)}" if missing_f else ""),
+        )
+        missing_e = caps.missing_encoders()
+        table.add_row(
+            "Required encoders",
+            "[green]OK[/green]" if not missing_e else "[red]MISSING[/red]",
+            f"{len(caps.encoders)} available; need {', '.join(REQUIRED_ENCODERS)}"
+            + (f" — MISSING: {', '.join(missing_e)}" if missing_e else ""),
+        )
+        if caps.supports_subtitle_burn:
+            table.add_row("FFmpeg libass", "[green]OK[/green]",
+                          f"subtitle burn-in available via the '{caps.subtitle_filter}' filter")
+        else:
+            table.add_row(
+                "FFmpeg libass", "[red]MISSING[/red]",
+                "no 'ass'/'subtitles' filter — subtitle renders will FAIL (not silently skip). "
+                "Install an --enable-libass build (brew install ffmpeg-full) and set FREECHER_FFMPEG_PATH",
+            )
+    except FFmpegNotFoundError as exc:
+        table.add_row("FFmpeg (resolved)", "[red]MISSING[/red]", str(exc)[:110])
 
 
     # 5. faster-whisper
@@ -3625,3 +3660,302 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.command("render-batch")
+def render_batch_command(
+    run_arg: str = typer.Argument(..., help="Run directory or run name under runs/"),
+    source_id: Optional[str] = typer.Option(None, "--source-id", help="Source id for R2 output keys (default: from manifest)"),
+    top_n: int = typer.Option(5, "--top-n", "-n", help="How many ranked highlights to render"),
+    source_video: Optional[Path] = typer.Option(None, "--source-video", help=SOURCE_VIDEO_OVERRIDE_HELP),
+    preset: str = typer.Option("shorts", "--preset", "-p", help="Rendering preset"),
+    no_crop: bool = typer.Option(False, "--no-crop", help="Disable smart crop"),
+    no_subtitles: bool = typer.Option(False, "--no-subtitles", help="Disable burned subtitles"),
+    no_loudnorm: bool = typer.Option(False, "--no-loudnorm", help="Disable loudness normalization"),
+    no_refine_boundaries: bool = typer.Option(False, "--no-refine-boundaries", help="Cut frozen candidate boundaries verbatim"),
+    no_publish: bool = typer.Option(False, "--no-publish", help="Render and validate only; do not upload to R2"),
+    force: bool = typer.Option(False, "--force", "-f", help="Re-render even if a valid artifact exists"),
+) -> None:
+    """Render the Top-N ranked highlights, validate each, and publish them to R2."""
+    from freecher_worker.rendering.batch import render_top_n
+
+    run_dir = _resolve_run_path(run_arg)
+    man = load_json(run_dir / "manifest.json")
+    if source_id is None:
+        src = str(man.get("source", ""))
+        source_id = src.rstrip("/").split("/")[-2] if "/" in src else run_dir.name
+    video = Path(source_video).expanduser().resolve() if source_video else Path(man["source"])
+    if not video.is_file():
+        console.print(f"[bold red]Error:[/bold red] source video not found: {video}")
+        raise typer.Exit(code=1)
+
+    result = render_top_n(
+        run_dir=run_dir, source_video=video, source_id=source_id, top_n=top_n,
+        preset_name=preset, enable_smart_crop=not no_crop,
+        enable_subtitles=not no_subtitles, enable_audio_normalization=not no_loudnorm,
+        refine_boundaries=not no_refine_boundaries, force=force, publish=not no_publish,
+    )
+
+    table = Table(show_header=True, header_style="bold magenta")
+    for col, w in (("Rank", 5), ("Clip ID", 30), ("Window", 17), ("Res", 10),
+                   ("Subs", 5), ("Crop", 14), ("Bytes", 12), ("Status", 8)):
+        table.add_column(col, width=w)
+    for c in result.clips:
+        table.add_row(
+            f"#{c.rank}", c.clip_id,
+            f"{c.start_seconds:.1f}-{c.end_seconds:.1f}",
+            f"{c.width}x{c.height}" if c.width else "-",
+            "yes" if c.subtitles_burned else "no", c.crop_mode or "-",
+            f"{c.bytes:,}" if c.bytes else "-",
+            f"[green]{c.status.value}[/green]" if c.status.value == "DONE" else f"[red]{c.status.value}[/red]",
+        )
+    console.print(table)
+    for c in result.clips:
+        if c.status.value != "DONE":
+            console.print(f"[red]{c.clip_id}[/red]: {c.error_type}: {c.error_message}")
+        elif c.r2_key:
+            console.print(f"  {c.clip_id} -> [cyan]{c.r2_key}[/cyan]")
+    colour = "green" if result.status == "DONE" else "red"
+    console.print(f"\n[bold {colour}]Batch {result.status}[/bold {colour}] "
+                  f"({result.succeeded}/{result.requested} clips)\n")
+    if result.status != "DONE":
+        raise typer.Exit(code=1)
+
+
+def _configure_job_logging(verbose: bool = True) -> None:
+    """Send the orchestrator's SKIP/RUN stage gates to stderr.
+
+    Without this the pipeline's decisions are only recoverable from the job
+    record; the requirement is that a resumed run is readable from the log too.
+    """
+    import logging as _logging
+    lg = _logging.getLogger("freecher_worker")
+    lg.setLevel(_logging.INFO if verbose else _logging.WARNING)
+    if not any(getattr(h, "_freecher_stage", False) for h in lg.handlers):
+        h = _logging.StreamHandler()
+        h.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+        h._freecher_stage = True  # type: ignore[attr-defined]
+        lg.addHandler(h)
+    lg.propagate = False
+
+
+def _jobs_store(jobs_dir: Optional[Path]):
+    from freecher_worker.jobs.store import DEFAULT_ROOT, JobStore
+    import os as _os
+    return JobStore(jobs_dir or _os.environ.get("FREECHER_JOBS_DIR") or DEFAULT_ROOT)
+
+
+@app.command("run-url")
+def run_url_command(
+    url: str = typer.Argument(..., help="Public video URL to turn into clips"),
+    top_n: int = typer.Option(5, "--top-n", "-n", help="How many ranked clips to produce"),
+    jobs_dir: Optional[Path] = typer.Option(None, "--jobs-dir", help="Job store directory"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Resume/retry this existing job"),
+) -> None:
+    """Run the whole pipeline for one URL: ingest -> transcribe -> discover -> rank -> render -> publish."""
+    from freecher_worker.jobs.models import JobStatus
+    from freecher_worker.jobs.orchestrator import Orchestrator
+
+    _configure_job_logging()
+    store = _jobs_store(jobs_dir)
+    if job_id:
+        job = store.get(job_id)
+        store.update(job.job_id, lambda j: setattr(j, "status", JobStatus.QUEUED))
+    else:
+        job = store.create(source_url=url, top_n=top_n)
+    console.print(f"[bold cyan]job[/bold cyan] {job.job_id}  top_n={job.top_n}\n{url}\n")
+
+    result = Orchestrator(store).run(job.job_id)
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Stage", width=14)
+    table.add_column("Seconds", width=10, justify="right")
+    table.add_column("Skipped", width=8)
+    table.add_column("Reason")
+    for t in result.stage_timings:
+        table.add_row(t.stage, f"{t.seconds:.1f}" if t.seconds is not None else "-",
+                      "yes" if t.skipped else "no", t.reason or "")
+    console.print(table)
+
+    if result.status is JobStatus.DONE:
+        console.print(f"\n[bold green]DONE[/bold green]  source_id={result.source_id}  "
+                      f"{len(result.clips)} clip(s)")
+        for c in result.clips:
+            console.print(f"  #{c.get('rank')} {c.get('clip_id')}  {c.get('bytes'):,} B  "
+                          f"[cyan]{c.get('r2_key')}[/cyan]")
+    else:
+        console.print(f"\n[bold red]FAILED[/bold red] in {result.error_stage}: "
+                      f"{result.error_type}: {result.error_message}")
+        console.print(f"retryable: {result.retryable}")
+        raise typer.Exit(code=1)
+
+
+@app.command("worker")
+def worker_command(
+    jobs_dir: Optional[Path] = typer.Option(None, "--jobs-dir", help="Job store directory"),
+    once: bool = typer.Option(False, "--once", help="Drain the queue and exit"),
+    poll_seconds: float = typer.Option(3.0, "--poll", help="Seconds between polls when idle"),
+) -> None:
+    """Drain queued jobs. Run alongside `freecher-worker api`."""
+    import time as _time
+    from freecher_worker.jobs.orchestrator import Orchestrator
+
+    _configure_job_logging()
+    store = _jobs_store(jobs_dir)
+    orch = Orchestrator(store)
+    console.print(f"[bold cyan]worker[/bold cyan] watching {store.root}")
+    for reclaimed in orch.reclaim_orphans():
+        console.print(f"reclaimed orphaned job {reclaimed}")
+    while True:
+        job = store.claim_next_queued()
+        if job is None:
+            # A parked job is not queued, so the claim above never sees it. Check
+            # whether the GPU host has delivered before deciding the queue is idle.
+            for resumed in orch.resume_awaiting():
+                console.print(f"transcript arrived for {resumed}; requeued")
+            job = store.claim_next_queued()
+        if job is None:
+            if once:
+                console.print("queue empty; exiting")
+                return
+            _time.sleep(poll_seconds)
+            continue
+        console.print(f"picked up {job.job_id} ({job.source_url})")
+        try:
+            result = orch.run(job.job_id)
+        except KeyboardInterrupt:
+            # systemd sends SIGINT on stop. The orchestrator has already put the
+            # job back in the queue; exit promptly so the unit does not sit in
+            # stop-sigterm until systemd escalates to SIGKILL.
+            console.print("interrupted; job requeued")
+            return
+        console.print(f"  -> {result.status.value}")
+
+
+@app.command("api")
+def api_command(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    jobs_dir: Optional[Path] = typer.Option(None, "--jobs-dir", help="Job store directory"),
+) -> None:
+    """Serve the HTTP API. Jobs are queued here and executed by `freecher-worker worker`."""
+    import os as _os
+    import uvicorn
+    if jobs_dir:
+        _os.environ["FREECHER_JOBS_DIR"] = str(jobs_dir)
+    console.print(f"[bold cyan]Freecher API[/bold cyan] http://{host}:{port}  (docs at /docs)")
+    uvicorn.run("freecher_worker.api.app:app", host=host, port=port, log_level="info")
+
+
+@app.command("preflight")
+def preflight_command(
+    jobs_dir: Optional[Path] = typer.Option(None, "--jobs-dir", help="Job store directory"),
+    offline: bool = typer.Option(False, "--offline", help="Skip the R2 round trip"),
+) -> None:
+    """Can this host run a job? The same checks GET /health reports.
+
+    Intended as the first thing run after a deploy, and the first thing run when
+    a deployed host starts failing. Exits non-zero when degraded so it can gate
+    a systemd unit or a deployment script.
+    """
+    from freecher_worker.ops.diagnostics import collect
+
+    diag = collect(jobs_dir=jobs_dir, include_network=not offline)
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Check", width=14)
+    table.add_column("", width=6)
+    table.add_column("Detail")
+    for check in diag.checks:
+        mark = "[green]OK[/green]" if check.ok else (
+            "[red]FAIL[/red]" if check.required else "[yellow]skip[/yellow]")
+        table.add_row(check.name, mark, check.detail)
+    console.print(table)
+
+    if diag.ok:
+        console.print("\n[bold green]ready[/bold green]")
+        return
+    console.print("\n[bold red]degraded[/bold red] — "
+                  + ", ".join(c.name for c in diag.failures()))
+    raise typer.Exit(code=1)
+
+
+@app.command("transcribe-queue")
+def transcribe_queue_command(
+    once: bool = typer.Option(False, "--once", help="Drain what is pending and exit"),
+    max_jobs: int = typer.Option(0, "--max", help="Stop after this many (0 = no limit)"),
+    poll_seconds: float = typer.Option(30.0, "--poll", help="Seconds between polls when idle"),
+    list_only: bool = typer.Option(False, "--list", help="Show the queue and exit"),
+) -> None:
+    """GPU side of the transcription handoff: drain requests parked in R2.
+
+    This is what runs in the Kaggle T4 notebook. It reimplements nothing — each
+    request is executed by the same `transcribe_from_r2` the `transcribe` command
+    uses; this only decides which source is next and honours the decoding config
+    the requesting host asked for.
+    """
+    import time as _time
+
+    from freecher_worker.config import get_settings
+    from freecher_worker.ingest.r2 import build_r2_client
+    from freecher_worker.transcription.handoff import clear_request, pending_requests
+    from freecher_worker.transcription.r2 import transcribe_from_r2
+
+    _configure_job_logging()
+    cfg = get_settings()
+    if not (cfg.r2_bucket and cfg.r2_endpoint):
+        console.print("[bold red]R2 is not configured[/bold red] — set FREECHER_R2_*")
+        raise typer.Exit(code=2)
+    client = build_r2_client(cfg.r2_endpoint, cfg.r2_access_key_id, cfg.r2_secret_access_key)
+
+    if list_only:
+        queue = pending_requests(client, cfg.r2_bucket)
+        if not queue:
+            console.print("queue empty")
+            return
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("source_id")
+        table.add_column("model")
+        table.add_column("requested_at")
+        for req in queue:
+            table.add_row(str(req.get("source_id")), str(req.get("model", "?")),
+                          str(req.get("requested_at", "?")))
+        console.print(table)
+        return
+
+    done = 0
+    while True:
+        queue = pending_requests(client, cfg.r2_bucket)
+        if not queue:
+            if once:
+                console.print("queue empty; exiting")
+                return
+            _time.sleep(poll_seconds)
+            continue
+
+        request = queue[0]
+        source_id = str(request["source_id"])
+        console.print(f"[bold cyan]transcribing[/bold cyan] {source_id} "
+                      f"(model={request.get('model', cfg.transcribe_model)})")
+        try:
+            result = transcribe_from_r2(
+                source_id, client=client, bucket=cfg.r2_bucket,
+                model_name=request.get("model") or cfg.transcribe_model,
+                device=request.get("device") or cfg.transcribe_device,
+                compute_type=request.get("compute_type") or cfg.transcribe_compute_type,
+                beam_size=int(request.get("beam_size") or cfg.transcribe_beam_size),
+                vad_filter=bool(request.get("vad_filter", cfg.transcribe_vad_filter)),
+                language=request.get("language"),
+                overwrite=False,
+            )
+            console.print(f"  -> [green]{result.transcript_key}[/green]")
+            clear_request(client, cfg.r2_bucket, source_id)
+        except Exception as exc:  # noqa: BLE001 - one bad source must not stop the queue
+            # The request object is left in place deliberately: a transient
+            # failure should be retried, and a permanent one stays visible in
+            # the queue instead of disappearing silently.
+            console.print(f"  -> [red]{type(exc).__name__}[/red]: {exc}")
+
+        done += 1
+        if max_jobs and done >= max_jobs:
+            console.print(f"reached --max {max_jobs}; exiting")
+            return

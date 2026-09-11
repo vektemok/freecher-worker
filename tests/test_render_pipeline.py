@@ -354,7 +354,11 @@ def test_a_missing_override_fails_with_a_clear_message(tmp_path):
     assert result.exit_code == 1
     # Names the flag, so the reader knows which input was wrong.
     assert "--source-video" in result.output
-    assert "absent.mp4" in result.output
+    # Rich wraps at the console width, which is narrower on a server than in a
+    # developer terminal -- there the path broke as "absent.\nmp4". Strip the
+    # wrapping before matching, so this asserts the message content and not the
+    # width of whatever terminal happened to run it.
+    assert "absent.mp4" in "".join(result.output.split())
 
 
 def test_a_directory_is_not_accepted_as_a_source_video(tmp_path):

@@ -8,7 +8,7 @@ from typing import List, Optional
 import cv2
 
 from .detector import SubjectDetector, get_subject_detector
-from .models import CropPoint, CropTrajectory, DetectedSubject
+from .models import CropDiagnostics, CropPoint, CropTrajectory, DetectedSubject
 
 logger = logging.getLogger("freecher_worker")
 
@@ -77,10 +77,20 @@ def generate_crop_trajectory(
     analysis_fps: float = 2.0,
     deadzone_ratio: float = 0.03,
     max_velocity_px_per_sec: float = 200.0,
+    detector_name: str = "auto",
 ) -> CropTrajectory:
-    """Analyze video at sampled intervals to build a smooth 9:16 crop trajectory."""
+    """Analyze video at sampled intervals to build a smooth 9:16 crop trajectory.
+
+    The detector defaults to "auto" (YuNet, degrading to Haar/HOG). It used to be
+    hardcoded to "haar", which detects nothing at all on OpenCV 5 -- that build
+    dropped CascadeClassifier/HOGDescriptor -- so every frame fell through to
+    center_fallback and smart crop was silently a static centre crop.
+    """
+    requested = detector_name or "auto"
     if detector is None:
-        detector = get_subject_detector("haar")
+        detector = get_subject_detector(requested)
+    detector_used = type(detector).__name__
+    detector_operational = bool(getattr(detector, "is_operational", True))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -100,6 +110,13 @@ def generate_crop_trajectory(
     raw_observations: List[tuple[float, float, float, str]] = []
     deadzone_px = deadzone_ratio * source_width
 
+    frames_decoded = 0
+    frames_with_detections = 0
+    total_detections = 0
+    subject_type_counts: dict[str, int] = {}
+    confidences: List[float] = []
+    fallback_reasons: dict[str, int] = {}
+
     # 1. Sample and detect
     for t_rel in sample_times:
         t_abs = start_seconds + t_rel
@@ -107,10 +124,23 @@ def generate_crop_trajectory(
         ret, frame = cap.read()
         if not ret or frame is None:
             raw_observations.append((t_rel, source_width / 2.0, source_height / 2.0, "center_fallback"))
+            fallback_reasons["frame_decode_failed"] = fallback_reasons.get("frame_decode_failed", 0) + 1
             continue
 
+        frames_decoded += 1
         subjects = detector.detect(frame, t_abs)
+        if subjects:
+            frames_with_detections += 1
+            total_detections += len(subjects)
+            for sub in subjects:
+                subject_type_counts[sub.subject_type] = subject_type_counts.get(sub.subject_type, 0) + 1
+                confidences.append(float(sub.confidence))
         tgt_x, tgt_y, subj_type = select_target_center(subjects, source_width, source_height, crop_w)
+        if subj_type == "center_fallback":
+            reason = ("detector_not_operational" if not detector_operational
+                      else "no_subjects_detected" if not subjects
+                      else "subjects_rejected_by_selector")
+            fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
         raw_observations.append((t_rel, tgt_x, tgt_y, subj_type))
 
     cap.release()
@@ -159,10 +189,45 @@ def generate_crop_trajectory(
             )
         )
 
+    tracked = sum(1 for pt in points if pt.subject_type != "center_fallback")
+    n = len(points) or 1
+    xs = [pt.center_x for pt in points]
+    diagnostics = CropDiagnostics(
+        detector_requested=requested,
+        detector_used=detector_used,
+        detector_operational=detector_operational,
+        frames_sampled=len(sample_times),
+        frames_decoded=frames_decoded,
+        frames_with_detections=frames_with_detections,
+        total_detections=total_detections,
+        subject_type_counts=subject_type_counts,
+        confidence_min=round(min(confidences), 4) if confidences else None,
+        confidence_mean=round(sum(confidences) / len(confidences), 4) if confidences else None,
+        confidence_max=round(max(confidences), 4) if confidences else None,
+        tracked_fraction=round(tracked / n, 4),
+        fallback_fraction=round((len(points) - tracked) / n, 4),
+        fallback_reasons=fallback_reasons,
+        crop_center_x_min=round(min(xs), 2) if xs else None,
+        crop_center_x_max=round(max(xs), 2) if xs else None,
+        crop_center_x_range=round(max(xs) - min(xs), 2) if xs else None,
+    )
+    diagnostics.summary = (
+        f"detector={diagnostics.detector_used}(requested={requested}, "
+        f"operational={detector_operational}); "
+        f"{frames_with_detections}/{frames_decoded} sampled frames had detections "
+        f"({total_detections} subjects, types={subject_type_counts or '{}'}); "
+        f"tracked {diagnostics.tracked_fraction:.0%} of keyframes, "
+        f"fallback {diagnostics.fallback_fraction:.0%} "
+        f"(reasons={fallback_reasons or '{}'}); "
+        f"crop centre x range {diagnostics.crop_center_x_range}px"
+    )
+    logger.info("[crop] %s", diagnostics.summary)
+
     return CropTrajectory(
         source_width=source_width,
         source_height=source_height,
         crop_w=crop_w,
         crop_h=crop_h,
         points=points,
+        diagnostics=diagnostics,
     )

@@ -1,0 +1,37 @@
+[Unit]
+Description=Freecher API (queues jobs; never runs the pipeline)
+Documentation=file:///opt/freecher/app/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=freecher
+Group=freecher
+# The pipeline writes run artifacts to ./runs, and ProtectSystem=strict
+# makes /opt read-only, so the working directory is the state directory.
+WorkingDirectory=/var/lib/freecher
+EnvironmentFile=/etc/freecher/freecher.env
+ExecStart=/opt/freecher/venv/bin/freecher-worker api --host 127.0.0.1 --port 8000 --jobs-dir /var/lib/freecher/jobs
+Restart=always
+RestartSec=5
+# The API is stateless apart from the job directory; a hung worker must never
+# take the API down with it, so they are separate units with no Requires= link.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# Logs go to the journal: journalctl -u freecher-api -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=freecher-api
+
+# Hardening. ProtectSystem=strict makes / read-only, so every path the service
+# writes to is listed explicitly and nothing else is writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/freecher /var/log/freecher
+
+[Install]
+WantedBy=multi-user.target

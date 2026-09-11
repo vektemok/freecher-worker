@@ -739,6 +739,47 @@ decision. Two details that are easy to get wrong here:
 
 ---
 
+## Production Deployment
+
+`deploy/` holds everything needed to run Freecher on a server: two systemd
+units, an environment template, an idempotent `install.sh`, and an operator
+helper. `deploy/README.md` is the deployment guide; the short version is
+
+```bash
+sudo ./deploy/install.sh          # provisions, then refuses to start a degraded host
+curl -s localhost:8000/health     # 200 ready, 503 degraded, with per-check detail
+sudo freecher-run preflight       # the same checks from a shell
+```
+
+Stage placement on the reference deployment (Oracle VM.Standard.A1.Flex,
+Ubuntu 24.04 ARM64, 2 OCPU / 6 GB, plus a Kaggle T4 for GPU work):
+
+| Stage | Host |
+|---|---|
+| INGESTING, DISCOVERING, RANKING, RENDERING, UPLOADING | Oracle |
+| TRANSCRIBING | Oracle for short audio, Kaggle T4 beyond `FREECHER_CPU_TRANSCRIPTION_MAX_SECONDS` |
+
+### Transcription handoff
+
+`FREECHER_TRANSCRIBE_BACKEND=auto` runs faster-whisper locally when a CUDA
+device is present, or when the audio is short enough that CPU is honest. A
+longer source on a CPU-only host is handed to the GPU host through R2 rather
+than starting a multi-hour CPU decode:
+
+```
+worker            processing/{id}/transcribe_request.json   (job -> AWAITING_TRANSCRIPT)
+GPU host          freecher-worker transcribe-queue --once
+                  processing/{id}/transcript.json
+worker idle loop  transcript found -> job requeued -> every earlier stage skips
+```
+
+Nothing about Whisper is duplicated: `transcribe-queue` drives the same
+`transcribe_from_r2` the `transcribe` command uses. Kaggle sessions cannot be
+started programmatically, so that one step is manual, and a parked job says so
+instead of failing or hanging.
+
+---
+
 ## GPU Transcription (R2 audio artifact → transcript.json)
 
 `transcribe` reads the audio artifact ingest produced and writes a transcript beside it.

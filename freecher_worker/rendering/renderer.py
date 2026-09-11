@@ -21,6 +21,12 @@ from freecher_worker.utils.json_io import load_json, save_json
 
 from .asr_refinement import HighlightWordTranscriber
 from .audio import build_loudnorm_filter, measure_loudness
+from freecher_worker.media.ffmpeg_env import (  # noqa: F401
+    SubtitleBurnUnsupportedError,
+    probe_capabilities,
+    require_subtitle_burn,
+    resolve_ffmpeg,
+)
 from .boundaries import RefinedHighlight, refine_highlight
 from .presets import RenderPreset, get_preset
 from .validator import VideoValidationResult, validate_rendered_video
@@ -62,6 +68,7 @@ class RenderItemManifest(BaseModel):
     resolution: str = "1080x1920"
     crop_mode: str = "smart"
     subtitle_style: str = "ass_karaoke"
+    subtitles_burned: bool = False
     audio_normalized: bool = True
 
     encoder: str
@@ -194,8 +201,14 @@ def render_single_short(
             analysis_fps=cfg.crop_analysis_fps,
             deadzone_ratio=cfg.crop_deadzone_ratio,
             max_velocity_px_per_sec=cfg.crop_max_velocity_pixels_per_sec,
+            detector_name=cfg.crop_detector,
         )
         save_json(trajectory, crop_cache)
+
+        diag = getattr(trajectory, "diagnostics", None)
+        if diag is not None:
+            crop_mode = "smart" if diag.tracked_fraction > 0 else "center_fallback"
+            timings["crop_tracked_fraction"] = diag.tracked_fraction
 
         crop_x_expr = build_ffmpeg_crop_x_expression(trajectory, escape_for_filter=True)
         crop_scale_filter = f"crop={trajectory.crop_w}:{trajectory.crop_h}:{crop_x_expr}:0,scale={preset.width}:{preset.height}"
@@ -233,18 +246,15 @@ def render_single_short(
 
     # 6. Build filtergraph for ONE final video encode
     video_filter_parts = [crop_scale_filter]
+    subtitles_burned = False
     if ass_path and ass_path.is_file():
         # Escape path for FFmpeg filtergraph
         escaped_ass = str(ass_path.resolve()).replace("\\", "/").replace(":", r"\:")
-        if is_ffmpeg_filter_supported("ass"):
-            video_filter_parts.append(f"ass='{escaped_ass}'")
-        elif is_ffmpeg_filter_supported("subtitles"):
-            video_filter_parts.append(f"subtitles='{escaped_ass}'")
-        else:
-            logger.warning(
-                f"[render] Current FFmpeg build does not have 'ass' or 'subtitles' filter enabled (libass missing). "
-                f"Subtitles file saved to {ass_path} but will not be burned into video stream."
-            )
+        # Raises SubtitleBurnUnsupportedError when libass is missing. Subtitles were
+        # requested, so a subtitle-less MP4 is a FAILED render, not a successful one.
+        subtitle_filter = require_subtitle_burn(cfg)
+        video_filter_parts.append(f"{subtitle_filter}='{escaped_ass}'")
+        subtitles_burned = True
 
     vf_chain = ",".join(video_filter_parts)
     af_chain = loudnorm_filter_str
@@ -259,7 +269,7 @@ def render_single_short(
         enc_args = ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
 
     cmd = [
-        "ffmpeg",
+        resolve_ffmpeg(cfg),
         "-nostdin",
         "-y",
         "-ss", f"{r_start:.3f}",
@@ -312,6 +322,7 @@ def render_single_short(
         resolution=f"{preset.width}x{preset.height}",
         crop_mode=crop_mode,
         subtitle_style="ass_karaoke" if enable_subtitles else "none",
+        subtitles_burned=subtitles_burned,
         audio_normalized=audio_normalized,
         encoder=encoder,
         file=f"final/short_{highlight.rank:02d}.mp4",

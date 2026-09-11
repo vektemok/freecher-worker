@@ -11,6 +11,21 @@ COLOR_WHITE = "&H00FFFFFF&"
 COLOR_GOLD = "&H00D7FF&"  # Vibrant energetic gold/yellow pop
 
 
+def sanitize_font_name(font_family: str) -> str:
+    """Reduce a CSS-style font stack to a single ASS-safe font name.
+
+    ASS style lines are comma-delimited, so a value like
+    ``"Montserrat, DejaVu Sans, Arial"`` silently injects two extra fields and
+    shifts every later one: Fontsize becomes "DejaVu Sans" (parsed as 0) and the
+    text renders invisibly. libass already does its own fallback through
+    fontconfig/CoreText, so only the first family belongs in the field.
+    """
+    first = (font_family or "").split(",")[0].strip()
+    # Colons and braces would also break the Style line / override blocks.
+    first = first.replace(":", " ").replace("{", "").replace("}", "").strip()
+    return first or "Arial"
+
+
 def format_ass_timestamp(seconds: float) -> str:
     """Format seconds into ASS timestamp format H:MM:SS.cs."""
     if seconds < 0:
@@ -46,7 +61,7 @@ def generate_ass_script(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{font_family},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        f"Style: Default,{sanitize_font_name(font_family)},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
         f"1,0,0,0,100,100,0,0,1,3.5,2.0,2,80,80,{margin_v},1",
         "",
         "[Events]",

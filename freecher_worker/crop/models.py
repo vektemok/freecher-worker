@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -30,6 +30,34 @@ class CropPoint(BaseModel):
     subject_type: str = Field(description="Type of tracked subject at this keyframe")
 
 
+class CropDiagnostics(BaseModel):
+    """Why the crop trajectory looks the way it does.
+
+    Exists so that `center_fallback` can never appear without a recorded reason.
+    """
+
+    detector_requested: str = Field(description="Detector name asked for in configuration")
+    detector_used: str = Field(description="Detector class actually instantiated")
+    detector_operational: bool = Field(description="Whether the detector can detect anything at all")
+    frames_sampled: int = 0
+    frames_decoded: int = 0
+    frames_with_detections: int = 0
+    total_detections: int = 0
+    subject_type_counts: Dict[str, int] = Field(default_factory=dict)
+    confidence_min: Optional[float] = None
+    confidence_mean: Optional[float] = None
+    confidence_max: Optional[float] = None
+    tracked_fraction: float = Field(default=0.0, description="Share of keyframes driven by a subject")
+    fallback_fraction: float = Field(default=0.0, description="Share of keyframes on center fallback")
+    fallback_reasons: Dict[str, int] = Field(
+        default_factory=dict, description="Why fallback was used, counted per keyframe"
+    )
+    crop_center_x_min: Optional[float] = None
+    crop_center_x_max: Optional[float] = None
+    crop_center_x_range: Optional[float] = None
+    summary: str = Field(default="", description="One-line human-readable explanation")
+
+
 class CropTrajectory(BaseModel):
     """Complete temporal crop trajectory across a highlight clip."""
 
@@ -38,3 +66,4 @@ class CropTrajectory(BaseModel):
     crop_w: int
     crop_h: int
     points: List[CropPoint] = Field(default_factory=list)
+    diagnostics: Optional[CropDiagnostics] = None

@@ -1,0 +1,42 @@
+[Unit]
+Description=Freecher worker (drains the job queue: ingest -> ... -> publish)
+Documentation=file:///opt/freecher/app/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=freecher
+Group=freecher
+# The pipeline writes run artifacts to ./runs, and ProtectSystem=strict
+# makes /opt read-only, so the working directory is the state directory.
+WorkingDirectory=/var/lib/freecher
+EnvironmentFile=/etc/freecher/freecher.env
+ExecStart=/opt/freecher/venv/bin/freecher-worker worker --jobs-dir /var/lib/freecher/jobs
+Restart=always
+RestartSec=10
+
+# A render can run for minutes. SIGINT lets the current ffmpeg finish being
+# killed cleanly and the job record be written before the process goes away;
+# the job store is crash-safe regardless, but a clean stop keeps the record
+# honest instead of leaving a stage that looks still-running.
+KillSignal=SIGINT
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=freecher-worker
+
+# Two OCPUs total: renders are CPU-bound and would otherwise starve the API and
+# sshd. Nice + a CPU quota keeps the box responsive while a clip encodes.
+Nice=5
+CPUQuota=190%
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/freecher /var/log/freecher
+
+[Install]
+WantedBy=multi-user.target

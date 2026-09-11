@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import List
 from .models import CropPoint, CropTrajectory
 
+#: FFmpeg's av_expr_parse() starts with stack_index = 100, so a deeply nested
+#: if()-chain fails with AVERROR(EINVAL) ("Invalid argument"). Each keyframe adds
+#: one nesting level, so the keyframe count has to be capped. 45 is the budget the
+#: shorts pipeline already uses for the same limit.
+EXPRESSION_KEYFRAME_BUDGET = 45
+
 
 def simplify_trajectory_points(
     points: List[CropPoint],
@@ -109,6 +115,35 @@ def build_ffmpeg_crop_expression(
     return clamped.replace(",", r"\,") if escape_for_filter else clamped
 
 
+def _fit_x_axis_to_budget(points: List[CropPoint], max_points: int) -> List[CropPoint]:
+    """Cap keyframe count for the x expression, thinning on the x axis only.
+
+    `fit_points_to_expression_budget` also simplifies on y, which is wrong here:
+    a 9:16 crop of a landscape source pins crop_y at 0, so every interior point
+    is trivially collinear on y and the whole trajectory collapses to two points
+    -- silently throwing away the camera move this expression exists to carry.
+
+    Raise the x tolerance first (keeps the shape), and only decimate evenly if
+    geometry alone cannot reach the budget.
+    """
+    if len(points) <= max_points:
+        return list(points)
+    for tolerance in (2.0, 4.0, 8.0, 16.0, 32.0, 64.0):
+        candidate = simplify_trajectory_points(points, tolerance_px=tolerance, axis="x")
+        if len(candidate) <= max_points:
+            return candidate
+        points = candidate if len(candidate) > 2 else points
+    step = len(points) / float(max_points - 1)
+    decimated = [points[min(len(points) - 1, int(round(i * step)))]
+                 for i in range(max_points - 1)]
+    decimated.append(points[-1])
+    out: List[CropPoint] = []
+    for pt in decimated:
+        if not out or pt.time > out[-1].time:
+            out.append(pt)
+    return out
+
+
 def build_ffmpeg_crop_x_expression(trajectory: CropTrajectory, escape_for_filter: bool = True) -> str:
     """Convert crop trajectory into an FFmpeg-evaluable piecewise-linear expression x(t).
 
@@ -121,8 +156,13 @@ def build_ffmpeg_crop_x_expression(trajectory: CropTrajectory, escape_for_filter
     if not raw_points:
         return "trunc((in_w-out_w)/2)"
 
-    # Simplify trajectory to avoid excessive expression nesting in FFmpeg
+    # Simplify, then hard-cap the keyframe count. Simplification alone is not
+    # enough: a genuinely busy camera move keeps every point, and the resulting
+    # if()-chain overflows FFmpeg's expression parser. This only became reachable
+    # once subject tracking started producing real trajectories -- before that
+    # every clip was a constant centre crop and returned early below.
     points = simplify_trajectory_points(raw_points, tolerance_px=2.0)
+    points = _fit_x_axis_to_budget(points, EXPRESSION_KEYFRAME_BUDGET)
 
     # If all points share the same crop_x coordinate, return static constant
     first_x = points[0].crop_x

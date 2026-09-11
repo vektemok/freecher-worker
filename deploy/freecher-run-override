@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# freecher-run with temporary environment overrides, for one-offs and drills.
+#
+#   sudo freecher-run-override FREECHER_TRANSCRIBE_BACKEND=remote -- run-url <url>
+#
+# The overrides are appended to a copy of the deployment env file rather than
+# passed as systemd --setenv, because systemd applies EnvironmentFile= *after*
+# Environment=, so a --setenv for a key the file also defines is silently
+# discarded. Later lines in one env file do win, so appending works.
+set -euo pipefail
+
+ENV_FILE=/etc/freecher/freecher.env
+VENV=/opt/freecher/venv
+STATE=/var/lib/freecher
+
+[[ $EUID -eq 0 ]] || exec sudo -- "$0" "$@"
+[[ $# -ge 2 ]] || { echo "usage: $0 KEY=VAL[,KEY=VAL...] -- <cli args>" >&2; exit 2; }
+
+IFS="," read -ra overrides <<< "$1"; shift
+[[ "${1:-}" == "--" ]] && shift
+
+merged=$(mktemp /run/freecher-override.XXXXXX)
+chmod 0600 "$merged"
+trap 'rm -f "$merged"' EXIT
+cat "$ENV_FILE" > "$merged"
+printf '%s\n' "${overrides[@]}" >> "$merged"
+
+systemd-run --quiet --collect --wait --pipe \
+  --uid=freecher --gid=freecher --working-directory="$STATE" \
+  --property=EnvironmentFile="$merged" \
+  "$VENV/bin/freecher-worker" "$@"
